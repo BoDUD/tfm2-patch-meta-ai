@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use mod_api_stable::{RecordKindV1, StableClient, StableExtension};
+use mod_api_stable::{ClientSceneKindV1, RecordKindV1, StableClient, StableExtension};
 use serde_json::Value;
 
 use crate::config::{self, Config};
@@ -29,10 +29,17 @@ pub trait Game: Source {
     fn game_date(&mut self) -> Option<(i32, u32, u32)>;
     fn send_command(&mut self, command: &str, payload: &[u8]) -> bool;
     fn take_events(&mut self) -> Vec<(String, Vec<u8>)>;
-    /// A match is on screen (reading then would cost frames where they show most).
-    fn watching_match(&mut self) -> bool {
-        false
+    /// The screen inside the save (`None` when the game does not say).
+    fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
+        None
     }
+}
+
+/// The mod only works on the management screens. Everything around a match - lineup, stadium
+/// entrance, the match itself (`InGame`/`Match`), result, locker room - is left alone so not a
+/// single frame there is spent on it.
+fn idle_scene(scene: Option<ClientSceneKindV1>) -> bool {
+    !matches!(scene, None | Some(ClientSceneKindV1::Main))
 }
 
 struct ClientGame<'a, 'b> {
@@ -67,8 +74,8 @@ impl Game for ClientGame<'_, '_> {
     fn take_events(&mut self) -> Vec<(String, Vec<u8>)> {
         self.ctx.take_events().into_iter().map(|e| (e.event, e.payload)).collect()
     }
-    fn watching_match(&mut self) -> bool {
-        self.ctx.client_scene_kind() == Some(mod_api_stable::ClientSceneKindV1::Match)
+    fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
+        self.ctx.client_scene_kind()
     }
 }
 
@@ -107,6 +114,7 @@ struct State {
     solo: Scanner,
     /// Reading time spent beyond the per-frame budget, paid back by frames that do not read.
     debt: Duration,
+    scene: Option<ClientSceneKindV1>,
     reported_backfill: bool,
     dirty: bool,
     next_rebuild: Option<Instant>,
@@ -134,6 +142,7 @@ impl State {
             comp: Scanner::new(RecordKindV1::MatchReplay, false),
             solo: Scanner::new(RecordKindV1::SoloRankMatch, true),
             debt: Duration::ZERO,
+            scene: None,
             reported_backfill: false,
             dirty: false,
             next_rebuild: None,
@@ -191,6 +200,14 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
 }
 
 fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
+    let scene = game.client_scene();
+    if scene != st.scene {
+        diag::log(&format!("screen: {scene:?}{}", if idle_scene(scene) { " (mod paused)" } else { "" }));
+        st.scene = scene;
+    }
+    if idle_scene(scene) {
+        return;
+    }
     // which save is open (another one may have been loaded without leaving the game scene)
     if due(st.next_identity, now) {
         st.next_identity = Some(now + IDENTITY_EVERY);
@@ -233,10 +250,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         );
     }
 
-    // nothing is read while a match is on screen
-    if !game.watching_match() {
-        read_records(st, game, cfg);
-    }
+    read_records(st, game, cfg);
     st.comp.cap_backlog(BACKLOG_COMPETITION);
     st.solo.cap_backlog(BACKLOG_SOLO);
     report_probes(st);
@@ -725,7 +739,7 @@ mod tests {
         events: Vec<(String, Vec<u8>)>,
         accept: bool,
         read_delay: Duration,
-        watching: bool,
+        scene: Option<ClientSceneKindV1>,
         reads: u32,
     }
 
@@ -796,8 +810,8 @@ mod tests {
         fn take_events(&mut self) -> Vec<(String, Vec<u8>)> {
             std::mem::take(&mut self.events)
         }
-        fn watching_match(&mut self) -> bool {
-            self.watching
+        fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
+            self.scene
         }
     }
 
@@ -921,16 +935,28 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_read_during_a_match() {
+    fn nothing_happens_around_a_match() {
         let _serial = crate::tests::serial();
         with_temp_dir();
+        for scene in [
+            ClientSceneKindV1::Lineup,
+            ClientSceneKindV1::StadiumEntrance,
+            ClientSceneKindV1::InGame,
+            ClientSceneKindV1::Match,
+            ClientSceneKindV1::MatchResult,
+            ClientSceneKindV1::LockerRoom,
+        ] {
+            crate::reset_for_tests();
+            let mut g = save();
+            g.scene = Some(scene);
+            frames(&mut g, 100, Instant::now());
+            assert_eq!(g.reads, 0, "{scene:?}");
+            assert!(g.sent.is_empty());
+        }
         let mut g = save();
-        g.watching = true;
-        frames(&mut g, 100, Instant::now());
-        assert_eq!(g.reads, 0);
-        g.watching = false;
+        g.scene = Some(ClientSceneKindV1::Main);
         frames(&mut g, 5, Instant::now());
-        assert!(g.reads > 0);
+        assert!(g.reads > 0, "works on the management screen");
     }
 
     #[test]
