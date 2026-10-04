@@ -56,6 +56,7 @@ pub struct Scanner {
     queue: Vec<usize>,
     not_played: HashSet<usize>,
     old_streak: u32,
+    capped: bool,
     pub versions: BTreeMap<String, VersionStats>,
     pub counts: Counts,
     /// Every record id the game listed at the last refresh.
@@ -82,6 +83,7 @@ impl Scanner {
             queue: Vec::new(),
             not_played: HashSet::new(),
             old_streak: 0,
+            capped: false,
             versions: BTreeMap::new(),
             counts: Counts::default(),
             listed: 0,
@@ -94,17 +96,26 @@ impl Scanner {
         self.queue.len()
     }
 
-    /// Lists the game's record ids and queues the ones not read yet. `recheck_unplayed` also
-    /// re-queues solo-rank matches that were not played the last time they were read.
-    pub fn refresh(&mut self, src: &mut impl Source, recheck_unplayed: bool) {
+    /// Lists the game's record ids and queues the ones not read yet. Solo-rank matches that
+    /// were not played yet stay out of the queue; `recheck_unplayed` puts the oldest of them
+    /// (at most that many - a save can hold thousands of scheduled ones) back in.
+    pub fn refresh(&mut self, src: &mut impl Source, recheck_unplayed: usize) {
+        if recheck_unplayed > 0 && !self.not_played.is_empty() {
+            let mut oldest: Vec<usize> = self.not_played.iter().copied().collect();
+            oldest.sort_unstable();
+            oldest.truncate(recheck_unplayed);
+            for id in oldest {
+                self.not_played.remove(&id);
+            }
+        }
+        if self.capped {
+            return;
+        }
         let ids = src.record_ids(self.kind);
         self.listed = ids.len();
         let mut added = false;
         for id in ids {
-            if self.done.contains(&id) || self.queued.contains(&id) {
-                continue;
-            }
-            if self.not_played.contains(&id) && !recheck_unplayed {
+            if self.done.contains(&id) || self.queued.contains(&id) || self.not_played.contains(&id) {
                 continue;
             }
             self.queued.insert(id);
@@ -114,9 +125,37 @@ impl Scanner {
         if added {
             self.queue.sort_unstable();
         }
-        if recheck_unplayed {
-            self.not_played.clear();
+    }
+
+    /// Stops the backlog after `limit` records read in this save (newest first, so what is
+    /// dropped is the oldest). New records keep coming in after that.
+    pub fn cap_backlog(&mut self, limit: u32) {
+        if self.capped || self.counts.read < limit {
+            return;
         }
+        self.capped = true;
+        self.counts.skipped_old += self.queue.len() as u32;
+        for id in self.queue.drain(..) {
+            self.done.insert(id);
+        }
+        self.queued.clear();
+    }
+
+    /// After the backlog cap: queue only ids newer than everything read so far.
+    pub fn refresh_new(&mut self, src: &mut impl Source) {
+        if !self.capped {
+            return;
+        }
+        let newest = self.done.iter().copied().max().unwrap_or(0);
+        let ids = src.record_ids(self.kind);
+        self.listed = ids.len();
+        for id in ids {
+            if id > newest && !self.queued.contains(&id) && !self.not_played.contains(&id) {
+                self.queued.insert(id);
+                self.queue.push(id);
+            }
+        }
+        self.queue.sort_unstable();
     }
 
     /// Reads and counts the newest queued record.
@@ -281,7 +320,7 @@ pub(crate) mod tests {
         save.records.insert(2, game("1.3", &["a", "c"], &["b", "d"], false));
         save.records.insert(3, game("1.3", &["c", "a"], &["b", "d"], true));
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(scan.current_version().as_deref(), Some("1.3"));
         assert_eq!(scan.previous_version().as_deref(), Some("1.2"));
@@ -303,20 +342,20 @@ pub(crate) mod tests {
             save.records.insert(id, game("1.3", &["a"], &["b"], id % 2 == 0));
         }
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         for _ in 0..10 {
             scan.step(&mut save);
         }
         // records pruned / another save: the list shrinks to 3 ids, two of them unknown
         save.records.retain(|id, _| *id <= 3);
         save.records.insert(1000, game("1.3", &["c"], &["d"], true));
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(scan.counts.matches, 10 + 3 + 1);
         assert_eq!(scan.counts.fetch_failed, 37, "queued ids that vanished are skipped");
         // nothing is read twice
         let before = save.reads;
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(save.reads, before);
     }
@@ -327,13 +366,13 @@ pub(crate) mod tests {
         let unplayed = r#"{"played":false,"version":"1.3","blue_team_win":false,"blue_team":[{"champion":"a"}],"red_team":[{"champion":"b"}]}"#;
         save.records.insert(7, unplayed.to_string());
         let mut scan = Scanner::new(RecordKindV1::SoloRankMatch, true);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(scan.counts.not_played, 1);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         assert_eq!(scan.pending(), 0, "not re-read on every refresh");
         save.records.insert(7, unplayed.replace("\"played\":false", "\"played\":true"));
-        scan.refresh(&mut save, true);
+        scan.refresh(&mut save, 100);
         drain(&mut scan, &mut save);
         assert_eq!(scan.counts.matches, 1);
         assert_eq!(scan.versions["1.3"].champs["b"].w, 1);
@@ -347,11 +386,50 @@ pub(crate) mod tests {
             save.records.insert(id, game(v, &["a"], &["b"], true));
         }
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(scan.counts.matches, 200 + OLD_STREAK_STOP);
         assert_eq!(scan.counts.skipped_old, 800 - OLD_STREAK_STOP);
         assert_eq!(save.reads, 200 + OLD_STREAK_STOP);
+    }
+
+    #[test]
+    fn unplayed_rechecks_and_the_backlog_are_bounded() {
+        let mut save = FakeSave::default();
+        let unplayed = r#"{"played":false,"version":"1.3","blue_team_win":false,"blue_team":[{"champion":"a"}],"red_team":[{"champion":"b"}]}"#;
+        for id in 1..=1000 {
+            save.records.insert(id, unplayed.to_string());
+        }
+        let mut scan = Scanner::new(RecordKindV1::SoloRankMatch, true);
+        scan.refresh(&mut save, 0);
+        drain(&mut scan, &mut save);
+        assert_eq!(save.reads, 1000);
+        scan.refresh(&mut save, 0);
+        assert_eq!(scan.pending(), 0);
+        scan.refresh(&mut save, 100);
+        assert_eq!(scan.pending(), 100, "only the oldest 100 are looked at again");
+        drain(&mut scan, &mut save);
+        assert_eq!(save.reads, 1100);
+
+        // the backlog stops after the cap; newer records still come in
+        let mut save = FakeSave::default();
+        for id in 1..=500 {
+            save.records.insert(id, game("1.3", &["a"], &["b"], true));
+        }
+        let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
+        scan.refresh(&mut save, 0);
+        for _ in 0..50 {
+            scan.step(&mut save);
+        }
+        scan.cap_backlog(50);
+        assert_eq!(scan.pending(), 0);
+        assert_eq!(scan.counts.skipped_old, 450);
+        save.records.insert(501, game("1.3", &["a"], &["b"], false));
+        scan.refresh(&mut save, 0);
+        scan.refresh_new(&mut save);
+        assert_eq!(scan.pending(), 1);
+        drain(&mut scan, &mut save);
+        assert_eq!(scan.counts.matches, 51);
     }
 
     #[test]
@@ -360,7 +438,7 @@ pub(crate) mod tests {
         save.records.insert(1, r#"{"date":3}"#.to_string());
         save.records.insert(2, "garbage".to_string());
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
-        scan.refresh(&mut save, false);
+        scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
         assert_eq!(scan.counts.invalid, 2);
         assert!(scan.first_problem.as_deref().unwrap().starts_with("record #2: not JSON"));

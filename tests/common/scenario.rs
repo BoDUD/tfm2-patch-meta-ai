@@ -334,11 +334,18 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         // on the title screen nothing happens
         frame(SceneKindV1::Title.code());
         assert!(w.log.is_empty());
-        // a save is open: the 30 matches are read in the first frame, the tier list goes out,
-        // the server writes it and answers, the client reads the answer next frame
-        for _ in 0..5 {
+        // a save is open: the 30 matches are read a few per frame (about 1 ms of reading per
+        // frame), the model is rebuilt (every 5 s of real time), the tier list goes out, the
+        // server writes it and answers, the client reads the answer
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while !(*(state as *mut World)).log.contains(&"event apply_tiers_result".to_string()) {
+            assert!(started.elapsed().as_secs() < 30, "no tier list after {frames} frames");
             frame(SceneKindV1::InGame.code());
+            frames += 1;
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        frame(SceneKindV1::InGame.code()); // the client takes the server's answer
         let tiers: serde_json::Value = serde_json::from_str(&w.tiers).unwrap();
         assert_eq!(tiers["alpha"], "S", "{tiers}");
         assert_eq!(tiers["zulu"], "A", "kept: not a champion of this save");

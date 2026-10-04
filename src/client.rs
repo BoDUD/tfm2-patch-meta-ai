@@ -29,6 +29,10 @@ pub trait Game: Source {
     fn game_date(&mut self) -> Option<(i32, u32, u32)>;
     fn send_command(&mut self, command: &str, payload: &[u8]) -> bool;
     fn take_events(&mut self) -> Vec<(String, Vec<u8>)>;
+    /// A match is on screen (reading then would cost frames where they show most).
+    fn watching_match(&mut self) -> bool {
+        false
+    }
 }
 
 struct ClientGame<'a, 'b> {
@@ -63,6 +67,9 @@ impl Game for ClientGame<'_, '_> {
     fn take_events(&mut self) -> Vec<(String, Vec<u8>)> {
         self.ctx.take_events().into_iter().map(|e| (e.event, e.payload)).collect()
     }
+    fn watching_match(&mut self) -> bool {
+        self.ctx.client_scene_kind() == Some(mod_api_stable::ClientSceneKindV1::Match)
+    }
 }
 
 pub struct ClientExt;
@@ -75,32 +82,39 @@ impl StableExtension for ClientExt {
 }
 
 const IDENTITY_EVERY: Duration = Duration::from_secs(2);
-const LIST_EVERY: Duration = Duration::from_secs(2);
-const RECHECK_UNPLAYED_EVERY: Duration = Duration::from_secs(30);
-const REBUILD_EVERY: Duration = Duration::from_secs(2);
-const NEWS_EVERY: Duration = Duration::from_secs(30);
+const LIST_EVERY: Duration = Duration::from_secs(10);
+/// Unplayed solo-rank matches looked at again once per in-game day, oldest first.
+const RECHECK_UNPLAYED: usize = 200;
+const REBUILD_EVERY: Duration = Duration::from_secs(5);
+const NEWS_EVERY: Duration = Duration::from_secs(300);
+/// Records read per save at most (newest first); older ones add little to the current patch.
+const BACKLOG_COMPETITION: u32 = 3000;
+const BACKLOG_SOLO: u32 = 2000;
 const TABLE_EVERY: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
-/// Reading time per frame; a single record that takes longer pauses reading for a few frames.
-const FRAME_BUDGET: Duration = Duration::from_millis(3);
-const SLOW_READ: Duration = Duration::from_millis(8);
-const MAX_READS_PER_FRAME: u32 = 40;
+/// Average reading time per frame. A record that takes longer is paid back over the next
+/// frames (no reading until then), so a heavy replay costs one short hitch, not a slow game.
+const FRAME_BUDGET: Duration = Duration::from_micros(1000);
+const MAX_READS_PER_FRAME: u32 = 20;
 
 struct State {
     out_of_game: bool,
     save: Option<(usize, String)>,
     next_identity: Option<Instant>,
     next_list: Option<Instant>,
-    recheck_unplayed_at: Option<Instant>,
+    unplayed_day: Option<(i32, u32, u32)>,
     comp: Scanner,
     solo: Scanner,
-    pause_frames: u32,
+    /// Reading time spent beyond the per-frame budget, paid back by frames that do not read.
+    debt: Duration,
     reported_backfill: bool,
     dirty: bool,
     next_rebuild: Option<Instant>,
     rebuilt_with: Option<Arc<Config>>,
     notes: Vec<PatchNote>,
     news_read_at: Option<Instant>,
+    /// The newest played version when the news was last read.
+    news_version: Option<String>,
     table_written_at: Option<Instant>,
     table: Option<String>,
     last_summary: String,
@@ -116,16 +130,17 @@ impl State {
             save: None,
             next_identity: None,
             next_list: None,
-            recheck_unplayed_at: None,
+            unplayed_day: None,
             comp: Scanner::new(RecordKindV1::MatchReplay, false),
             solo: Scanner::new(RecordKindV1::SoloRankMatch, true),
-            pause_frames: 0,
+            debt: Duration::ZERO,
             reported_backfill: false,
             dirty: false,
             next_rebuild: None,
             rebuilt_with: None,
             notes: Vec::new(),
             news_read_at: None,
+            news_version: None,
             table_written_at: None,
             table: None,
             last_summary: String::new(),
@@ -198,13 +213,16 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     if due(st.next_list, now) {
         st.next_list = Some(now + LIST_EVERY);
-        let recheck = due(st.recheck_unplayed_at, now);
-        if recheck {
-            st.recheck_unplayed_at = Some(now + RECHECK_UNPLAYED_EVERY);
+        let day = game.game_date();
+        let new_day = day.is_some() && day != st.unplayed_day;
+        if new_day {
+            st.unplayed_day = day;
         }
-        st.comp.refresh(game, false);
+        st.comp.refresh(game, 0);
+        st.comp.refresh_new(game);
         if cfg.solo_weight > 0.0 {
-            st.solo.refresh(game, recheck);
+            st.solo.refresh(game, if new_day { RECHECK_UNPLAYED } else { 0 });
+            st.solo.refresh_new(game);
         }
         diag::log_once(
             "listed",
@@ -215,7 +233,12 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         );
     }
 
-    read_records(st, game, cfg);
+    // nothing is read while a match is on screen
+    if !game.watching_match() {
+        read_records(st, game, cfg);
+    }
+    st.comp.cap_backlog(BACKLOG_COMPETITION);
+    st.solo.cap_backlog(BACKLOG_SOLO);
     report_probes(st);
 
     let caught_up = st.comp.pending() == 0 && st.solo.pending() == 0;
@@ -243,13 +266,12 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 }
 
 fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
-    if st.pause_frames > 0 {
-        st.pause_frames -= 1;
+    if st.debt > Duration::ZERO {
+        st.debt = st.debt.saturating_sub(FRAME_BUDGET);
         return;
     }
     let frame = Instant::now();
     for _ in 0..MAX_READS_PER_FRAME {
-        let started = Instant::now();
         let step = if st.comp.pending() > 0 {
             st.comp.step(game)
         } else if cfg.solo_weight > 0.0 && st.solo.pending() > 0 {
@@ -261,15 +283,11 @@ fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
             break;
         }
         st.dirty = true;
-        let took = started.elapsed();
-        if took > SLOW_READ {
-            st.pause_frames = (took.as_millis() / 4).min(30) as u32;
-            break;
-        }
         if frame.elapsed() >= FRAME_BUDGET {
             break;
         }
     }
+    st.debt = frame.elapsed().saturating_sub(FRAME_BUDGET).min(Duration::from_secs(2));
 }
 
 fn report_probes(st: &mut State) {
@@ -348,8 +366,10 @@ fn current_version(
 
 fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant) {
     // the patch notes (re-read every 30 s; they change once per in-game patch)
-    if due(st.news_read_at.map(|t| t + NEWS_EVERY), now) {
+    let played_newest = st.comp.current_version().or_else(|| st.solo.current_version());
+    if due(st.news_read_at.map(|t| t + NEWS_EVERY), now) || played_newest != st.news_version {
         st.news_read_at = Some(now);
+        st.news_version = played_newest;
         match game.record_json(RecordKindV1::Team, team, "news") {
             Some(json) => match patchnotes::parse_news(&json) {
                 Ok(notes) => {
@@ -704,6 +724,9 @@ mod tests {
         sent: Vec<Request>,
         events: Vec<(String, Vec<u8>)>,
         accept: bool,
+        read_delay: Duration,
+        watching: bool,
+        reads: u32,
     }
 
     impl Source for FakeGame {
@@ -715,6 +738,10 @@ mod tests {
             }
         }
         fn record_json(&mut self, kind: RecordKindV1, id: usize, path: &str) -> Option<String> {
+            if kind == RecordKindV1::MatchReplay {
+                self.reads += 1;
+                std::thread::sleep(self.read_delay);
+            }
             match (kind, path) {
                 (RecordKindV1::MatchReplay, "") => self.replays.get(&id).cloned(),
                 (RecordKindV1::SoloRankMatch, "") => self.solo.get(&id).cloned(),
@@ -768,6 +795,9 @@ mod tests {
         }
         fn take_events(&mut self) -> Vec<(String, Vec<u8>)> {
             std::mem::take(&mut self.events)
+        }
+        fn watching_match(&mut self) -> bool {
+            self.watching
         }
     }
 
@@ -867,6 +897,40 @@ mod tests {
         // leaving the game clears everything
         tick(&mut g, false, now);
         assert!(shared::get().is_none());
+    }
+
+    #[test]
+    fn slow_records_cost_about_a_millisecond_per_frame() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        let mut g = save();
+        g.read_delay = Duration::from_millis(20); // a heavy replay
+        let started = Instant::now();
+        let mut now = Instant::now();
+        let mut worst = Duration::ZERO;
+        for _ in 0..400 {
+            let t = Instant::now();
+            tick(&mut g, true, now);
+            worst = worst.max(t.elapsed());
+            now += Duration::from_millis(16);
+        }
+        let per_frame = started.elapsed() / 400;
+        assert!(g.reads >= 15, "still reading: {}", g.reads);
+        assert!(per_frame < Duration::from_micros(1800), "{per_frame:?} per frame");
+        assert!(worst < Duration::from_millis(45), "one record per frame at most: {worst:?}");
+    }
+
+    #[test]
+    fn nothing_is_read_during_a_match() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        let mut g = save();
+        g.watching = true;
+        frames(&mut g, 100, Instant::now());
+        assert_eq!(g.reads, 0);
+        g.watching = false;
+        frames(&mut g, 5, Instant::now());
+        assert!(g.reads > 0);
     }
 
     #[test]
