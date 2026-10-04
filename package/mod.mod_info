@@ -1,0 +1,16 @@
+{
+  "author": "BoDUD",
+  "contains_code": true,
+  "dependencies": [
+    {
+      "mod_id": "base",
+      "version": ">=0.6.0"
+    }
+  ],
+  "description": "Patch-aware draft AI and an automatic tier list. Reads every competition match and solo-rank game of your save and estimates each champion's win rate in the current in-game patch (starting from the previous patch's results and the patch notes). Then (1) the AI's bans and picks lean toward champions that really win, and (2) your team's S/A/B/C/D champion tier list is kept up to date (it shows from the next in-game day). Settings: settings.ini in the mod folder, applied within seconds. diag.log and meta_table.txt in the same folder show what the mod sees.\n\n根据存档里当前版本的真实胜负：让 AI 的 ban/pick 更合理，并自动维护你队伍的 S/A/B/C/D 英雄梯队（游戏内第二天显示）。设置文件 settings.ini 在 Mod 文件夹内，保存后几秒生效。",
+  "last_updated": "2026-10-04",
+  "mod_id": "patch_meta_ai",
+  "mod_type": "native",
+  "name": "Patch Meta AI: Smarter Ban/Pick + Auto Tier List",
+  "version": "1.0.0"
+}

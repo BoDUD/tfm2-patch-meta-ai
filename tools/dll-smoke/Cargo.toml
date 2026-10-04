@@ -1,0 +1,15 @@
+# Loads the built patch_meta_ai.dll with LoadLibrary and runs tests/common/scenario.rs against it:
+# the same game session the integration test runs, but through the real DLL (Windows or Wine).
+#   cargo build --release --target x86_64-pc-windows-gnu
+#   wine dll-smoke.exe Z:\path\to\folder\patch_meta_ai.dll
+[package]
+name = "dll-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+mod-api-stable = { path = "../../vendor/mod-api-stable" }
+serde_json = "1"
+
+[workspace]

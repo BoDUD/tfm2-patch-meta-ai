@@ -1,0 +1,25 @@
+# Patch Meta AI for Teamfight Manager 2 (stable mod API, game 0.6+).
+# `cargo build --release` on Windows gives target/release/patch_meta_ai.dll; from Linux,
+# tools/build.sh cross-compiles the same DLL (x86_64-pc-windows-gnu) and packages the mod folder.
+[package]
+name = "patch_meta_ai"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Teamfight Manager 2 mod: patch-aware ban/pick AI and an automatic champion tier list"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The game's stable-ABI SDK (mod-sdk-stable/mod-api-stable as shipped with game 0.6.2, ABI level 9).
+mod-api-stable = { path = "vendor/mod-api-stable" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# panic stays "unwind": the SDK shims catch a panic inside a callback instead of taking the game down.
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
