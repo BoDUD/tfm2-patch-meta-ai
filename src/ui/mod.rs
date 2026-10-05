@@ -10,10 +10,10 @@
 pub mod draft_screen;
 pub mod explore;
 pub mod names;
+pub mod page;
 pub mod panel;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::history::Role;
@@ -40,11 +40,33 @@ pub trait Ui {
     fn main_tab(&self) -> Option<String> {
         None
     }
-    /// A click on `path` sets `flag`. The handler only sets a flag, so registering the same path
-    /// again (the game keeps handlers by path) or a click delivered twice does no harm.
-    fn on_click(&mut self, _path: &str, _flag: &'static AtomicBool) -> bool {
+    /// Clicks on `path` are queued for [`take_clicks`]. The game keeps handlers by path and may
+    /// deliver one click twice; the queue is deduplicated per frame, so that does no harm.
+    fn on_click(&mut self, _path: &str) -> bool {
         false
     }
+    /// Fills an image node with a champion's face.
+    fn set_champion_icon(&mut self, _path: &str, _champion: &str, _size: f32) -> bool {
+        false
+    }
+    /// The game has a text under this reference (`#asset/...?key`).
+    fn has_text(&self, _reference: &str) -> bool {
+        false
+    }
+}
+
+static CLICKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The paths clicked since the last call, each once.
+pub fn take_clicks() -> Vec<String> {
+    let mut list = std::mem::take(&mut *CLICKS.lock().unwrap_or_else(PoisonError::into_inner));
+    let mut seen = std::collections::HashSet::new();
+    list.retain(|p| seen.insert(p.clone()));
+    list
+}
+
+fn push_click(path: String) {
+    CLICKS.lock().unwrap_or_else(PoisonError::into_inner).push(path);
 }
 
 impl Ui for StableClient<'_> {
@@ -94,14 +116,34 @@ impl Ui for StableClient<'_> {
     fn main_tab(&self) -> Option<String> {
         self.client_main_tab()
     }
-    fn on_click(&mut self, path: &str, flag: &'static AtomicBool) -> bool {
+    fn on_click(&mut self, path: &str) -> bool {
+        let owned = path.to_string();
         self.ui_register_path_events(path, move |ctx| {
             // a click (or a host that does not say which event); not hovers or node removal
             if matches!(ctx.ui_current_event().and_then(|e| e.kind), None | Some(UiEventKindV1::Click)) {
-                flag.store(true, Ordering::SeqCst);
+                push_click(owned.clone());
             }
         })
     }
+    fn set_champion_icon(&mut self, path: &str, champion: &str, size: f32) -> bool {
+        self.ui_set_champion_icon(path, champion, size, size, 2.0)
+    }
+    fn has_text(&self, reference: &str) -> bool {
+        self.i18n(reference).is_some_and(|t| !t.is_empty() && !t.starts_with('#'))
+    }
+}
+
+/// What a screen element gets every frame.
+pub struct Frame<'a> {
+    pub frame: u64,
+    pub snapshot: Option<&'a crate::shared::Snapshot>,
+    pub context: &'a Context,
+    /// The team to scout ([`team_key`]).
+    pub opponent: Option<&'a str>,
+    /// The screen and management tab (another one closes pages opened on this one).
+    pub screen: &'a str,
+    /// This frame's clicks (see [`take_clicks`]).
+    pub clicks: &'a [String],
 }
 
 /// What the screens need from the save (set by the client when a save is read).
@@ -130,6 +172,7 @@ struct State {
     names: names::NameBook,
     draft: draft_screen::DraftScreen,
     panel: panel::Panel,
+    page: page::MetaPage,
     context: Context,
 }
 
@@ -178,7 +221,19 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     let snapshot = crate::shared::get();
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
-    st.panel.tick(ui, frame, snapshot.as_deref(), &st.context, opponent.as_deref(), &screen);
+    let clicks = take_clicks();
+    let f = Frame {
+        frame,
+        snapshot: snapshot.as_deref(),
+        context: &st.context,
+        opponent: opponent.as_deref(),
+        screen: &screen,
+        clicks: &clicks,
+    };
+    st.panel.tick(ui, &f);
+    if cfg.meta_page {
+        st.page.tick(ui, &f);
+    }
 }
 
 /// A team name as a key: lower case, without the league rank the ban/pick screen appends
@@ -226,15 +281,18 @@ pub(crate) mod tests {
         pub nodes: BTreeMap<String, Node>,
         pub spawned: Vec<(String, String)>,
         pub keys: Vec<String>,
-        pub clicks: Vec<(String, &'static AtomicBool)>,
+        pub handlers: Vec<String>,
+        pub icons: BTreeMap<String, String>,
+        pub texts: Vec<String>,
     }
 
     impl FakeUi {
-        /// The player clicks a node: every handler registered on it runs.
+        /// The player clicks a node: every handler registered on it runs (twice when it was
+        /// registered twice, as the game does).
         pub fn click(&self, path: &str) {
-            for (p, flag) in &self.clicks {
+            for p in &self.handlers {
                 if p == path && self.nodes.contains_key(path) {
-                    flag.store(true, Ordering::SeqCst);
+                    push_click(p.clone());
                 }
             }
         }
@@ -381,9 +439,19 @@ pub(crate) mod tests {
         fn keys_pressed(&self) -> Vec<String> {
             self.keys.clone()
         }
-        fn on_click(&mut self, path: &str, flag: &'static AtomicBool) -> bool {
-            self.clicks.push((path.to_string(), flag));
+        fn on_click(&mut self, path: &str) -> bool {
+            self.handlers.push(path.to_string());
             true
+        }
+        fn set_champion_icon(&mut self, path: &str, champion: &str, _size: f32) -> bool {
+            if !self.nodes.contains_key(path) {
+                return false;
+            }
+            self.icons.insert(path.to_string(), champion.to_string());
+            true
+        }
+        fn has_text(&self, reference: &str) -> bool {
+            self.texts.iter().any(|t| t == reference)
         }
     }
 

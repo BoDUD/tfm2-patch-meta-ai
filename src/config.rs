@@ -90,6 +90,8 @@ pub struct Config {
     pub grid_values: bool,
     /// ... the likely lane of each enemy pick.
     pub lane_tags: bool,
+    /// The Meta Analysis page in the left menu.
+    pub meta_page: bool,
     // [report]
     /// Write `meta_report.html` next to `meta_table.txt`.
     pub report: bool,
@@ -126,6 +128,7 @@ impl Default for Config {
             draft_overlay: true,
             grid_values: true,
             lane_tags: true,
+            meta_page: true,
             report: true,
             verbose: false,
             explore: false,
@@ -220,6 +223,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
+        "meta_page" => cfg.meta_page = flag(value)?,
         "explore" => cfg.explore = flag(value)?,
         "patches" => cfg.patches = number(value)?.round(),
         "drift" => cfg.drift = number(value)?,
@@ -404,7 +408,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} explore={}",
+         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         c.tier_list.as_str(),
         c.patches,
@@ -430,6 +434,7 @@ pub fn summary(c: &Config) -> String {
         if c.draft_overlay { "on" } else { "off" },
         if c.grid_values { "on" } else { "off" },
         if c.lane_tags { "on" } else { "off" },
+        if c.meta_page { "on" } else { "off" },
         if c.explore { "on" } else { "off" }
     )
 }
@@ -521,9 +526,12 @@ unranked=keep
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
 ; lane_tags     : on each enemy pick, its most likely lane / 敌方每个已选英雄最可能的位置
+; meta_page     : a "Meta Analysis" page in the left menu (champions, duos, players, model)
+;                 左侧菜单里的"版本分析"页面（英雄、组合、选手、模型）
 draft_overlay=on
 grid_values=on
 lane_tags=on
+meta_page=on
 
 [report]
 ; meta_report.html in the mod folder: tiers, lane win rates, synergies, matchups, players

@@ -120,6 +120,8 @@ pub struct Champion {
     pub sd: f32,
     /// Strength in the patch before (None when only one patch is kept).
     pub previous: Option<f32>,
+    /// Strength and competition games in every kept patch, oldest first (`Meta::versions`).
+    pub history: Vec<(f32, Tally)>,
     /// Games and wins this patch / over the kept patches.
     pub current: Tally,
     pub window: Tally,
@@ -468,6 +470,12 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             strength: e.value,
             sd: e.sd,
             previous: (cur_index > 0).then(|| effect(Key::Champ(c, cur_index - 1)).value),
+            history: (0..=cur_index)
+                .map(|v| {
+                    let t = per_version[v as usize].get(&c).copied().unwrap_or_default();
+                    (effect(Key::Champ(c, v)).value, t)
+                })
+                .collect(),
             current: cur.get(&c).copied().unwrap_or_default(),
             window,
             evidence,
@@ -702,6 +710,9 @@ pub(crate) mod tests {
         let c = meta.champion("c").unwrap();
         let l = meta.champion("l").unwrap();
         assert_eq!(c.last_change, Some(("1.2".to_string(), -1)));
+        assert_eq!(c.history.len(), 2);
+        assert!(c.history[0].0 > c.history[1].0, "the nerf shows in its history: {:?}", c.history);
+        assert_eq!(c.history[1].1, c.current);
         assert_eq!(c.patch_dir, -1);
         // c dropped from ~62%; l (untouched) stays weak on its history
         assert!(c.win_rate() < 0.55 && c.win_rate() > 0.4, "c {} {:?}", c.win_rate(), c.current);
