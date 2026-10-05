@@ -129,14 +129,12 @@ fn lock() -> MutexGuard<'static, Option<State>> {
 pub fn set_context(context: Context) {
     let mut guard = lock();
     let st = guard.get_or_insert_with(State::default);
-    if st.context.champions != context.champions {
-        st.names = names::NameBook::default();
-    }
     for (label, id) in &context.english {
         st.names.learn(label, id);
     }
     for id in &context.champions {
         st.names.learn(id, id);
+        st.names.learn(&names::name_ref(id), id);
     }
     st.context = context;
 }
@@ -153,9 +151,6 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     st.frame += 1;
     let frame = st.frame;
     st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"));
-    if scene == Some(ClientSceneKindV1::Main) || scene.is_none() {
-        st.names.tick(ui, frame, &st.context.champions);
-    }
     if cfg.draft_overlay {
         let view = draft_screen::View {
             team_name: &st.context.team_name,
@@ -169,7 +164,20 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     let snapshot = crate::shared::get();
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
-    st.panel.tick(ui, frame, snapshot.as_deref(), &st.names, &st.context, opponent.as_deref(), &screen);
+    st.panel.tick(ui, frame, snapshot.as_deref(), &st.context, opponent.as_deref(), &screen);
+}
+
+/// A team name as a key: lower case, without the league rank the ban/pick screen appends
+/// ("Samsung Galaxy #1") or stray line breaks.
+pub fn team_key(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let mut key = clean.trim();
+    if let Some(at) = key.rfind(" #") {
+        if key[at + 2..].chars().all(|c| c.is_ascii_digit()) && at + 2 < key.len() {
+            key = key[..at].trim_end();
+        }
+    }
+    key.to_lowercase()
 }
 
 /// Text for a `.ui` string literal.
@@ -347,6 +355,14 @@ pub(crate) mod tests {
         fn keys_pressed(&self) -> Vec<String> {
             self.keys.clone()
         }
+    }
+
+    #[test]
+    fn team_keys() {
+        assert_eq!(team_key("Samsung Galaxy #1"), "samsung galaxy");
+        assert_eq!(team_key("Jin Air Green Wings\r #10"), "jin air green wings");
+        assert_eq!(team_key(" T1 "), "t1");
+        assert_eq!(team_key("Team #Blue"), "team #blue");
     }
 
     #[test]

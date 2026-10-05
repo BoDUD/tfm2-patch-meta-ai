@@ -2,29 +2,32 @@
 //!
 //! - **win chance** (bottom left, under the player's picks): the model's probability that the
 //!   player's line-up beats the enemy's as picked so far, with a bar;
-//! - **advice** (bottom right): the best picks and bans for the player right now, each with
-//!   what it is worth and why (lane, synergy, matchups);
+//! - **advice** (bottom right): the best picks and the best ban for the player right now, each
+//!   with what it is worth and why (lane, synergy, matchups, the player's mastery);
 //! - **grid values**: on every champion card, what picking it is worth to the player now, in
 //!   win-rate points;
 //! - **enemy lanes**: on each enemy pick, the lane it most likely plays and how sure that is -
 //!   from the champions' lane history, so it works in every language.
 //!
-//! The screen is read from the champion grid: each card says (in its `blue` / `red` badge and
-//! `ban` icon) who picked or banned it. A card's champion comes from its runner state when that
-//! names one, else from its name label (`names::NameBook`). Both bottom corners of the screen
-//! are empty in the game's layout (team names, bans and logos sit in the middle).
+//! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
+//! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
+//! badge is visible once that side picked it, with the pick number in `<badge>.text`, and its
+//! `ban` icon once it is banned. Team names sit in `main.bottom.<side>_side.name` with the
+//! league rank appended ("Samsung Galaxy #1"). Labels read back the raw text they were given,
+//! so champion names are written as the game's own name reference and the game shows them in
+//! its language. Both bottom corners of the screen are empty in the game's layout.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use super::names::NameBook;
-use super::{color, Ui};
+use super::names::{name_ref, NameBook};
+use super::{color, team_key, Ui};
 use crate::advisor::{self, PickValue};
+use crate::diag;
 use crate::glm::sigmoid;
 use crate::history::Role;
 use crate::shared::Snapshot;
-use crate::diag;
 
 pub const GRID: &str = "main.champions.contents";
 const OVERLAY: &str = "main.pma";
@@ -34,18 +37,21 @@ const BLUE_NAME: &str = "main.bottom.blue_side.name";
 const RED_NAME: &str = "main.bottom.red_side.name";
 const PICK_COLUMNS: [&str; 2] = ["main.blue_picks", "main.red_picks"];
 const READ_EVERY: u64 = 6;
+/// Matches the model needs before its advice is shown.
+const MIN_MATCHES: u32 = 10;
 
 const BLUE: u32 = 0x5b73ffff;
 const RED: u32 = 0xef6471ff;
 const GOOD: u32 = 0x4cc38aff;
 const BAD: u32 = 0xef6471ff;
 const DIM: u32 = 0xa3a9b6ff;
+const TEXT: u32 = 0xe8e8e8ff;
 const PANEL: u32 = 0x161721f0;
 
 /// What the overlay shows besides the model.
 pub struct View<'a> {
     pub team_name: &'a str,
-    /// Each team's players and lanes, by team name (lower case).
+    /// Each team's players and lanes, by [`team_key`].
     pub rosters: &'a HashMap<String, Vec<(u32, Option<Role>)>>,
     pub grid_values: bool,
     pub lane_tags: bool,
@@ -55,8 +61,6 @@ pub struct View<'a> {
 pub struct Card {
     pub path: String,
     pub champ: Option<String>,
-    /// The name on the card.
-    pub label: String,
     /// Picked by blue / red, with the pick number on the badge.
     pub blue: Option<u32>,
     pub red: Option<u32>,
@@ -65,7 +69,7 @@ pub struct Card {
 
 #[derive(Default)]
 pub struct DraftScreen {
-    /// The other team on the last ban/pick screen (lower case), for scouting.
+    /// The other team on the last ban/pick screen ([`team_key`]), for scouting.
     pub enemy_team: Option<String>,
     on: bool,
     next_read: u64,
@@ -79,8 +83,12 @@ fn visible(ui: &impl Ui, path: &str) -> bool {
     ui.visible(path) == Some(true)
 }
 
-/// The champion on a card: a champion id in its runner state, else its name label.
-fn card_champion(ui: &impl Ui, path: &str, label: &str, known: &dyn Fn(&str) -> bool, names: &NameBook) -> Option<String> {
+/// The champion on a card: its node name (the champion id), else a champion id in its runner
+/// state, else its name label.
+fn card_champion(ui: &impl Ui, child: &str, path: &str, known: &dyn Fn(&str) -> bool, names: &NameBook) -> Option<String> {
+    if known(child) {
+        return Some(child.to_string());
+    }
     if let Some(state) = ui.state(path).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
         for key in ["champion", "champion_name", "name", "id", "key"] {
             if let Some(v) = crate::records::find_key(&state, key).and_then(|v| v.as_str()) {
@@ -90,7 +98,8 @@ fn card_champion(ui: &impl Ui, path: &str, label: &str, known: &dyn Fn(&str) -> 
             }
         }
     }
-    names.lookup(label).map(str::to_string).filter(|c| known(c))
+    let label = ui.text(&format!("{path}.name")).unwrap_or_default();
+    names.lookup(&label).map(str::to_string).filter(|c| known(c))
 }
 
 pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -> Vec<Card> {
@@ -98,17 +107,15 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
         .into_iter()
         .map(|child| {
             let path = format!("{GRID}.{child}");
-            let label = ui.text(&format!("{path}.name")).unwrap_or_default();
             let badge = |side: &str| -> Option<u32> {
                 let p = format!("{path}.{side}");
                 visible(ui, &p).then(|| ui.text(&format!("{p}.text")).and_then(|t| t.trim().parse().ok()).unwrap_or(0))
             };
             Card {
-                champ: card_champion(ui, &path, &label, known, names),
+                champ: card_champion(ui, &child, &path, known, names),
                 blue: badge("blue"),
                 red: badge("red"),
                 banned: visible(ui, &format!("{path}.ban")),
-                label,
                 path,
             }
         })
@@ -117,12 +124,11 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
 
 /// 0 = the player is blue, 1 = red (from the team names at the bottom of the screen).
 pub fn player_side(ui: &impl Ui, team_name: &str) -> Option<usize> {
-    let norm = |s: &str| s.trim().to_lowercase();
-    let team = norm(team_name);
+    let team = team_key(team_name);
     if team.is_empty() {
         return None;
     }
-    [BLUE_NAME, RED_NAME].iter().position(|p| ui.text(p).is_some_and(|t| norm(&t) == team))
+    [BLUE_NAME, RED_NAME].iter().position(|p| ui.text(p).is_some_and(|t| team_key(&t) == team))
 }
 
 fn points(v: f32) -> f32 {
@@ -133,14 +139,19 @@ fn signed(v: f32) -> String {
     format!("{}{:.1}", if v >= 0.0 { "+" } else { "" }, v)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn label(id: &str, x: u32, y: u32, w: u32, h: u32, size: u32, c: u32, align: &str) -> String {
+    format!(
+        "#{id}:label {{ @\"asset/base/style/main#label\"; x: {x}px; y: {y}px; width: {w}px; height: {h}px; \
+         size: {size}; color: {}; align_x: {align}; align_y: Center; text: \"\"; ignore_event: true; }} ",
+        color(c)
+    )
+}
+
+/// Advice rows: what (pick / ban), the champion's name, its value, why.
+const ADVICE_ROWS: usize = 3;
+
 fn overlay_source() -> String {
-    let label = |id: &str, x: u32, y: u32, w: u32, h: u32, size: u32, c: u32, align: &str| {
-        format!(
-            "#{id}:label {{ @\"asset/base/style/main#label\"; x: {x}px; y: {y}px; width: {w}px; height: {h}px; \
-             size: {size}; color: {}; align_x: {align}; align_y: Center; text: \"\"; ignore_event: true; }} ",
-            color(c)
-        )
-    };
     let panel = |id: &str, x: u32, inner: String| {
         format!(
             "#{id}:color {{ x: {x}px; y: 988px; width: 460px; height: 84px; color: {}; ignore_event: true; \
@@ -153,17 +164,19 @@ fn overlay_source() -> String {
          rounding: Uniform {{ rounding: 4; }} #fill:color {{ width: 50%; height: 100%; color: {}; ignore_event: true; \
          rounding: Uniform {{ rounding: 4; }} }} }} ",
         label("title", 12, 4, 300, 22, 13, DIM, "Left"),
-        label("value", 12, 26, 200, 34, 26, 0xe8e8e8ff, "Left"),
+        label("value", 12, 26, 200, 34, 26, TEXT, "Left"),
         label("detail", 200, 30, 248, 26, 13, DIM, "Right"),
         color(RED),
         color(BLUE)
     );
-    let advice = format!(
-        "{}{}{}",
-        label("l0", 12, 4, 436, 24, 13, 0xe8e8e8ff, "Left"),
-        label("l1", 12, 30, 436, 24, 13, 0xe8e8e8ff, "Left"),
-        label("l2", 12, 56, 436, 24, 13, DIM, "Left")
-    );
+    let mut advice = String::new();
+    for r in 0..ADVICE_ROWS {
+        let y = 4 + r as u32 * 26;
+        advice.push_str(&label(&format!("k{r}"), 12, y, 40, 24, 13, DIM, "Left"));
+        advice.push_str(&label(&format!("c{r}"), 56, y, 150, 24, 14, TEXT, "Left"));
+        advice.push_str(&label(&format!("v{r}"), 208, y, 56, 24, 14, GOOD, "Right"));
+        advice.push_str(&label(&format!("w{r}"), 274, y, 178, 24, 12, DIM, "Left"));
+    }
     format!(
         "pma:empty {{ width: 100%; height: 100%; ignore_event: true; {}{}}}",
         panel("win", 20, win),
@@ -178,6 +191,27 @@ fn tag_source(id: &str, w: u32, x_from_right: bool) -> String {
          rounding: Uniform {{ rounding: 6; }} #text:label {{ @\"asset/base/style/main#label\"; width: 100%; height: 100%; \
          size: 12; align_x: Center; align_y: Center; text: \"\"; ignore_event: true; }} }}"
     )
+}
+
+/// Why a pick or ban is worth what it is, in a few words.
+fn why(v: &PickValue) -> String {
+    let mut parts = Vec::new();
+    if let Some(r) = v.role {
+        parts.push(r.name().to_string());
+    }
+    if v.synergy.abs() >= 0.02 {
+        parts.push(format!("syn {}", signed(points(v.synergy))));
+    }
+    if v.counter.abs() >= 0.02 {
+        parts.push(format!("vs {}", signed(points(v.counter))));
+    }
+    if v.mastery.abs() >= 0.02 {
+        parts.push(format!("player {}", signed(points(v.mastery))));
+    }
+    if v.balance > 0.0 {
+        parts.push("one-sided".to_string());
+    }
+    parts.join(" · ")
 }
 
 impl DraftScreen {
@@ -199,18 +233,38 @@ impl DraftScreen {
             return;
         }
         self.next_read = frame + READ_EVERY;
-        let Some(snapshot) = snapshot else { return };
+        let side = player_side(ui, view.team_name);
+        self.enemy_team = ui.text([BLUE_NAME, RED_NAME][1 - side.unwrap_or(0)]).map(|t| team_key(&t)).filter(|t| !t.is_empty());
+
+        // too little to go on: say so, nothing else
+        let ready = snapshot.filter(|s| s.meta.matches + s.meta.solo_matches >= MIN_MATCHES);
+        let Some(snapshot) = ready else {
+            let matches = snapshot.map_or(0, |s| s.meta.matches + s.meta.solo_matches);
+            if self.drawn == Some(matches as u64) && ui.exists(OVERLAY) {
+                return;
+            }
+            if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source()) {
+                return;
+            }
+            self.drawn = Some(matches as u64);
+            ui.set_text(&format!("{OVERLAY}.win.title"), "Patch Meta");
+            ui.set_text(&format!("{OVERLAY}.win.value"), "—");
+            ui.set_text(&format!("{OVERLAY}.win.detail"), &format!("{matches}/{MIN_MATCHES} matches"));
+            ui.set_text(&format!("{OVERLAY}.advice.k0"), "");
+            ui.set_text(&format!("{OVERLAY}.advice.w0"), "");
+            ui.set_text(&format!("{OVERLAY}.advice.c0"), "Not enough matches yet");
+            ui.set_text(&format!("{OVERLAY}.advice.c1"), "比赛数据还不够");
+            return;
+        };
         let meta = &snapshot.meta;
         let known = |c: &str| meta.names.get(c).is_some();
         let cards = read_grid(ui, &known, names);
-        let side = player_side(ui, view.team_name);
         if !self.reported {
             self.reported = true;
             let named = cards.iter().filter(|c| c.champ.is_some()).count();
             diag::log(&format!(
-                "[ui] grid: {} cards, {named} matched to a champion (e.g. {:?}); player side {}",
+                "[ui] grid: {} cards, {named} matched to a champion; player side {}",
                 cards.len(),
-                cards.iter().take(3).map(|c| (&c.label, &c.champ)).collect::<Vec<_>>(),
                 match side {
                     Some(0) => "blue",
                     Some(1) => "red",
@@ -219,7 +273,6 @@ impl DraftScreen {
             ));
         }
         let side = side.unwrap_or(0);
-        self.enemy_team = ui.text([BLUE_NAME, RED_NAME][1 - side]).map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -227,8 +280,9 @@ impl DraftScreen {
             (&c.champ, c.blue, c.red, c.banned).hash(&mut h);
         }
         (side, Arc::as_ptr(snapshot) as usize).hash(&mut h);
-        let key = h.finish();
-        let healthy = ui.exists(OVERLAY) && cards.iter().all(|c| !view.grid_values || ui.exists(&format!("{}.{TAG}", c.path)));
+        let key = h.finish() | 1 << 63;
+        let healthy = ui.exists(OVERLAY)
+            && cards.iter().all(|c| !view.grid_values || c.champ.is_none() || ui.exists(&format!("{}.{TAG}", c.path)));
         if self.drawn == Some(key) && healthy {
             return;
         }
@@ -239,7 +293,7 @@ impl DraftScreen {
         self.drawn = Some(key);
         // the players on each side, by the team names at the bottom of the screen
         let roster_of = |path: &str| -> Vec<(u32, Option<Role>)> {
-            ui.text(path).and_then(|t| view.rosters.get(&t.trim().to_lowercase()).cloned()).unwrap_or_default()
+            ui.text(path).and_then(|t| view.rosters.get(&team_key(&t)).cloned()).unwrap_or_default()
         };
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
         self.draw(ui, snapshot, &cards, side, &rosters, view);
@@ -267,10 +321,9 @@ impl DraftScreen {
         };
         let (blue, red) = (picks(true), picks(false));
         let (ally, enemy) = if side == 0 { (blue, red) } else { (red, blue) };
-        let label_of: HashMap<u16, &str> = cards.iter().filter_map(|c| Some((id(c)?, c.label.as_str()))).collect();
-        let label = |c: u16| -> String { label_of.get(&c).map_or_else(|| meta.names.name(c).to_string(), |l| l.to_string()) };
         let damage = |c: u16| snapshot.damage_of(c);
-        let open: Vec<&Card> = cards.iter().filter(|c| c.blue.is_none() && c.red.is_none() && !c.banned).collect();
+        let open: Vec<u16> =
+            cards.iter().filter(|c| c.blue.is_none() && c.red.is_none() && !c.banned).filter_map(&id).collect();
 
         // win chance
         let p = advisor::win_probability(meta, &ally, &enemy);
@@ -278,81 +331,52 @@ impl DraftScreen {
         ui.set_text(&format!("{OVERLAY}.win.title"), &format!("Win chance 胜率 · {} vs {}", ally.len(), enemy.len()));
         ui.set_text(&format!("{OVERLAY}.win.value"), &format!("{:.0}%", p * 100.0));
         ui.set_properties(&format!("{OVERLAY}.win.value"), &format!("color: {};", color(mine)));
-        ui.set_text(
-            &format!("{OVERLAY}.win.detail"),
-            &format!("patch {} · {} matches", meta.current, meta.current_matches),
-        );
+        ui.set_text(&format!("{OVERLAY}.win.detail"), &format!("patch {} · {} matches", meta.current, meta.current_matches));
         ui.set_properties(&format!("{OVERLAY}.win.back"), &format!("color: {};", color(theirs)));
         ui.set_properties(
             &format!("{OVERLAY}.win.back.fill"),
             &format!("width: {:.1}%; color: {};", (p * 100.0).clamp(2.0, 98.0), color(mine)),
         );
 
-        // advice
-        let mut pick_values: Vec<PickValue> = open
-            .iter()
-            .filter_map(|c| id(c))
-            .map(|c| advisor::pick_value(meta, c, &ally, &enemy, players, &damage))
-            .collect();
+        // advice: the two best picks and the best ban
+        let mut pick_values: Vec<PickValue> =
+            open.iter().map(|c| advisor::pick_value(meta, *c, &ally, &enemy, players, &damage)).collect();
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        let mut ban_values: Vec<PickValue> = open
-            .iter()
-            .filter_map(|c| id(c))
-            .map(|c| advisor::ban_value(meta, c, &ally, &enemy, enemy_players, &damage))
-            .collect();
+        let mut ban_values: Vec<PickValue> =
+            open.iter().map(|c| advisor::ban_value(meta, *c, &ally, &enemy, enemy_players, &damage)).collect();
         ban_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        let why = |v: &PickValue| -> String {
-            let mut parts = Vec::new();
-            if let Some(r) = v.role {
-                parts.push(r.name().to_string());
+        let rows: [(&str, Option<&PickValue>); ADVICE_ROWS] =
+            [("Pick 选", pick_values.first()), ("Alt 备", pick_values.get(1)), ("Ban 禁", ban_values.first())];
+        for (r, (what, v)) in rows.iter().enumerate() {
+            let row = |part: &str| format!("{OVERLAY}.advice.{part}{r}");
+            ui.set_text(&row("k"), what);
+            match v {
+                Some(v) => {
+                    ui.set_text(&row("c"), &name_ref(meta.names.name(v.champ)));
+                    let pts = points(v.total);
+                    ui.set_text(&row("v"), &signed(pts));
+                    ui.set_properties(&row("v"), &format!("color: {};", color(if pts >= 0.0 { GOOD } else { BAD })));
+                    ui.set_text(&row("w"), &why(v));
+                }
+                None => {
+                    for part in ["c", "v", "w"] {
+                        ui.set_text(&row(part), "");
+                    }
+                }
             }
-            if v.synergy.abs() >= 0.02 {
-                parts.push(format!("syn {}", signed(points(v.synergy))));
-            }
-            if v.counter.abs() >= 0.02 {
-                parts.push(format!("vs {}", signed(points(v.counter))));
-            }
-            if v.mastery.abs() >= 0.02 {
-                parts.push(format!("player {}", signed(points(v.mastery))));
-            }
-            if v.balance > 0.0 {
-                parts.push("one-sided dmg".to_string());
-            }
-            parts.join(", ")
-        };
-        let line = |title: &str, list: &[PickValue], n: usize| -> String {
-            let items: Vec<String> = list
-                .iter()
-                .take(n)
-                .map(|v| format!("{} {} ({})", label(v.champ), signed(points(v.total)), why(v)))
-                .collect();
-            if items.is_empty() {
-                format!("{title}: -")
-            } else {
-                format!("{title}: {}", items.join("  "))
-            }
-        };
-        ui.set_text(&format!("{OVERLAY}.advice.l0"), &line("Pick 选", &pick_values, 2));
-        ui.set_text(&format!("{OVERLAY}.advice.l1"), &line("Ban 禁", &ban_values, 2));
-        ui.set_text(
-            &format!("{OVERLAY}.advice.l2"),
-            &match pick_values.get(2) {
-                Some(v) => format!("also 备选: {} {} ({})", label(v.champ), signed(points(v.total)), why(v)),
-                None => String::new(),
-            },
-        );
+        }
 
         // grid values
         if view.grid_values {
             let by_champ: HashMap<u16, f32> = pick_values.iter().map(|v| (v.champ, v.total)).collect();
-            for c in cards {
+            for c in cards.iter().filter(|c| c.champ.is_some()) {
                 let tag = format!("{}.{TAG}", c.path);
                 if !ui.exists(&tag) && !ui.spawn(&c.path, &tag_source(TAG, 52, false)) {
                     continue;
                 }
                 let value = id(c).and_then(|x| by_champ.get(&x)).copied();
                 let shown = value.is_some();
-                if self.tagged.get(&tag) != Some(&shown) {
+                if self.tagged.get(&tag) != Some(&shown) || !shown {
                     ui.set_visible(&tag, shown);
                     self.tagged.insert(tag.clone(), shown);
                 }
@@ -401,25 +425,22 @@ mod tests {
     use crate::meta::{build, Inputs, Settings};
     use crate::ui::tests::FakeUi;
 
+    /// The screen as the game builds it: cards named by champion id, a rank after team names.
     fn screen() -> FakeUi {
         let mut ui = FakeUi::default();
         ui.add("main", "match_ui");
-        ui.add("main.bottom.blue_side.name", "label").text = Some("Mods FC".into());
-        ui.add("main.bottom.red_side.name", "label").text = Some("Rivals".into());
+        ui.add(BLUE_NAME, "label").text = Some("Mods FC #1".into());
+        ui.add(RED_NAME, "label").text = Some("Rivals\r #10".into());
         for col in PICK_COLUMNS {
             for i in 0..5 {
-                ui.add(&format!("{col}.{i}"), "blue_pick_slot");
+                ui.add(&format!("{col}.pick_slot_{i}"), "color_icon_button");
             }
         }
         ui.add(GRID, "empty");
-        for (i, n) in NAMES.iter().enumerate() {
-            let path = format!("{GRID}.{i}");
+        for n in NAMES {
+            let path = format!("{GRID}.{n}");
             ui.add(&path, "banpick_champion_slot");
-            // half the cards name their champion in the state, half only on the label
-            if i % 2 == 0 {
-                ui.nodes.get_mut(&path).unwrap().state = Some(format!(r#"{{"champion":"{n}"}}"#));
-            }
-            ui.add(&format!("{path}.name"), "label").text = Some(format!("Name {n}"));
+            ui.add(&format!("{path}.name"), "label").text = Some(name_ref(n));
             for badge in ["blue", "red", "ban"] {
                 ui.add(&format!("{path}.{badge}"), "color").visible = false;
                 ui.add(&format!("{path}.{badge}.text"), "label");
@@ -428,15 +449,14 @@ mod tests {
         ui
     }
 
-    fn pick(ui: &mut FakeUi, index: usize, side: &str, order: u32) {
-        let path = format!("{GRID}.{index}.{side}");
+    fn pick(ui: &mut FakeUi, champ: &str, side: &str, order: u32) {
+        let path = format!("{GRID}.{champ}.{side}");
         ui.nodes.get_mut(&path).unwrap().visible = true;
         ui.nodes.get_mut(&format!("{path}.text")).unwrap().text = Some(order.to_string());
     }
 
-    #[test]
-    fn reads_the_draft_and_draws_the_overlay() {
-        let (names, games) = simulate(2000, "1.1", |n| match n {
+    fn snapshot(games: usize) -> Arc<Snapshot> {
+        let (names, games) = simulate(games, "1.1", |n| match n {
             "c" => 0.5,
             "l" => -0.5,
             _ => 0.0,
@@ -446,42 +466,47 @@ mod tests {
             &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
             &Settings::default(),
         );
-        let snapshot = Arc::new(Snapshot { meta, damage: HashMap::new() });
-        let mut book = NameBook::default();
-        for n in NAMES {
-            book.learn(&format!("Name {n}"), n);
-        }
+        Arc::new(Snapshot { meta, damage: HashMap::new() })
+    }
+
+    #[test]
+    fn reads_the_draft_and_draws_the_overlay() {
+        let snapshot = snapshot(2000);
+        let book = NameBook::default();
         let mut ui = screen();
-        pick(&mut ui, 0, "red", 1); // the enemy took "a"
-        pick(&mut ui, 1, "blue", 1); // we took "b"
-        ui.nodes.get_mut(&format!("{GRID}.4.ban")).unwrap().visible = true; // "e" banned
-        let rosters = HashMap::new();
-        let view = View { team_name: "mods fc", rosters: &rosters, grid_values: true, lane_tags: true };
+        pick(&mut ui, "a", "red", 1); // the enemy took "a"
+        pick(&mut ui, "b", "blue", 1); // we took "b"
+        ui.nodes.get_mut(&format!("{GRID}.e.ban")).unwrap().visible = true;
+        let mut rosters = HashMap::new();
+        rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
         let known = |c: &str| NAMES.contains(&c);
         let cards = read_grid(&ui, &known, &book);
         assert_eq!(cards.len(), 12);
-        assert!(cards.iter().all(|c| c.champ.is_some()), "state or label: {cards:?}");
-        let card = |i: usize| cards.iter().find(|c| c.path == format!("{GRID}.{i}")).unwrap();
-        assert_eq!(card(0).red, Some(1));
-        assert!(card(4).banned && !card(3).banned);
-        assert_eq!(player_side(&ui, "Mods FC"), Some(0));
+        let card = |n: &str| cards.iter().find(|c| c.champ.as_deref() == Some(n)).unwrap();
+        assert_eq!(card("a").red, Some(1));
+        assert!(card("e").banned && !card("d").banned);
+        assert_eq!(player_side(&ui, "mods fc"), Some(0), "the rank after the name is ignored");
+        assert_eq!(screen.enemy_team.as_deref(), Some("rivals"));
 
         let text = |p: &str| ui.text(p).unwrap_or_default();
         assert!(text("main.pma.win.value").ends_with('%'), "{}", text("main.pma.win.value"));
-        assert!(text("main.pma.advice.l0").starts_with("Pick 选: Name "), "{}", text("main.pma.advice.l0"));
-        assert!(text("main.pma.advice.l0").contains("Name c"), "the strong champion is advised: {}", text("main.pma.advice.l0"));
-        assert!(text("main.pma.advice.l1").contains("Name c"), "{}", text("main.pma.advice.l1"));
+        // champion names are the game's name references, shown in its language
+        assert!(text("main.pma.advice.c0").starts_with("#asset/base/text/champion?description."));
+        let advised = [text("main.pma.advice.c0"), text("main.pma.advice.c1")];
+        assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
+        assert_eq!(text("main.pma.advice.k2"), "Ban 禁");
         // grid values on open cards only
-        assert_eq!(ui.visible(&format!("{GRID}.0.{TAG}")), Some(false), "picked");
-        assert_eq!(ui.visible(&format!("{GRID}.4.{TAG}")), Some(false), "banned");
-        assert_eq!(ui.visible(&format!("{GRID}.2.{TAG}")), Some(true));
-        assert!(text(&format!("{GRID}.2.{TAG}.text")).starts_with('+'), "c is worth picking");
+        assert_eq!(ui.visible(&format!("{GRID}.a.{TAG}")), Some(false), "picked");
+        assert_eq!(ui.visible(&format!("{GRID}.e.{TAG}")), Some(false), "banned");
+        assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(true));
+        assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('+'), "c is worth picking");
         // a lane read on the enemy's first pick slot
-        assert!(text(&format!("main.red_picks.0.{LANE_TAG}.text")).ends_with('%'));
-        assert!(!ui.exists(&format!("main.red_picks.1.{LANE_TAG}")));
+        assert!(text(&format!("main.red_picks.pick_slot_0.{LANE_TAG}.text")).ends_with('%'));
+        assert!(!ui.exists(&format!("main.red_picks.pick_slot_1.{LANE_TAG}")));
 
         // nothing changed: nothing redrawn; the game rebuilt the screen: drawn again
         let spawned = ui.spawned.len();
@@ -490,5 +515,20 @@ mod tests {
         ui.remove("main.pma");
         screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
         assert!(ui.exists("main.pma.win.value"));
+    }
+
+    #[test]
+    fn says_so_when_there_is_too_little_data() {
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        for snapshot in [None, Some(snapshot(5))] {
+            let mut ui = screen();
+            let mut screen = DraftScreen::default();
+            screen.tick(&mut ui, 0, snapshot.as_ref(), &book, &view);
+            assert_eq!(ui.text("main.pma.win.value").as_deref(), Some("—"));
+            assert!(ui.text("main.pma.advice.c0").unwrap().contains("Not enough"));
+            assert!(!ui.exists(&format!("{GRID}.c.{TAG}")), "no values on the cards");
+        }
     }
 }

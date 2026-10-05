@@ -514,7 +514,7 @@ fn teams(st: &mut State, game: &mut impl Game, own: usize) -> Teams {
             .or_insert_with(|| game.team_name(team as usize).unwrap_or_default())
             .trim()
             .to_string();
-        let key = label.to_lowercase();
+        let key = crate::ui::team_key(&label);
         if key.is_empty() {
             continue;
         }
@@ -524,7 +524,7 @@ fn teams(st: &mut State, game: &mut impl Game, own: usize) -> Teams {
         wanted_athletes.extend(players.iter().map(|(a, _)| *a));
         if team as usize == own {
             let other = newest.teams[1 - side];
-            out.last_opponent = other.and_then(|o| st.team_names.get(&o)).map(|n| n.trim().to_lowercase());
+            out.last_opponent = other.and_then(|o| st.team_names.get(&o)).map(|n| crate::ui::team_key(n));
         }
         let mut counts: HashMap<u16, (u32, u32)> = HashMap::new();
         for (_, g, side) in list.iter().take(RECENT_PER_TEAM) {
