@@ -1,82 +1,108 @@
-# Patch Meta AI — 更聪明的 Ban/Pick + 自动英雄梯队（团战经理 2 / Teamfight Manager 2）
+# Patch Meta AI — 选人顾问 + 更聪明的 Ban/Pick + 自动梯队（团战经理 2 / Teamfight Manager 2）
 
 <img src="package/thumbnail.png" width="256" align="right" alt="Patch Meta AI">
 
-按**当前游戏内版本**的真实胜负数据工作的原生 Mod（稳定版 Mod API，游戏 0.6 及以上）：
+按你存档里的真实胜负数据工作的原生 Mod（稳定版 Mod API，游戏 0.6 及以上）。2.0 起，它用**一个统一的统计模型**同时估计英雄强度、分位置强度、选手实力与熟练度、队友配合和对位克制，然后：
 
-1. **Ban/Pick AI**：AI 选人时更倾向本版本真正赢球的英雄，不在弱势英雄上浪费 ban 位，优先 ban 掉"又强又热门"的英雄。
-2. **自动梯队**：自动维护你队伍的 S/A/B/C/D 英雄梯队，版本一变、数据一多就跟着更新（游戏内第二天显示）。
+1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。
+2. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度。
+3. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。
+4. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
+5. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
 
-数据全部来自你的存档：所有大会比赛记录、单排记录，以及球队新闻里的补丁公告。
+数据全部来自你的存档：大会比赛、单排、球队新闻里的补丁公告。
+
+## 和其他 Mod 一起用
+
+- **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片左上角和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
+- **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
+- **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
+
+启用了哪些 Mod 是从游戏的 `config/game/mods.json` 读的。另外，如果梯队在游戏内换日后连续被别的东西改回去，本 Mod 也会自动停止写入并在 `diag.log` 里说明。
 
 ## 安装
 
 - **手动安装**：把 `patch_meta_ai` 文件夹（含 `patch_meta_ai.dll`、`mod.mod_info`、`thumbnail.png`）放进 `<游戏目录>\mods\`，进游戏在 Mod 菜单里启用（含代码的 Mod 会弹一次确认），重启游戏。
 - 只有 Windows 版（`.dll`）。
-- 不要和其他"按胜率改 ban/pick""自动设置梯队"的 Mod 同时启用，它们会互相覆盖。
-
-## 设置：`settings.ini`
-
-第一次运行时在 Mod 文件夹里自动生成，改完保存几秒内生效，不用重启。删掉会重新生成默认值。
-
-| 段落 | 键 | 默认 | 作用 |
-|---|---|---|---|
-| `[features]` | `ban_pick` / `tier_list` | on / on | 两个功能各自的开关 |
-| `[model]` | `baseline_games` | 20 | 每个英雄起步时的 50% 虚拟场次（越大越保守） |
-| | `carry_games` | 40 | 上个版本最多带入多少场战绩作为起点 |
-| | `changed_carry` | 0.5 | 补丁公告里被调整的英雄，带入比例 |
-| | `patch_shift` | 0.02 | 被加强/削弱的英雄起点上调/下调的胜率 |
-| | `solo_weight` | 0.5 | 一场单排算几场大会比赛 |
-| | `reliability_games` | 30 | 置信度达到一半所需的场次 |
-| | `reworked` | （空） | 本版本重做的英雄 id，忽略其上个版本数据 |
-| `[draft]` | `pick_strength` / `ban_strength` | 1.0 / 0.8 | 对 AI 原有评分的影响力度 |
-| | `edge_scale` | 0.5 | 胜率优势换算成影响力的尺度 |
-| `[tiers]` | `min_games` | 10 | 证据场次少于此值的英雄不参与分级 |
-| | `s` `a` `b` `c` | 10/20/40/20 | 各梯队所占百分比，其余为 D |
-| | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
-| `[debug]` | `verbose` | off | 在 `diag.log` 里写更多细节 |
 
 ## 原理
 
-每个英雄在当前版本的胜率用 Beta 分布估计：
+所有比赛（最近 `patches` 个版本的大会比赛，加上按 `solo_weight` 计的单排）拟合一个带先验的逻辑回归：
 
-- **起点**：`baseline_games` 场 50% 的虚拟对局，加上上个版本最多 `carry_games` 场的实际战绩。补丁公告里加强的英雄起点上调 `patch_shift`，削弱的下调；被调整的英雄只带入 `changed_carry` 的上版本数据，`reworked` 的完全不带。
-- **更新**：本版本的大会比赛，加上单排对局乘以 `solo_weight`。
+`P(蓝方胜) = sigmoid(蓝方优势 + Σ蓝方[英雄强度 + 位置修正 + 选手实力 + 选手×英雄熟练度] − Σ红方[…] + Σ队友配合 − … + Σ对位克制)`
 
-由此得到：
+- **英雄强度按版本**：每个英雄在每个版本有一个强度，相邻版本之间是"随机游走"——没被改动时最多漂移约 `drift`，被补丁加强/削弱时最多变化约 `change`，并朝改动方向预移 `patch_shift`。所以改动前的比赛仍然计入，只是分量变小；新版本的少量比赛能把估计推多远，由模型自己按证据决定。
+- **选手实力**：强队的拿手英雄不会因为"强队在用"而被高估。
+- **所有效应都有先验**（往 0 收缩），场次少的配合、克制、熟练度会自然地接近 0。
+- 拟合在后台线程进行（L-BFGS，大存档几十毫秒），不占游戏帧。
 
-- **ban/pick 修正**：`tanh(logit(胜率) / edge_scale) × 置信度`，再乘以 `pick_strength` 或 `ban_strength`。ban 时，强势英雄还要乘以出场率系数（出场率是平均的 2 倍以上按 2 倍算，很少出场的按 0.5 倍）。
-- **梯队**：按保守估计（胜率减一个标准误）排序，按比例切分。前 `s`% 为 S，以此类推。
+显示的"胜率"= 队友和选手都是平均水平时、这个英雄所在队伍的估计胜率。梯队按保守估计（强度减一个标准差）排序后按比例切分。
 
-## 出问题时看这两个文件
+**选人顾问**对每个可选英雄计算：它在剩余位置里最常打的那个位置的强度 + 与已选队友的配合 + 对已选敌人的克制 + 将由哪名选手使用时的熟练度 − 伤害类型单一的惩罚。禁用价值 = 这个英雄对敌方的价值（含敌方对应选手的熟练度），按出场+禁用率加权。敌方位置推断用每个英雄的历史位置分布对所有分配方式加权，所以和游戏语言无关。
+
+**模型自检**：读完存档后，用除最新 10% 外的比赛拟合，再在最新的比赛上打分（热门方获胜率、Brier 分数），结果写进 `diag.log`、报告和 F8 面板。
+
+## 设置：`settings.ini`
+
+第一次运行时自动生成，改完保存几秒内生效（模型相关的下次重建时生效），不用重启。删掉会重新生成默认值。1.x 的旧设置文件可以直接用，旧的模型参数会被忽略。
+
+| 段落 | 键 | 默认 | 作用 |
+|---|---|---|---|
+| `[features]` | `ban_pick` / `tier_list` | auto / auto | AI 选人、自动梯队：`auto` = 开，除非已启用做同样事情的 Mod；`on` / `off` |
+| `[model]` | `patches` | 12 | 模型回看的版本数（含当前） |
+| | `drift` / `change` | 0.08 / 0.3 | 英雄强度每个版本的变化幅度：未改动 / 被补丁改动（对数几率） |
+| | `patch_shift` | 0.02 | 补丁加强/削弱时起点预移的胜率 |
+| | `solo_weight` | 0.5 | 一场单排算几场大会比赛 |
+| | `reworked` | （空） | 本版本重做的英雄 id，历史数据几乎不计 |
+| | `roles` `players` `mastery` `pairs` | 0.3 / 0.35 / 0.2 / 0.15 | 位置、选手、熟练度、配合/克制效应的先验幅度（越大越容易被数据推离 0） |
+| `[draft]` | `pick_strength` / `ban_strength` | 1.0 / 0.8 | 对 AI 原有评分的影响力度 |
+| | `edge_scale` | 0.5 | 价值（对数几率）换算成影响力的尺度：`tanh(价值 / edge_scale)` |
+| `[tiers]` | `min_games` | 10 | 近期场次（本版本 + 往前每个版本减半）少于此值的英雄不分级 |
+| | `s` `a` `b` `c` | 10/20/40/20 | 各梯队所占百分比，其余为 D |
+| | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
+| `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议 |
+| | `grid_values` | on | 英雄卡片上的价值 |
+| | `lane_tags` | on | 敌方已选英雄的位置推断 |
+| `[report]` | `report` | on | 写 `meta_report.html` |
+| `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 F9 随时写一份） |
+| | `verbose` | off | 在 `diag.log` 里写更多细节 |
+
+## 快捷键
+
+- **F8**：打开 Meta 面板 / 下一页 / 最后一页后关闭。
+- **F9**：把当前界面的 UI 结构写进 `ui_dump_*.txt`（反馈界面问题时用）。
+
+## 出问题时看这些文件
 
 都在 Mod 文件夹里：
 
-- `diag.log`：Mod 读到了什么、做了什么，包括每个存档第一次读到的数据格式（`[probe]` 行）、梯队有没有写进去。每次启动游戏重写，上一次的保留为 `diag.prev.log`。反馈问题时请附上它。
-- `meta_table.txt`：每个英雄当前的估计胜率、场次、梯队和 ban/pick 修正值。
+- `diag.log`：Mod 读到了什么、做了什么（每个存档第一次读到的数据格式写在 `[probe]` 行，选人界面读到了什么写在 `[ui]` 行）。每次启动游戏重写，上一次的保留为 `diag.prev.log`。反馈问题时请附上它。
+- `meta_table.txt` / `meta_report.html`：模型当前的全部数字。
+- `probe_competition.json`、`probe_records.txt`：存档数据格式样本（游戏更新后数据格式变了时用来适配）。
 
 ## 从源码构建
 
 - Windows：装好 Rust 后在仓库根目录 `cargo build --release`，得到 `target\release\patch_meta_ai.dll`。
-- Linux/WSL：`tools/build.sh`，需要 `rustup target add x86_64-pc-windows-gnu` 和 `gcc-mingw-w64-x86-64`。它会跑测试、交叉编译、打包出 `dist/patch_meta_ai/` 和 zip。
-  - 加 `--smoke` 还会用 Wine 真正加载 DLL，跑一遍模拟的游戏流程（`tools/dll-smoke`）。
-- `cargo test`：单元测试，加上走真实 C 接口的整局模拟（`tests/fake_host.rs`）。
+- Linux/WSL：`tools/build.sh`，需要 `rustup target add x86_64-pc-windows-gnu` 和 `gcc-mingw-w64-x86-64`。它会跑测试、交叉编译、打包出 `dist/patch_meta_ai/` 和 zip。加 `--smoke` 还会用 Wine 真正加载 DLL，跑一遍模拟的游戏流程。
+- `cargo test`：单元测试（模型能否从模拟比赛中找回已知的英雄强度、选手实力、配合；补丁改动后的估计；选人界面读写），加上走真实 C 接口的整局模拟（`tests/fake_host.rs`）。`cargo test --release -- --ignored --nocapture fit_time` 测一次存档规模的拟合耗时。
 
 `vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，0.6.2，ABI 等级 9），版权归 TeamSamoyed。
 
 ## 致谢
 
-"按胜率调整 ban/pick + 自动梯队"这个思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」。那个 Mod 已停止更新，在新版游戏里会失效，原因见 [docs/background.md](docs/background.md)。本 Mod 是独立实现，代码、模型、设置和美术都是新的。
+"按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
 
-Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). It estimates every champion's win rate in the current in-game patch from your save: competition matches, solo-rank games, the previous patch's results and the patch notes. With that estimate it
+Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). Version 2 fits one regularised logistic regression over your save's matches - champion strength per patch (a random walk across patches, wider where the patch notes changed a champion), lane offsets, each player's own strength and champion mastery, ally synergy and opponent matchups - on a background thread, and uses it for:
 
-1. nudges the draft AI's ban and pick scores;
-2. keeps your team's S/A/B/C/D champion tier list up to date.
+1. **the ban/pick screen**: your line-up's win chance, the best picks and bans now with reasons, each champion card's value to you, and each enemy pick's likely lane (from lane history, any language);
+2. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
+3. **the AI's bans and picks**, valued in the actual draft;
+4. **your team's tier list**;
+5. **`meta_report.html`** and `meta_table.txt` in the mod folder.
 
-- Settings live in `settings.ini` next to the DLL and are hot-reloaded.
-- `diag.log` and `meta_table.txt` show what the mod sees.
+- `ban_pick` / `tier_list` default to `auto`: they step aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
+- Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.
-- Inspired by yudra's discontinued "Win-Rate Ban/Pick AI + Champion Tiers"; independent implementation.
 - MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK.
