@@ -11,6 +11,10 @@
 //! Also read when present (game 0.6 `MatchReplayData`): `seed` (the same match keeps it when
 //! the game hands the record a new id), `blue_team_id` / `red_team_id`, `blue_ban` / `red_ban`,
 //! and each player's athlete id (`athlete` or `athlete_id`, a number or an object with `id`).
+//!
+//! Solo-rank records name no lanes. Each player's `stat` holds their rating in every position
+//! (`top`, `jungle`, `mid`, `bottom`, `support`), so a side without lanes gets the one-to-one
+//! assignment of its players to lanes with the highest total rating.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -20,6 +24,50 @@ pub struct Player {
     pub champion: String,
     pub position: Option<String>,
     pub athlete: Option<u32>,
+}
+
+const LANES: [&str; 5] = ["Top", "Jungle", "Mid", "Bottom", "Support"];
+
+/// A player's rating in each lane (`stat.top` ... `stat.support`), when the record has them.
+fn lane_ratings(map: &Map<String, Value>) -> Option<[f64; 5]> {
+    let stat = map.get("stat")?.as_object()?;
+    let mut out = [0.0; 5];
+    for (slot, lane) in out.iter_mut().zip(LANES) {
+        *slot = stat.get(&lane.to_ascii_lowercase())?.as_f64()?;
+    }
+    Some(out)
+}
+
+/// Lanes for a side whose record names none: the assignment with the highest total rating.
+fn assign_lanes(players: &mut [Player], ratings: &[Option<[f64; 5]>]) {
+    if players.len() != 5 || players.iter().any(|p| p.position.is_some()) || ratings.iter().any(Option::is_none) {
+        return;
+    }
+    let ratings: Vec<[f64; 5]> = ratings.iter().flatten().copied().collect();
+    let mut best = (f64::MIN, [0usize; 5]);
+    let mut lanes = [0usize, 1, 2, 3, 4];
+    // every permutation of five lanes (Heap's algorithm)
+    fn permute(k: usize, lanes: &mut [usize; 5], ratings: &[[f64; 5]], best: &mut (f64, [usize; 5])) {
+        if k == 1 {
+            let total: f64 = lanes.iter().enumerate().map(|(p, l)| ratings[p][*l]).sum();
+            if total > best.0 {
+                *best = (total, *lanes);
+            }
+            return;
+        }
+        for i in 0..k {
+            permute(k - 1, lanes, ratings, best);
+            if k.is_multiple_of(2) {
+                lanes.swap(i, k - 1);
+            } else {
+                lanes.swap(0, k - 1);
+            }
+        }
+    }
+    permute(5, &mut lanes, &ratings, &mut best);
+    for (p, l) in players.iter_mut().zip(best.1) {
+        p.position = Some(LANES[l].to_string());
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -251,11 +299,13 @@ pub fn players(team: &Value) -> Vec<Player> {
         }
     }
     let mut out = Vec::new();
-    collect_players(team, &mut out, 0);
+    let mut ratings = Vec::new();
+    collect_players(team, &mut out, &mut ratings, 0);
+    assign_lanes(&mut out, &ratings);
     out
 }
 
-fn collect_players(v: &Value, out: &mut Vec<Player>, depth: usize) {
+fn collect_players(v: &Value, out: &mut Vec<Player>, ratings: &mut Vec<Option<[f64; 5]>>, depth: usize) {
     if depth > 6 {
         return;
     }
@@ -263,18 +313,19 @@ fn collect_players(v: &Value, out: &mut Vec<Player>, depth: usize) {
         Value::Object(map) => {
             if let Some(player) = player(map) {
                 out.push(player);
+                ratings.push(lane_ratings(map));
                 return;
             }
             for (key, child) in map {
                 if key.contains("ban") {
                     continue;
                 }
-                collect_players(child, out, depth + 1);
+                collect_players(child, out, ratings, depth + 1);
             }
         }
         Value::Array(items) => {
             for item in items {
-                collect_players(item, out, depth + 1);
+                collect_players(item, out, ratings, depth + 1);
             }
         }
         _ => {}
@@ -462,6 +513,27 @@ mod tests {
         let none = r#"{"version": "1.3", "blue_team_win": true,
                        "blue_team": [{"champion": "a"}], "red_team": [{"champion": "b"}]}"#;
         assert!(matches!(parse_record(none, true), Parsed::Invalid(why) if why.starts_with("no played")));
+    }
+
+    #[test]
+    fn solo_rank_lanes_come_from_the_players_ratings() {
+        let player = |c: &str, t: u32, j: u32, m: u32, b: u32, s: u32| {
+            format!(r#"{{"champion":"{c}","athlete_id":1,"stat":{{"top":{t},"jungle":{j},"mid":{m},"bottom":{b},"support":{s},"ego":50}}}}"#)
+        };
+        let json = format!(
+            r#"{{"played":true,"version":"1.3","blue_team_win":true,"blue_team":[{},{},{},{},{}],"red_team":[{}]}}"#,
+            player("a", 0, 100, 0, 0, 0),
+            player("b", 90, 0, 0, 0, 10),
+            player("c", 0, 0, 0, 60, 70),
+            player("d", 0, 0, 100, 0, 0),
+            player("e", 0, 0, 0, 80, 75),
+            player("x", 100, 0, 0, 0, 0),
+        );
+        let Parsed::Match(m) = parse_record(&json, true) else { panic!() };
+        let lanes: Vec<&str> = m.blue.iter().map(|p| p.position.as_deref().unwrap()).collect();
+        // c and e both lean bottom; the best total gives e bottom and c support
+        assert_eq!(lanes, ["Jungle", "Top", "Support", "Mid", "Bottom"]);
+        assert_eq!(m.red[0].position, None, "an incomplete side gets no guess");
     }
 
     #[test]
