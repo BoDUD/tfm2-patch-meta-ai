@@ -190,7 +190,7 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
     st.out_of_game = false;
     config::refresh(now);
     let cfg = config::get();
-    if !cfg.ban_pick && !cfg.tier_list {
+    if !cfg.ban_pick_on() && !cfg.tier_list_on() {
         if shared::get().is_some() {
             shared::clear();
         }
@@ -273,7 +273,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     // the tier list goes out once it was built from the whole backlog, not after every
     // partial rebuild while the save is still being read
-    if cfg.tier_list {
+    if cfg.tier_list_on() {
         let complete = st.plan_complete;
         sync_tiers(st, game, team, now, complete);
     }
@@ -635,6 +635,9 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs((30u64 << failures.min(4)).min(600))
 }
 
+/// Times the same list is written again after something else changed it.
+const MAX_RESENDS: u32 = 3;
+
 /// Shortest time between two tier lists sent to the server.
 const SEND_GAP: Duration = Duration::from_secs(10);
 
@@ -677,11 +680,19 @@ fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, p
     if day.is_some() && day != sync.day {
         let first_look = sync.day.is_none();
         sync.day = day;
-        if !first_look && sync.applied == Some(sync.plan_hash) && sync.resends < 3 {
+        if !first_look && sync.applied == Some(sync.plan_hash) && sync.resends < MAX_RESENDS {
             if let Some(stale) = differs(game, team, plan) {
                 sync.applied = None;
                 sync.resends += 1;
-                diag::log(&format!("tier list changed in the game ({stale}); writing it again"));
+                if sync.resends < MAX_RESENDS {
+                    diag::log(&format!("tier list changed in the game ({stale}); writing it again"));
+                } else {
+                    // written back again and again: another mod (or the player) owns the list
+                    sync.applied = Some(sync.plan_hash);
+                    diag::log(&format!(
+                        "tier list changed in the game again ({stale}): another mod seems to write it too                          (e.g. Drafter's Toolbox); leaving it alone until the list here changes.                          Set tier_list=off in settings.ini to stop for good."
+                    ));
+                }
             }
         }
     }
@@ -894,6 +905,35 @@ mod tests {
         frames(&mut g, 5, now);
         assert_eq!(g.sent.len(), 2);
         assert_eq!(g.tiers["a"], "S");
+    }
+
+    #[test]
+    fn another_tier_writer_is_left_alone() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        let mut g = save();
+        let mut now = frames(&mut g, 200, Instant::now());
+        assert_eq!(g.sent.len(), 1);
+        // every in-game day another mod puts its own list back
+        for day in 2..10 {
+            g.tiers = serde_json::json!({"a": "C"});
+            g.date = (2026, 3, day);
+            now = frames(&mut g, 300, now);
+        }
+        assert_eq!(g.sent.len(), MAX_RESENDS as usize, "stops fighting: {:?}", g.sent.len());
+        assert_eq!(g.tiers["a"], "C");
+    }
+
+    #[test]
+    fn a_tier_mod_listed_in_mods_json_takes_over() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        crate::compat::set(crate::compat::Others::from_mods_json(r#"{"enabled_mods":["drafters_toolkit"]}"#));
+        let mut g = save();
+        frames(&mut g, 200, Instant::now());
+        assert!(g.sent.is_empty(), "tier_list=auto leaves the list to the Toolbox");
+        assert!(shared::get().is_some(), "ban/pick still works");
+        crate::compat::set(crate::compat::Others::default());
     }
 
     #[test]

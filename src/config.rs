@@ -11,11 +11,45 @@ use crate::{diag, paths};
 pub const FILE: &str = "settings.ini";
 const CHECK_EVERY: Duration = Duration::from_secs(3);
 
+/// A feature switch. `Auto` is on unless another enabled mod already does the job (`compat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switch {
+    Auto,
+    On,
+    Off,
+}
+
+impl Switch {
+    fn parse(v: &str) -> Result<Switch, String> {
+        if v.eq_ignore_ascii_case("auto") {
+            return Ok(Switch::Auto);
+        }
+        flag(v).map(|on| if on { Switch::On } else { Switch::Off }).map_err(|_| format!("expected auto/on/off, got {v:?}"))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Switch::Auto => "auto",
+            Switch::On => "on",
+            Switch::Off => "off",
+        }
+    }
+
+    /// On, given whether another mod already does the job.
+    pub fn resolve(self, taken: bool) -> bool {
+        match self {
+            Switch::Auto => !taken,
+            Switch::On => true,
+            Switch::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     // [features]
-    pub ban_pick: bool,
-    pub tier_list: bool,
+    pub ban_pick: Switch,
+    pub tier_list: Switch,
     // [model]
     /// Pseudo-games at a 50% win rate every champion starts from.
     pub baseline_games: f32,
@@ -52,8 +86,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ban_pick: true,
-            tier_list: true,
+            ban_pick: Switch::Auto,
+            tier_list: Switch::Auto,
             baseline_games: 20.0,
             carry_games: 40.0,
             changed_carry: 0.5,
@@ -78,6 +112,16 @@ impl Default for Config {
 impl Config {
     pub fn is_reworked(&self, champion: &str) -> bool {
         self.reworked.iter().any(|c| c == champion)
+    }
+
+    /// The AI's bans and picks are nudged (not left to another draft mod).
+    pub fn ban_pick_on(&self) -> bool {
+        self.ban_pick.resolve(crate::compat::get().draft_driver().is_some())
+    }
+
+    /// The tier list is written (not left to another tier mod).
+    pub fn tier_list_on(&self) -> bool {
+        self.tier_list.resolve(crate::compat::get().tier_writer().is_some())
     }
 }
 
@@ -128,8 +172,8 @@ fn number(v: &str) -> Result<f32, String> {
 
 fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
-        "ban_pick" => cfg.ban_pick = flag(value)?,
-        "tier_list" => cfg.tier_list = flag(value)?,
+        "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
+        "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "baseline_games" => cfg.baseline_games = number(value)?,
         "carry_games" => cfg.carry_games = number(value)?,
@@ -301,8 +345,8 @@ pub fn summary(c: &Config) -> String {
         "ban_pick={} tier_list={} baseline_games={} carry_games={} changed_carry={} \
          patch_shift={} solo_weight={} reliability_games={} reworked=[{}] pick_strength={} \
          ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={}",
-        on(c.ban_pick),
-        on(c.tier_list),
+        c.ban_pick.as_str(),
+        c.tier_list.as_str(),
         c.baseline_games,
         c.carry_games,
         c.changed_carry,
@@ -322,14 +366,6 @@ pub fn summary(c: &Config) -> String {
     )
 }
 
-fn on(b: bool) -> &'static str {
-    if b {
-        "on"
-    } else {
-        "off"
-    }
-}
-
 /// Written to `settings.ini` when the file does not exist.
 pub const TEMPLATE: &str = r#"; ============================================================================
 ; Patch Meta AI - settings / 设置
@@ -342,8 +378,12 @@ pub const TEMPLATE: &str = r#"; ================================================
 ;             AI 的 ban/pick 参考当前版本的真实胜负数据
 ; tier_list : your team's champion tier list is kept up to date automatically
 ;             自动维护你队伍的英雄梯队
-ban_pick=on
-tier_list=on
+; auto = on, unless another enabled mod already does it (Drafter's Toolbox writes tiers,
+;        Terminator Draft AI drives the AI's draft); on / off = always / never
+; auto = 默认开启；若已启用其他做同样事情的 Mod（Drafter's Toolbox 写梯队、Terminator Draft AI
+;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关
+ban_pick=auto
+tier_list=auto
 
 [model]
 ; Every champion's win rate is estimated per in-game patch:
@@ -415,7 +455,7 @@ mod tests {
                     reworked=fighter, demon  ninja\nunranked=clear\ns=15%\nedge_scale=-1\n\
                     bogus=1\nchanged_carry=2\njunk line\n";
         let (cfg, warnings) = parse(text);
-        assert!(!cfg.ban_pick && cfg.tier_list);
+        assert!(cfg.ban_pick == Switch::Off && cfg.tier_list == Switch::Auto);
         assert!((cfg.patch_shift - 0.03).abs() < 1e-6);
         assert_eq!(cfg.reworked, ["fighter", "demon", "ninja"]);
         assert!(cfg.clear_unranked && cfg.is_reworked("demon"));
@@ -423,6 +463,18 @@ mod tests {
         assert_eq!(cfg.edge_scale, 0.5);
         assert_eq!(cfg.changed_carry, 0.5);
         assert_eq!(warnings.len(), 4, "{warnings:?}");
+    }
+
+    #[test]
+    fn auto_steps_aside_for_another_mod() {
+        assert!(Switch::Auto.resolve(false) && !Switch::Auto.resolve(true));
+        assert!(Switch::On.resolve(true) && !Switch::Off.resolve(false));
+        let (cfg, warnings) = parse("tier_list=AUTO
+ban_pick=yes
+");
+        assert!(warnings.is_empty());
+        assert_eq!((cfg.tier_list, cfg.ban_pick), (Switch::Auto, Switch::On));
+        assert_eq!(parse("tier_list=maybe").1.len(), 1);
     }
 
     #[test]

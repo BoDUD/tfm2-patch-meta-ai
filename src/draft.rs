@@ -33,7 +33,7 @@ fn adjust(
     candidate: usize,
     table: impl Fn(&shared::Tables) -> &std::collections::HashMap<String, f32>,
 ) -> StableDraftDecision {
-    if !config::get().ban_pick {
+    if !config::get().ban_pick_on() {
         return StableDraftDecision::Pass;
     }
     let Some(name) = ctx.champion_name(candidate) else { return StableDraftDecision::Pass };
