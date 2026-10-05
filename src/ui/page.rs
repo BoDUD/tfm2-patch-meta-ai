@@ -12,8 +12,9 @@
 //!   player's best champions now), **Model** (how well it predicts).
 //!
 //! Everything sits under `main` (the screen root has no automatic layout, unlike the left
-//! menu, which stacks its children). Clicking any of the game's menu entries, Esc, or another
-//! screen closes the page and gives the content underneath back. Texts are the game's own
+//! menu, which stacks its children). Another screen or tab (any of the game's menu entries), Esc,
+//! or the entry again closes the page and gives the content underneath back. Nothing is attached
+//! to the game's own menu entries: their runner panics on anything it does not expect. Texts are the game's own
 //! (`#asset/base/text/ui?...`) or this mod's, merged into the same document from
 //! `text/ui.i18n`; when the merge is missing the English words are written instead.
 //!
@@ -283,7 +284,6 @@ pub struct MetaPage {
     screen: String,
     next_heal: u64,
     nav_seen: bool,
-    menu_buttons: Vec<String>,
     registered: HashSet<String>,
 }
 
@@ -303,7 +303,6 @@ impl Default for MetaPage {
             screen: String::new(),
             next_heal: 0,
             nav_seen: false,
-            menu_buttons: Vec::new(),
             registered: HashSet::new(),
         }
     }
@@ -350,19 +349,9 @@ impl MetaPage {
                 return;
             }
             self.nav_seen = true;
+            // only our own button: nothing is attached to the game's menu entries (their runner
+            // is touchy); picking one of them changes the screen, which closes the page
             self.register(ui, &format!("{NAV}.button"));
-            self.menu_buttons.clear();
-            for category in ui.children(LEFT_MENU) {
-                for button in ui.children(&format!("{LEFT_MENU}.{category}")) {
-                    let path = format!("{LEFT_MENU}.{category}.{button}");
-                    if ui.runner(&path).as_deref() == Some("main_left_button") {
-                        self.menu_buttons.push(path);
-                    }
-                }
-            }
-            for path in self.menu_buttons.clone() {
-                self.register(ui, &path);
-            }
             if self.open {
                 // the screen was rebuilt under an open page
                 self.drawn = None;
@@ -440,12 +429,6 @@ impl MetaPage {
             }
             return;
         }
-        if self.menu_buttons.iter().any(|b| b == path) {
-            if self.open {
-                self.close(ui);
-            }
-            return;
-        }
         if !self.open {
             return;
         }
@@ -519,7 +502,6 @@ impl MetaPage {
         self.filled = None;
         self.nav_seen = false;
         self.registered.clear();
-        self.menu_buttons.clear();
     }
 
     fn register_tabs(&mut self, ui: &mut impl Ui) {
@@ -680,24 +662,26 @@ impl MetaPage {
 
 // ---------------------------------------------------------------- sources
 
+/// The entry's look, lit while the page is open: the game's own menu colours.
 fn nav_style(lit: bool) -> String {
-    let (data, text) = if lit { (BORDER, TEXT) } else { (0x00000000, 0xa5a5abff) };
-    format!("data_color: {}; text_color: {};", color(data), color(text))
+    let fill = if lit { BORDER } else { 0x00000000 };
+    format!("btn: {{ color: {}; }} hover: {{ btn: {{ color: {}; }} }}", color(fill), color(if lit { BORDER } else { 0x23253380 }))
 }
 
-/// The left-menu entry: a separator and a menu button like the game's own, under the house.
+/// The left-menu entry: a separator and a button laid out like the game's menu entries (icon at
+/// 24, text at 56), under the house. Not the game's `main_left_button` runner: game code expects
+/// every one of those to belong to one of its own screens and panics on any other.
 fn nav_source(text: &str) -> String {
     format!(
         "pma_nav:empty {{ x: 0px; y: 969px; width: 264px; height: 52px; \
          #bar:color {{ x: 24px; y: 0px; width: 215px; height: 1px; color: #a6a6a6ff; ignore_event: true; }} \
-         #button:main_left_button {{ @\"asset/base/style/effect#bouncing\"; y: 4px; height: 48px; width: 100%; \
-         data_color: #00000000; text_color: #a5a5abff; \
-         hover: {{ data_color: #00000000; text_color: #e8e8e8ff; }} active: {{ data_color: #4a4c56ff; text_color: #e8e8e8ff; }} \
+         #button:color_icon_button {{ y: 4px; width: 264px; height: 48px; {} \
          hover_sound: \"asset/base/sound/sfx/UI_mouse_hover\"; click_sound: \"asset/base/sound/sfx/UI_mouse_click\"; \
-         #data:color {{ width: 100%; height: 100%; ignore_event: true; \
-         #icon:image {{ x: 24px; y: 12px; width: 24px; height: 24px; ignore_event: true; source: \"asset/base/ui/icons/chart\"; }} \
+         #icon:image {{ x: 24px; y: 12px; width: 24px; height: 24px; ignore_event: true; color: #a5a5abff; \
+         source: \"asset/base/ui/icons/chart\"; }} \
          #text:label {{ @\"asset/base/style/main#label\"; x: 56px; y: 14px; width: 184px; height: 20px; align_x: Left; \
-         align_y: Center; size: 18; fit_width: true; ignore_event: true; text: {}; }} }} }} }}",
+         align_y: Center; size: 18; fit_width: true; ignore_event: true; color: #a5a5abff; text: {}; }} }} }}",
+        nav_style(false),
         quote(text)
     )
 }
@@ -1245,7 +1229,8 @@ mod tests {
         ui.texts.push("#asset/base/text/ui?patch_meta.menu".into());
         let mut page = MetaPage::default();
         frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
-        assert!(ui.exists(&format!("{NAV}.button.data.text")));
+        assert!(ui.exists(&format!("{NAV}.button.text")));
+        assert!(!ui.spawned[0].1.contains("main_left_button"), "the game's menu runner panics on entries it does not own");
         assert!(ui.spawned[0].1.contains("#asset/base/text/ui?patch_meta.menu"), "the merged text when the game has it");
         assert!(!ui.spawned[0].1.contains("Meta Analysis"));
         assert!(!page.is_open());
@@ -1314,23 +1299,23 @@ mod tests {
             }
         }
 
-        // one of the game's menu entries closes it and gives the content back
-        ui.click("main.top.left.etc_category.statistics");
-        frame(&mut page, &mut ui, 16, &s, &context, "Main/Home");
+        // one of the game's menu entries (another tab) closes it and gives the content back
+        assert!(!ui.handlers.iter().any(|h| h.starts_with(LEFT_MENU)), "nothing attached to the game's menu");
+        frame(&mut page, &mut ui, 16, &s, &context, "Main/Statistics");
         assert!(!page.is_open() && !ui.exists(PAGE));
         assert_eq!(ui.visible(RIGHT), Some(true));
 
         // Esc and another screen close it too
         ui.click(&format!("{NAV}.button"));
-        frame(&mut page, &mut ui, 17, &s, &context, "Main/Home");
+        frame(&mut page, &mut ui, 17, &s, &context, "Main/Statistics");
         assert!(page.is_open());
         ui.keys = vec!["Escape".into()];
-        frame(&mut page, &mut ui, 18, &s, &context, "Main/Home");
+        frame(&mut page, &mut ui, 18, &s, &context, "Main/Statistics");
         ui.keys.clear();
         assert!(!page.is_open());
         ui.click(&format!("{NAV}.button"));
-        frame(&mut page, &mut ui, 19, &s, &context, "Main/Home");
-        frame(&mut page, &mut ui, 20, &s, &context, "Main/Statistics");
+        frame(&mut page, &mut ui, 19, &s, &context, "Main/Statistics");
+        frame(&mut page, &mut ui, 20, &s, &context, "Main/Home");
         assert!(!page.is_open() && !ui.exists(PAGE));
     }
 }
