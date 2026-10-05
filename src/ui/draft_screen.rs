@@ -45,6 +45,8 @@ const PANEL: u32 = 0x161721f0;
 /// What the overlay shows besides the model.
 pub struct View<'a> {
     pub team_name: &'a str,
+    /// Each team's players and lanes, by team name (lower case).
+    pub rosters: &'a HashMap<String, Vec<(u32, Option<Role>)>>,
     pub grid_values: bool,
     pub lane_tags: bool,
 }
@@ -63,6 +65,8 @@ pub struct Card {
 
 #[derive(Default)]
 pub struct DraftScreen {
+    /// The other team on the last ban/pick screen (lower case), for scouting.
+    pub enemy_team: Option<String>,
     on: bool,
     next_read: u64,
     /// The draft and model the overlay was last drawn for.
@@ -215,6 +219,7 @@ impl DraftScreen {
             ));
         }
         let side = side.unwrap_or(0);
+        self.enemy_team = ui.text([BLUE_NAME, RED_NAME][1 - side]).map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -232,10 +237,24 @@ impl DraftScreen {
             return;
         }
         self.drawn = Some(key);
-        self.draw(ui, snapshot, &cards, side, view);
+        // the players on each side, by the team names at the bottom of the screen
+        let roster_of = |path: &str| -> Vec<(u32, Option<Role>)> {
+            ui.text(path).and_then(|t| view.rosters.get(&t.trim().to_lowercase()).cloned()).unwrap_or_default()
+        };
+        let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
+        self.draw(ui, snapshot, &cards, side, &rosters, view);
     }
 
-    fn draw(&mut self, ui: &mut impl Ui, snapshot: &Snapshot, cards: &[Card], side: usize, view: &View<'_>) {
+    fn draw(
+        &mut self,
+        ui: &mut impl Ui,
+        snapshot: &Snapshot,
+        cards: &[Card],
+        side: usize,
+        rosters: &[Vec<(u32, Option<Role>)>; 2],
+        view: &View<'_>,
+    ) {
+        let (players, enemy_players) = (&rosters[side], &rosters[1 - side]);
         let meta = &snapshot.meta;
         let id = |c: &Card| c.champ.as_deref().and_then(|n| meta.names.get(n));
         let picks = |blue: bool| -> Vec<u16> {
@@ -273,13 +292,13 @@ impl DraftScreen {
         let mut pick_values: Vec<PickValue> = open
             .iter()
             .filter_map(|c| id(c))
-            .map(|c| advisor::pick_value(meta, c, &ally, &enemy, &damage))
+            .map(|c| advisor::pick_value(meta, c, &ally, &enemy, players, &damage))
             .collect();
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         let mut ban_values: Vec<PickValue> = open
             .iter()
             .filter_map(|c| id(c))
-            .map(|c| advisor::ban_value(meta, c, &ally, &enemy, &damage))
+            .map(|c| advisor::ban_value(meta, c, &ally, &enemy, enemy_players, &damage))
             .collect();
         ban_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         let why = |v: &PickValue| -> String {
@@ -292,6 +311,9 @@ impl DraftScreen {
             }
             if v.counter.abs() >= 0.02 {
                 parts.push(format!("vs {}", signed(points(v.counter))));
+            }
+            if v.mastery.abs() >= 0.02 {
+                parts.push(format!("player {}", signed(points(v.mastery))));
             }
             if v.balance > 0.0 {
                 parts.push("one-sided dmg".to_string());
@@ -360,10 +382,8 @@ impl DraftScreen {
                         .unwrap_or((Role::Top, 0.0));
                     format!("{} {:.0}%", best.name(), p * 100.0)
                 });
-                if !ui.exists(&tag) {
-                    if text.is_none() || !ui.spawn(&path, &tag_source(LANE_TAG, 96, true)) {
-                        continue;
-                    }
+                if !ui.exists(&tag) && (text.is_none() || !ui.spawn(&path, &tag_source(LANE_TAG, 96, true))) {
+                    continue;
                 }
                 ui.set_visible(&tag, text.is_some());
                 if let Some(t) = text {
@@ -435,7 +455,8 @@ mod tests {
         pick(&mut ui, 0, "red", 1); // the enemy took "a"
         pick(&mut ui, 1, "blue", 1); // we took "b"
         ui.nodes.get_mut(&format!("{GRID}.4.ban")).unwrap().visible = true; // "e" banned
-        let view = View { team_name: "mods fc", grid_values: true, lane_tags: true };
+        let rosters = HashMap::new();
+        let view = View { team_name: "mods fc", rosters: &rosters, grid_values: true, lane_tags: true };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 

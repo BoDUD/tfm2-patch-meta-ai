@@ -4,12 +4,21 @@
 //!
 //! Everything is in log-odds (0 = no change). A pick's value is its strength in the best lane
 //! still open, plus its synergy with the allies already picked, plus its matchups against the
-//! enemies already picked, minus a little when the team's damage would become one-sided. A
-//! ban's value is what the candidate would be worth to the enemy, weighted by how likely they
-//! are to take it.
+//! enemies already picked, minus a little when the team's damage would become one-sided, plus -
+//! when the team's players are known - the mastery of the player who would play it. A ban's
+//! value is what the candidate would be worth to the enemy (their player's mastery included),
+//! weighted by how likely they are to take it.
 
 use crate::history::Role;
 use crate::meta::Meta;
+
+/// A team's players and the lane each one plays (from their newest match).
+pub type Roster = [(u32, Option<Role>)];
+
+/// The player of `roster` who plays `role`.
+pub fn player_in(roster: &Roster, role: Role) -> Option<u32> {
+    roster.iter().find(|(_, r)| *r == Some(role)).map(|(a, _)| *a)
+}
 
 /// Physical or magic damage (from the champion's tags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,6 +176,8 @@ pub struct PickValue {
     pub synergy: f32,
     pub counter: f32,
     pub balance: f32,
+    /// The mastery of the player who would play it.
+    pub mastery: f32,
     pub total: f32,
 }
 
@@ -177,6 +188,7 @@ pub fn pick_value(
     cand: u16,
     ally: &[u16],
     enemy: &[u16],
+    players: &Roster,
     damage: &dyn Fn(u16) -> Option<Damage>,
 ) -> PickValue {
     let taken = lanes(meta, ally);
@@ -192,7 +204,17 @@ pub fn pick_value(
     let synergy: f32 = ally.iter().map(|a| meta.synergy(cand, *a).value).sum();
     let counter: f32 = enemy.iter().map(|e| meta.counter(cand, *e).value).sum();
     let balance = balance_cost(cand, ally, damage);
-    PickValue { champ: cand, role, strength, synergy, counter, balance, total: strength + synergy + counter - balance }
+    let mastery = role.and_then(|r| player_in(players, r)).map_or(0.0, |a| meta.mastery(a, cand).value);
+    PickValue {
+        champ: cand,
+        role,
+        strength,
+        synergy,
+        counter,
+        balance,
+        mastery,
+        total: strength + synergy + counter - balance + mastery,
+    }
 }
 
 /// The cost of a team's damage becoming one-sided with `cand` added.
@@ -221,9 +243,10 @@ pub fn ban_value(
     cand: u16,
     ally: &[u16],
     enemy: &[u16],
+    enemy_players: &Roster,
     damage: &dyn Fn(u16) -> Option<Damage>,
 ) -> PickValue {
-    let mut v = pick_value(meta, cand, enemy, ally, damage);
+    let mut v = pick_value(meta, cand, enemy, ally, enemy_players, damage);
     let typical = if meta.champions.is_empty() {
         0.0
     } else {
@@ -260,22 +283,43 @@ mod tests {
         let m = meta();
         let id = |n: &str| m.names.get(n).unwrap();
         let none = |_: u16| None;
-        let c = pick_value(&m, id("c"), &[], &[], &none);
-        let l = pick_value(&m, id("l"), &[], &[], &none);
+        let c = pick_value(&m, id("c"), &[], &[], &[], &none);
+        let l = pick_value(&m, id("l"), &[], &[], &[], &none);
         assert!(c.total > 0.3 && l.total < -0.2, "{c:?} {l:?}");
         // b is worth more next to a (their synergy)
-        let b_alone = pick_value(&m, id("b"), &[id("e")], &[], &none);
-        let b_with_a = pick_value(&m, id("b"), &[id("a")], &[], &none);
+        let b_alone = pick_value(&m, id("b"), &[id("e")], &[], &[], &none);
+        let b_with_a = pick_value(&m, id("b"), &[id("a")], &[], &[], &none);
         assert!(b_with_a.total > b_alone.total + 0.15, "{b_with_a:?} vs {b_alone:?}");
         assert!(b_with_a.synergy > 0.15);
         // banning: c is the threat
-        let ban_c = ban_value(&m, id("c"), &[], &[], &none);
-        let ban_l = ban_value(&m, id("l"), &[], &[], &none);
+        let ban_c = ban_value(&m, id("c"), &[], &[], &[], &none);
+        let ban_l = ban_value(&m, id("l"), &[], &[], &[], &none);
         assert!(ban_c.total > ban_l.total);
         // a line-up with c beats one with l
         let p = win_probability(&m, &[id("c"), id("e")], &[id("l"), id("f")]);
         assert!(p > 0.65, "{p}");
         assert!((win_probability(&m, &[], &[]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_players_mastery_counts_for_them() {
+        let m = meta();
+        let none = |_: u16| None;
+        // athlete 1 is strong on every champion; the simulation gives no real mastery, so take
+        // whichever (athlete, champion) the model rates highest and check it is used
+        let (&(athlete, champ), best) = m
+            .mastery
+            .iter()
+            .max_by(|a, b| a.1.value.partial_cmp(&b.1.value).unwrap())
+            .unwrap();
+        let plain = pick_value(&m, champ, &[], &[], &[], &none);
+        let role = plain.role.unwrap();
+        let with = pick_value(&m, champ, &[], &[], &[(athlete, Some(role))], &none);
+        assert!((with.mastery - best.value).abs() < 1e-6 && with.total > plain.total);
+        let other_lane = Role::ALL.into_iter().find(|r| *r != role).unwrap();
+        let elsewhere = pick_value(&m, champ, &[], &[], &[(athlete, Some(other_lane))], &none);
+        assert_eq!(elsewhere.mastery, 0.0, "only the player in that lane counts");
+        assert_eq!(player_in(&[(7, Some(Role::Mid))], Role::Mid), Some(7));
     }
 
     #[test]

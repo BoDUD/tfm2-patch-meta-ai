@@ -17,6 +17,8 @@ const NODE: &str = "pma_names";
 pub struct NameBook {
     state: State,
     by_text: HashMap<String, String>,
+    /// How each champion is shown (the game's language when known, else English).
+    by_id: HashMap<String, String>,
     /// Names came back in the game's language (not just the English fallback).
     pub localized: bool,
 }
@@ -52,7 +54,15 @@ impl NameBook {
     pub fn learn(&mut self, text: &str, champion: &str) {
         if !text.is_empty() {
             self.by_text.entry(normalize(text)).or_insert_with(|| champion.to_string());
+            if text != champion {
+                self.by_id.entry(champion.to_string()).or_insert_with(|| text.to_string());
+            }
         }
+    }
+
+    /// The name to show for a champion.
+    pub fn display<'a>(&'a self, champion: &'a str) -> &'a str {
+        self.by_id.get(champion).map_or(champion, String::as_str)
     }
 
     pub fn tick(&mut self, ui: &mut impl Ui, frame: u64, champions: &[String]) {
@@ -87,6 +97,7 @@ impl NameBook {
                         if !got.is_empty() && !got.starts_with('#') {
                             *resolved += 1;
                             self.by_text.insert(normalize(&got), champ.clone());
+                            self.by_id.insert(champ.clone(), got.trim().to_string());
                         }
                     }
                     batch.clear();
@@ -142,6 +153,7 @@ mod tests {
         }
         assert!(book.ready() && book.localized);
         assert_eq!(book.lookup("名字c42"), Some("c42"));
+        assert_eq!(book.display("c42"), "名字c42");
         assert!(!ui.exists(&format!("main.{NODE}")), "cleaned up");
 
         // a host that hands the reference back: English names only
@@ -154,5 +166,6 @@ mod tests {
         assert!(book.ready() && !book.localized);
         book.learn("Ahri", "c1");
         assert_eq!(book.lookup(" ahri "), Some("c1"));
+        assert_eq!((book.display("c1"), book.display("c2")), ("Ahri", "c2"));
     }
 }

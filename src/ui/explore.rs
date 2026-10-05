@@ -1,7 +1,7 @@
-//! The UI explorer: writes the live node tree of a screen to `ui_dump_<n>.txt` in the mod folder
-//! - every node's path, kind, visibility, rectangle, text and runner state. It runs when a
-//! screen the session has not seen appears (`explore=on` in settings.ini) and whenever F9 is
-//! pressed, and walks a few hundred nodes per frame so a big screen costs no visible hitch.
+//! The UI explorer: writes the live node tree of a screen to `ui_dump_<n>.txt` in the mod folder:
+//! every node's path, kind, visibility, rectangle, text and runner state. It runs when a screen
+//! the session has not seen appears (`explore=on` in settings.ini) and whenever F9 is pressed,
+//! and walks a few hundred nodes per frame so a big screen costs no visible hitch.
 
 use std::collections::{HashSet, VecDeque};
 

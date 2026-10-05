@@ -10,8 +10,12 @@
 pub mod draft_screen;
 pub mod explore;
 pub mod names;
+pub mod panel;
 
+use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use crate::history::Role;
 
 use mod_api_stable::{ClientSceneKindV1, InputEventKindV1, StableClient};
 
@@ -86,6 +90,16 @@ pub struct Context {
     pub champions: Vec<String>,
     /// (English display name, champion id).
     pub english: Vec<(String, String)>,
+    /// Each team's players and their lanes (newest match), by team name in lower case.
+    pub rosters: HashMap<String, Vec<(u32, Option<Role>)>>,
+    /// Team names as the game writes them, by lower-case name.
+    pub team_labels: HashMap<String, String>,
+    /// Each team's most played champions lately: (champion id, games, wins), most first.
+    pub team_picks: HashMap<String, Vec<(String, u32, u32)>>,
+    pub athletes: HashMap<u32, String>,
+    /// The player's opponent in their newest competition match (lower case).
+    pub last_opponent: Option<String>,
+    pub backtest: Option<crate::meta::Backtest>,
 }
 
 #[derive(Default)]
@@ -94,6 +108,7 @@ struct State {
     explorer: explore::Explorer,
     names: names::NameBook,
     draft: draft_screen::DraftScreen,
+    panel: panel::Panel,
     context: Context,
 }
 
@@ -103,7 +118,7 @@ fn lock() -> MutexGuard<'static, Option<State>> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A save was read: names to match and the player's team.
+/// After every rebuild: names to match, the player's team and every team's players.
 pub fn set_context(context: Context) {
     let mut guard = lock();
     let st = guard.get_or_insert_with(State::default);
@@ -137,12 +152,16 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     if cfg.draft_overlay {
         let view = draft_screen::View {
             team_name: &st.context.team_name,
+            rosters: &st.context.rosters,
             grid_values: cfg.grid_values,
             lane_tags: cfg.lane_tags,
         };
         let snapshot = crate::shared::get();
         st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view);
     }
+    let snapshot = crate::shared::get();
+    let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
+    st.panel.tick(ui, frame, snapshot.as_deref(), &st.names, &st.context, opponent.as_deref());
 }
 
 /// Text for a `.ui` string literal.

@@ -197,6 +197,8 @@ struct State {
     labels: Labels,
     damage: HashMap<u16, Damage>,
     champions: Vec<String>,
+    /// Team names by id (asked once each).
+    team_names: HashMap<u32, String>,
     probes_written: bool,
     records_probed: bool,
 }
@@ -236,6 +238,7 @@ impl State {
             labels: Labels::default(),
             damage: HashMap::new(),
             champions: Vec::new(),
+            team_names: HashMap::new(),
             probes_written: false,
             records_probed: false,
         }
@@ -477,6 +480,79 @@ fn current_version(
     }
 }
 
+/// What the screens know about every team, by lower-case team name.
+#[derive(Default)]
+struct Teams {
+    rosters: HashMap<String, Vec<(u32, Option<crate::history::Role>)>>,
+    labels: HashMap<String, String>,
+    picks: HashMap<String, Vec<(String, u32, u32)>>,
+    last_opponent: Option<String>,
+}
+
+/// Matches per team the "most played" lists count.
+const RECENT_PER_TEAM: usize = 20;
+
+/// Each team's players and lanes (its newest competition match) and its most played champions
+/// lately; the player's last opponent.
+fn teams(st: &mut State, game: &mut impl Game, own: usize) -> Teams {
+    let mut by_team: HashMap<u32, Vec<(usize, &Match, usize)>> = HashMap::new();
+    for g in st.comp.games.values() {
+        for (side, team) in g.teams.iter().enumerate() {
+            if let Some(team) = team {
+                by_team.entry(*team).or_default().push((g.record, g, side));
+            }
+        }
+    }
+    let mut out = Teams::default();
+    let mut wanted_athletes = Vec::new();
+    for (team, mut list) in by_team {
+        list.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let label = st
+            .team_names
+            .entry(team)
+            .or_insert_with(|| game.team_name(team as usize).unwrap_or_default())
+            .trim()
+            .to_string();
+        let key = label.to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let (_, newest, side) = list[0];
+        let players: Vec<(u32, Option<crate::history::Role>)> =
+            newest.sides[side].iter().filter_map(|s| Some((s.athlete?, s.role))).collect();
+        wanted_athletes.extend(players.iter().map(|(a, _)| *a));
+        if team as usize == own {
+            let other = newest.teams[1 - side];
+            out.last_opponent = other.and_then(|o| st.team_names.get(&o)).map(|n| n.trim().to_lowercase());
+        }
+        let mut counts: HashMap<u16, (u32, u32)> = HashMap::new();
+        for (_, g, side) in list.iter().take(RECENT_PER_TEAM) {
+            for s in &g.sides[*side] {
+                let e = counts.entry(s.champ).or_default();
+                e.0 += 1;
+                e.1 += g.won(*side) as u32;
+            }
+        }
+        let mut picks: Vec<(String, u32, u32)> =
+            counts.into_iter().map(|(c, (g, w))| (st.names.name(c).to_string(), g, w)).collect();
+        picks.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        picks.truncate(12);
+        if !players.is_empty() {
+            out.rosters.insert(key.clone(), players);
+        }
+        out.picks.insert(key.clone(), picks);
+        out.labels.insert(key, label);
+    }
+    for a in wanted_athletes {
+        if let std::collections::hash_map::Entry::Vacant(slot) = st.labels.athletes.entry(a) {
+            if let Some(name) = game.athlete_name(a) {
+                slot.insert(name);
+            }
+        }
+    }
+    out
+}
+
 /// Once per save: what the team, athlete, fixture and schedule records look like, for the
 /// features that need them (`probe_records.txt`).
 fn probe_records(game: &mut impl Game, team: usize) {
@@ -581,11 +657,6 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
             }
         }
         st.labels.team_name = game.team_name(team).unwrap_or_default();
-        crate::ui::set_context(crate::ui::Context {
-            team_name: st.labels.team_name.clone(),
-            champions: champions.clone(),
-            english: st.labels.champions.iter().map(|(id, label)| (label.clone(), id.clone())).collect(),
-        });
         st.champions = champions;
     }
     let unknown: Vec<&str> = (0..st.names.len() as u16)
@@ -622,6 +693,18 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         }
     }
     st.labels.date = game.game_date();
+    let teams = teams(st, game, team);
+    crate::ui::set_context(crate::ui::Context {
+        team_name: st.labels.team_name.clone(),
+        champions: st.champions.clone(),
+        english: st.labels.champions.iter().map(|(id, label)| (label.clone(), id.clone())).collect(),
+        rosters: teams.rosters,
+        team_labels: teams.labels,
+        team_picks: teams.picks,
+        athletes: st.labels.athletes.clone(),
+        last_opponent: teams.last_opponent,
+        backtest: st.backtest,
+    });
     if !st.records_probed {
         st.records_probed = true;
         probe_records(game, team);

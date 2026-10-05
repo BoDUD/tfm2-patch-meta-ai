@@ -50,9 +50,9 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
 pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool) -> f32 {
     let damage = |c: u16| snapshot.damage_of(c);
     if ban {
-        advisor::ban_value(&snapshot.meta, cand, ally, enemy, &damage).total
+        advisor::ban_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
     } else {
-        advisor::pick_value(&snapshot.meta, cand, ally, enemy, &damage).total
+        advisor::pick_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
     }
 }
 
