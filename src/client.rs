@@ -50,6 +50,10 @@ pub trait Game: Source {
     fn athlete_name(&mut self, _athlete: u32) -> Option<String> {
         None
     }
+    /// The season schedule document (or part of it).
+    fn schedule_json(&mut self, _path: &str) -> Option<String> {
+        None
+    }
     /// Fit in a background thread (tests fit in the frame, to stay deterministic).
     fn threaded(&self) -> bool {
         false
@@ -115,6 +119,9 @@ impl Game for ClientGame<'_, '_> {
     fn athlete_name(&mut self, athlete: u32) -> Option<String> {
         self.ctx.athlete_name(athlete as usize)
     }
+    fn schedule_json(&mut self, path: &str) -> Option<String> {
+        self.ctx.schedule_get_json(path)
+    }
     fn threaded(&self) -> bool {
         true
     }
@@ -126,6 +133,12 @@ impl StableExtension for ClientExt {
     fn post_update(&self, ctx: &mut StableClient<'_>, _dt_micros: u64) {
         let in_game = ctx.is_in_game();
         tick(&mut ClientGame { ctx }, in_game, Instant::now());
+        if in_game {
+            let scene = ctx.client_scene_kind();
+            crate::ui::tick(ctx, scene, &config::get());
+        } else {
+            crate::ui::reset();
+        }
     }
 }
 
@@ -185,6 +198,7 @@ struct State {
     damage: HashMap<u16, Damage>,
     champions: Vec<String>,
     probes_written: bool,
+    records_probed: bool,
 }
 
 impl State {
@@ -223,6 +237,7 @@ impl State {
             damage: HashMap::new(),
             champions: Vec::new(),
             probes_written: false,
+            records_probed: false,
         }
     }
 }
@@ -462,6 +477,31 @@ fn current_version(
     }
 }
 
+/// Once per save: what the team, athlete, fixture and schedule records look like, for the
+/// features that need them (`probe_records.txt`).
+fn probe_records(game: &mut impl Game, team: usize) {
+    let mut out = format!("{} {} - record layouts of this save (long lists cut short)\n", crate::MOD_ID, crate::VERSION);
+    let mut section = |title: &str, json: Option<String>| {
+        out.push_str(&format!("\n===== {title} =====\n"));
+        out.push_str(&json.map_or("(nothing)".to_string(), |j| pretty(&j)));
+        out.push('\n');
+    };
+    section(&format!("Team #{team}"), game.record_json(RecordKindV1::Team, team, ""));
+    let athletes = game.record_ids(RecordKindV1::Athlete);
+    section("Athlete (first)", athletes.first().and_then(|id| game.record_json(RecordKindV1::Athlete, *id, "")));
+    for kind in [RecordKindV1::MatchNormal, RecordKindV1::Match, RecordKindV1::YearSchedule, RecordKindV1::LeagueCompetition] {
+        let ids = game.record_ids(kind);
+        let mut picked: Vec<usize> = ids.first().copied().into_iter().chain(ids.last().copied()).collect();
+        picked.dedup();
+        for id in picked {
+            section(&format!("{kind:?} #{id} (of {})", ids.len()), game.record_json(kind, id, ""));
+        }
+    }
+    section("schedule", game.schedule_json(""));
+    diag::write_file("probe_records.txt", &out);
+    diag::log("wrote probe_records.txt (team, athlete, fixture and schedule layouts)");
+}
+
 /// A record as indented JSON, with very long arrays (replay inputs) cut short.
 fn pretty(raw: &str) -> String {
     fn trim(v: &mut Value) {
@@ -541,6 +581,11 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
             }
         }
         st.labels.team_name = game.team_name(team).unwrap_or_default();
+        crate::ui::set_context(crate::ui::Context {
+            team_name: st.labels.team_name.clone(),
+            champions: champions.clone(),
+            english: st.labels.champions.iter().map(|(id, label)| (label.clone(), id.clone())).collect(),
+        });
         st.champions = champions;
     }
     let unknown: Vec<&str> = (0..st.names.len() as u16)
@@ -577,6 +622,10 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         }
     }
     st.labels.date = game.game_date();
+    if !st.records_probed {
+        st.records_probed = true;
+        probe_records(game, team);
+    }
 
     let mut games: Vec<Match> = st.comp.games.values().cloned().collect();
     if cfg.solo_weight > 0.0 {

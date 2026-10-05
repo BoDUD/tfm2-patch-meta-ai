@@ -91,6 +91,41 @@ pub fn lanes(meta: &Meta, picks: &[u16]) -> Lanes {
     }
 }
 
+/// For each pick, the probability of each lane (summed over every one-to-one assignment,
+/// weighted by how often each champion plays its lane). Rows follow `picks`.
+pub fn lane_probabilities(meta: &Meta, picks: &[u16]) -> Vec<[f32; 5]> {
+    let picks = &picks[..picks.len().min(5)];
+    let mut out = vec![[0.0f32; 5]; picks.len()];
+    let mut total = 0.0f32;
+    let mut current: Vec<Role> = Vec::with_capacity(picks.len());
+    fn walk(meta: &Meta, picks: &[u16], current: &mut Vec<Role>, score: f32, out: &mut [[f32; 5]], total: &mut f32) {
+        if current.len() == picks.len() {
+            let w = score.exp();
+            *total += w;
+            for (row, r) in out.iter_mut().zip(current.iter()) {
+                row[r.index()] += w;
+            }
+            return;
+        }
+        let champ = picks[current.len()];
+        for r in Role::ALL {
+            if current.contains(&r) {
+                continue;
+            }
+            current.push(r);
+            walk(meta, picks, current, score + lane_fit(meta, champ, r), out, total);
+            current.pop();
+        }
+    }
+    walk(meta, picks, &mut current, 0.0, &mut out, &mut total);
+    if total > 0.0 {
+        for row in &mut out {
+            row.iter_mut().for_each(|p| *p /= total);
+        }
+    }
+    out
+}
+
 /// A champion's strength in a lane (log-odds), with the off-role cost.
 pub fn strength_in(meta: &Meta, champ: u16, role: Role) -> f32 {
     let Some(c) = meta.by_id(champ) else { return 0.0 };
@@ -135,7 +170,8 @@ pub struct PickValue {
     pub total: f32,
 }
 
-/// The value of picking `cand` for the team that has `ally` against `enemy`.
+/// The value of picking `cand` for the team that has `ally` against `enemy`, in the open lane
+/// it plays most often.
 pub fn pick_value(
     meta: &Meta,
     cand: u16,
@@ -145,10 +181,13 @@ pub fn pick_value(
 ) -> PickValue {
     let taken = lanes(meta, ally);
     let open: Vec<Role> = Role::ALL.into_iter().filter(|r| !taken.roles.contains(r)).collect();
+    // the open lane it plays most often (not the one whose estimate happens to be highest:
+    // that would favour lucky noise); strength only breaks ties
     let (role, strength) = open
         .iter()
-        .map(|r| (Some(*r), strength_in(meta, cand, *r)))
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|r| (Some(*r), lane_fit(meta, cand, *r), strength_in(meta, cand, *r)))
+        .max_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(r, _, s)| (r, s))
         .unwrap_or((None, meta.by_id(cand).map_or(0.0, |c| c.strength) - OFF_ROLE_COST));
     let synergy: f32 = ally.iter().map(|a| meta.synergy(cand, *a).value).sum();
     let counter: f32 = enemy.iter().map(|e| meta.counter(cand, *e).value).sum();
@@ -247,6 +286,17 @@ mod tests {
         assert_eq!(l.roles.len(), 3);
         assert!(l.confidence < 0.2, "{}", l.confidence);
         assert_eq!(lanes(&m, &[]).roles, Vec::<Role>::new());
+    }
+
+    #[test]
+    fn lane_probabilities_sum_to_one() {
+        let m = meta();
+        let probs = lane_probabilities(&m, &[0, 1]);
+        assert_eq!(probs.len(), 2);
+        for row in &probs {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        }
+        assert!(lane_probabilities(&m, &[]).is_empty());
     }
 
     #[test]

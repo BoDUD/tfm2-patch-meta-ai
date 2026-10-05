@@ -83,11 +83,20 @@ pub struct Config {
     pub c_percent: f32,
     /// Champions with fewer than `min_games`: `false` = keep their tier (default), `true` = No Tier.
     pub clear_unranked: bool,
+    // [screen]
+    /// The ban/pick screen overlay: win chance and advice.
+    pub draft_overlay: bool,
+    /// ... the value of every champion on the grid.
+    pub grid_values: bool,
+    /// ... the likely lane of each enemy pick.
+    pub lane_tags: bool,
     // [report]
     /// Write `meta_report.html` next to `meta_table.txt`.
     pub report: bool,
     // [debug]
     pub verbose: bool,
+    /// Write the UI tree of every new screen to `ui_dump_*.txt` (F9 always does).
+    pub explore: bool,
 }
 
 impl Default for Config {
@@ -114,8 +123,12 @@ impl Default for Config {
             b_percent: 40.0,
             c_percent: 20.0,
             clear_unranked: false,
+            draft_overlay: true,
+            grid_values: true,
+            lane_tags: true,
             report: true,
             verbose: false,
+            explore: false,
         }
     }
 }
@@ -204,6 +217,10 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
+        "draft_overlay" => cfg.draft_overlay = flag(value)?,
+        "grid_values" => cfg.grid_values = flag(value)?,
+        "lane_tags" => cfg.lane_tags = flag(value)?,
+        "explore" => cfg.explore = flag(value)?,
         "patches" => cfg.patches = number(value)?.round(),
         "drift" => cfg.drift = number(value)?,
         "change" => cfg.change = number(value)?,
@@ -387,7 +404,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={}",
+         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} explore={}",
         c.ban_pick.as_str(),
         c.tier_list.as_str(),
         c.patches,
@@ -409,7 +426,11 @@ pub fn summary(c: &Config) -> String {
         c.b_percent,
         c.c_percent,
         if c.clear_unranked { "clear" } else { "keep" },
-        if c.report { "on" } else { "off" }
+        if c.report { "on" } else { "off" },
+        if c.draft_overlay { "on" } else { "off" },
+        if c.grid_values { "on" } else { "off" },
+        if c.lane_tags { "on" } else { "off" },
+        if c.explore { "on" } else { "off" }
     )
 }
 
@@ -493,12 +514,26 @@ c=20
 ;            证据不足的英雄：keep = 保持原梯队，clear = 设为无梯队
 unranked=keep
 
+[screen]
+; On the ban/pick screen / 选人界面:
+; draft_overlay : win chance (bottom left) and the best picks and bans for you (bottom right)
+;                 左下角显示阵容胜率，右下角显示当前最佳选择与禁用
+; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
+;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
+; lane_tags     : on each enemy pick, its most likely lane / 敌方每个已选英雄最可能的位置
+draft_overlay=on
+grid_values=on
+lane_tags=on
+
 [report]
 ; meta_report.html in the mod folder: tiers, lane win rates, synergies, matchups, players
 ; Mod 文件夹里的 meta_report.html：梯队、分位置胜率、配合、克制、选手熟练度（用浏览器打开）
 report=on
 
 [debug]
+; explore : write the UI tree of every new screen to ui_dump_*.txt (F9 writes one any time)
+;           把每个新界面的 UI 结构写入 ui_dump_*.txt（任何时候按 F9 也会写一份）
+explore=off
 ; more detail in diag.log / diag.log 写更多细节
 verbose=off
 "#;

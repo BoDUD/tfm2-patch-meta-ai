@@ -34,6 +34,7 @@ pub mod report;
 pub mod scan;
 pub mod server;
 mod shared;
+pub mod ui;
 pub mod worker;
 
 use mod_api_stable::{declare_stable_mod, LogLevel, StableHost, StableMod};
