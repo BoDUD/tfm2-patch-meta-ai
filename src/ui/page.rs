@@ -265,7 +265,7 @@ const SORT_IDS: [(Sort, &str); 8] = [
 ];
 
 const TABS: [(&str, &str, &str); 4] =
-    [("champions", "tab_champions", "Champions"), ("pairs", "tab_pairs", "Duos & Matchups"), ("players", "tab_players", "Players"), ("model", "tab_model", "Model")];
+    [("champions", "tab_champions", "Champions"), ("pairs", "tab_pairs", "Synergy & Matchups"), ("players", "tab_players", "Players"), ("model", "tab_model", "Model")];
 
 pub struct MetaPage {
     open: bool,
@@ -743,12 +743,12 @@ fn champions_source<U: Ui>(t: &mut Texts<'_, U>, lane: Option<Role>) -> String {
         "#".into(),
         "#asset/base/text/ui?statistics.champion_name".into(),
         "#asset/base/text/ui?statistics.tier".into(),
-        t.get("col_win", "Est. Win Rate"),
+        t.get("col_win", "Power Win Rate"),
         t.get("col_delta", "vs Last Patch"),
         t.get("col_games", "Games"),
         t.get("col_pick", "Pick"),
         t.get("col_ban", "Ban"),
-        t.get("col_presence", "Presence"),
+        t.get("col_presence", "Contest Rate"),
         t.get("col_lanes", "Best Lanes"),
         t.get("col_patch", "Last Change"),
     ];
@@ -765,7 +765,7 @@ fn champions_source<U: Ui>(t: &mut Texts<'_, U>, lane: Option<Role>) -> String {
             None => header.push_str(&format!("#c{x}:empty {{ x: {x}px; width: {w}px; height: 56px; {heading}}} ")),
         }
     }
-    let note = t.get("note_win", "Estimated win rate: a team with this champion and average team-mates and players, this patch.");
+    let note = t.get("note_win", "Power win rate: how often a team wins with this champion this patch, its team-mates and players being average.");
     format!(
         "{lane_bar}#data:color {{ y: 52px; width: 1600px; height: 916px; color: {}; rounding: Uniform {{ rounding: 12; }} \
          #header:color {{ width: 1600px; height: 56px; color: {}; rounding: Individual {{ top_left: 12; top_right: 12; }} {header}}} \
@@ -954,14 +954,14 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
         tier_badge("tier", 132, 68, tier),
         label("change", 176, 68, 300, 28, 16, c.last_change.as_ref().map_or(DIM, |(_, d)| if *d > 0 { GOOD } else { BAD }), "Left", &change),
         bold("wr", 640, 18, 200, 50, 40, tier.map_or(TEXT, tier_color), "Left", &format!("{:.1}%", c.win_rate() * 100.0)),
-        label("wrl", 640, 70, 220, 24, 14, DIM, "Left", &t.get("col_win", "Est. Win Rate")),
+        label("wrl", 640, 70, 220, 24, 14, DIM, "Left", &t.get("col_win", "Power Win Rate")),
         label("delta", 860, 30, 160, 30, 22, delta.map_or(DIM, tone), "Left", &delta.map_or("-".into(), signed)),
         label("deltal", 860, 70, 180, 24, 14, DIM, "Left", &t.get("col_delta", "vs Last Patch")),
         [
             stat("games", 1060, &format!("{} / {}", c.current.games, c.window.games), &t.get("col_games", "Games")),
             stat("pick", 1220, &format!("{:.1}%", c.pick_rate * 100.0), &t.get("col_pick", "Pick")),
             stat("ban", 1340, &format!("{:.1}%", c.ban_rate * 100.0), &t.get("col_ban", "Ban")),
-            stat("presence", 1460, &format!("{:.1}%", c.presence() * 100.0), &t.get("col_presence", "Presence")),
+            stat("presence", 1460, &format!("{:.1}%", c.presence() * 100.0), &t.get("col_presence", "Contest Rate")),
         ]
         .concat()
     );
@@ -1008,9 +1008,9 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
     let strong: Vec<_> = against.iter().filter(|x| x.1 > 0.0).take(6).copied().collect();
     let weak: Vec<_> = against.iter().rev().filter(|x| x.1 < 0.0).take(6).copied().collect();
     let best: Vec<_> = with.iter().filter(|x| x.1 > 0.0).take(6).copied().collect();
-    s.push_str(&champ_list("with", 0, 360, 520, &t.get("best_with", "Best With"), &best, meta, &mut icons, &mut links, "detail"));
-    s.push_str(&champ_list("strong", 540, 360, 520, &t.get("strong_against", "Strong Against"), &strong, meta, &mut icons, &mut links, "detail"));
-    s.push_str(&champ_list("weak", 1080, 360, 520, &t.get("weak_against", "Weak Against"), &weak, meta, &mut icons, &mut links, "detail"));
+    s.push_str(&champ_list("with", 0, 360, 520, &t.get("best_with", "Best Partners"), &best, meta, &mut icons, &mut links, "detail"));
+    s.push_str(&champ_list("strong", 540, 360, 520, &t.get("strong_against", "Edge Over"), &strong, meta, &mut icons, &mut links, "detail"));
+    s.push_str(&champ_list("weak", 1080, 360, 520, &t.get("weak_against", "Edge Against"), &weak, meta, &mut icons, &mut links, "detail"));
     // patch history and best players
     let mut history = bold("title", 20, 10, 400, 24, 18, TEXT, "Left", &t.get("patch_history", "Patch History"));
     let n = c.history.len().max(1);
@@ -1087,9 +1087,9 @@ fn pairs_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta) -> Extras {
         rect(id, x, 52, 790, 876, PANEL, 12, &inner)
     };
     let duo_list: Vec<((u16, u16), Effect)> = duos.iter().map(|(k, e)| (**k, **e)).collect();
-    s.push_str(&column("duos", 0, &t.get("duos", "Best Duos"), "+", duo_list, &mut icons));
-    s.push_str(&column("edges", 810, &t.get("matchups", "Matchups"), ">", edges, &mut icons));
-    let note = t.get("note_pairs", "Lift: how much better (or worse) than their own strengths predict, in win-rate points.");
+    s.push_str(&column("duos", 0, &t.get("duos", "Golden Duos"), "+", duo_list, &mut icons));
+    s.push_str(&column("edges", 810, &t.get("matchups", "Matchup Edges"), ">", edges, &mut icons));
+    let note = t.get("note_pairs", "Synergy and edge: how many more games (in win-rate points) the pair wins than their own strengths predict.");
     s.push_str(&label("note", 4, 938, 1592, 24, 13, DIM, "Left", &note));
     (s, icons, Vec::new())
 }

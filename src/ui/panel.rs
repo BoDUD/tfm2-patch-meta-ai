@@ -243,7 +243,7 @@ fn tier_page(meta: &Meta) -> Page {
             ("Tier", 0, 50, false),
             ("Champion 英雄", 60, 270, false),
             ("", 334, 26, false),
-            ("Win 胜率", 370, 100, true),
+            ("Power 实力胜率", 370, 100, true),
             ("", 476, 70, false),
             ("Δ prev", 556, 90, true),
             ("Games 场次", 656, 140, true),
@@ -252,8 +252,8 @@ fn tier_page(meta: &Meta) -> Page {
             ("Best lanes 最佳位置", 1000, 320, false),
         ],
         rows,
-        note: "Win = estimated win rate with average team-mates and players; games = this patch / kept patches; \
-               ▲▼ = changed this patch. 胜率 = 队友与选手均为平均水平时的估计胜率；▲▼ = 本版本被调整。"
+        note: "Power = win rate with average team-mates and players; games = this patch / kept patches; \
+               ▲▼ = changed this patch. 实力胜率 = 队友与选手均为平均水平时的胜率；▲▼ = 本版本被调整。"
             .into(),
     }
 }

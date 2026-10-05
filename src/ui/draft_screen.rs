@@ -4,10 +4,11 @@
 //!   player's line-up beats the enemy's as picked so far, with a bar;
 //! - **advice** (bottom right): the best picks and the best ban for the player right now, each
 //!   with what it is worth and why (lane, synergy, matchups, the player's mastery);
-//! - **grid values**: on every champion card, what picking it is worth to the player now, in
-//!   win-rate points;
-//! - **enemy lanes**: on each enemy pick, the lane it most likely plays and how sure that is -
-//!   from the champions' lane history, so it works in every language.
+//! - **grid values**: on every champion card, a value chip at the foot of the portrait - an
+//!   arrow and what picking it is worth to the player now, in win-rate points, with a stripe in
+//!   its colour;
+//! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
+//!   of how sure that is - from the champions' lane history, so it works in every language.
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
@@ -184,13 +185,48 @@ fn overlay_source() -> String {
     )
 }
 
-fn tag_source(id: &str, w: u32, x_from_right: bool) -> String {
-    let (anchor, x) = if x_from_right { ("anchor_x: 1; pivot_x: 1; ", -6) } else { ("", 6) };
+/// The value chip at the foot of a card's portrait: a coloured stripe and an arrow with the value.
+fn chip_source() -> String {
     format!(
-        "{id}:color {{ {anchor}x: {x}px; y: 6px; width: {w}px; height: 20px; color: #07080bd0; ignore_event: true; \
-         rounding: Uniform {{ rounding: 6; }} #text:label {{ @\"asset/base/style/main#label\"; width: 100%; height: 100%; \
-         size: 12; align_x: Center; align_y: Center; text: \"\"; ignore_event: true; }} }}"
+        "{TAG}:color {{ x: 6px; y: 62px; width: 58px; height: 20px; color: #07080be0; ignore_event: true; \
+         rounding: Uniform {{ rounding: 4; }} \
+         #stripe:color {{ width: 3px; height: 100%; color: {}; ignore_event: true; }} \
+         #text:label {{ @\"asset/base/style/main#bold_label\"; x: 7px; width: 49px; height: 100%; size: 12; \
+         align_x: Left; align_y: Center; text: \"\"; ignore_event: true; }} }}",
+        color(DIM)
     )
+}
+
+/// Steps of the lane read's confidence bar.
+const LANE_STEPS: usize = 5;
+
+/// The lane read on an enemy pick: the lane icon and a five-step confidence bar.
+fn lane_source() -> String {
+    let mut steps = String::new();
+    for k in 0..LANE_STEPS {
+        steps.push_str(&format!(
+            "#s{k}:color {{ x: {}px; y: 9px; width: 7px; height: 5px; color: #4a4c56ff; ignore_event: true; \
+             rounding: Uniform {{ rounding: 2; }} }} ",
+            30 + k * 9
+        ));
+    }
+    format!(
+        "{LANE_TAG}:color {{ anchor_x: 1; pivot_x: 1; x: -6px; y: 6px; width: {}px; height: 24px; color: #07080be0; \
+         ignore_event: true; rounding: Uniform {{ rounding: 6; }} \
+         #icon:image {{ x: 5px; y: 3px; width: 18px; height: 18px; color: #e8e8e8ff; ignore_event: true; \
+         source: \"asset/base/ui/icons/top\"; }} {steps}}}",
+        30 + LANE_STEPS * 9 + 2
+    )
+}
+
+fn lane_icon(r: Role) -> &'static str {
+    match r {
+        Role::Top => "asset/base/ui/icons/top",
+        Role::Jungle => "asset/base/ui/icons/jungle",
+        Role::Mid => "asset/base/ui/icons/mid",
+        Role::Bottom => "asset/base/ui/icons/bottom",
+        Role::Support => "asset/base/ui/icons/support",
+    }
 }
 
 /// Why a pick or ban is worth what it is, in a few words.
@@ -371,7 +407,7 @@ impl DraftScreen {
             let by_champ: HashMap<u16, f32> = pick_values.iter().map(|v| (v.champ, v.total)).collect();
             for c in cards.iter().filter(|c| c.champ.is_some()) {
                 let tag = format!("{}.{TAG}", c.path);
-                if !ui.exists(&tag) && !ui.spawn(&c.path, &tag_source(TAG, 52, false)) {
+                if !ui.exists(&tag) && !ui.spawn(&c.path, &chip_source()) {
                     continue;
                 }
                 let value = id(c).and_then(|x| by_champ.get(&x)).copied();
@@ -382,9 +418,16 @@ impl DraftScreen {
                 }
                 if let Some(v) = value {
                     let pts = points(v);
-                    ui.set_text(&format!("{tag}.text"), &signed(pts));
-                    let c = if pts >= 1.0 { GOOD } else if pts <= -1.0 { BAD } else { DIM };
+                    let (arrow, c) = if pts >= 1.0 {
+                        ("▲", GOOD)
+                    } else if pts <= -1.0 {
+                        ("▼", BAD)
+                    } else {
+                        ("·", DIM)
+                    };
+                    ui.set_text(&format!("{tag}.text"), &format!("{arrow}{:.1}", pts.abs()));
                     ui.set_properties(&format!("{tag}.text"), &format!("color: {};", color(c)));
+                    ui.set_properties(&format!("{tag}.stripe"), &format!("color: {};", color(c)));
                 }
             }
         }
@@ -397,21 +440,25 @@ impl DraftScreen {
             for (i, slot) in slots.iter().enumerate() {
                 let path = format!("{column}.{slot}");
                 let tag = format!("{path}.{LANE_TAG}");
-                let text = probs.get(i).map(|row| {
-                    let (best, p) = row
-                        .iter()
+                let read = probs.get(i).map(|row| {
+                    row.iter()
                         .enumerate()
                         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                         .map(|(r, p)| (Role::ALL[r], *p))
-                        .unwrap_or((Role::Top, 0.0));
-                    format!("{} {:.0}%", best.name(), p * 100.0)
+                        .unwrap_or((Role::Top, 0.0))
                 });
-                if !ui.exists(&tag) && (text.is_none() || !ui.spawn(&path, &tag_source(LANE_TAG, 96, true))) {
+                if !ui.exists(&tag) && (read.is_none() || !ui.spawn(&path, &lane_source())) {
                     continue;
                 }
-                ui.set_visible(&tag, text.is_some());
-                if let Some(t) = text {
-                    ui.set_text(&format!("{tag}.text"), &t);
+                ui.set_visible(&tag, read.is_some());
+                if let Some((lane, p)) = read {
+                    ui.set_properties(&format!("{tag}.icon"), &format!("source: \"{}\";", lane_icon(lane)));
+                    // 20% is a blind guess among five lanes: the bar starts there
+                    let lit = (((p - 0.2) / 0.8).clamp(0.0, 1.0) * LANE_STEPS as f32).ceil() as usize;
+                    for k in 0..LANE_STEPS {
+                        let c = if k < lit { if lit >= 4 { GOOD } else { 0xf2c14eff } } else { 0x4a4c56ff };
+                        ui.set_properties(&format!("{tag}.s{k}"), &format!("color: {};", color(c)));
+                    }
                 }
             }
         }
@@ -503,9 +550,12 @@ mod tests {
         assert_eq!(ui.visible(&format!("{GRID}.a.{TAG}")), Some(false), "picked");
         assert_eq!(ui.visible(&format!("{GRID}.e.{TAG}")), Some(false), "banned");
         assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(true));
-        assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('+'), "c is worth picking");
-        // a lane read on the enemy's first pick slot
-        assert!(text(&format!("main.red_picks.pick_slot_0.{LANE_TAG}.text")).ends_with('%'));
+        assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('▲'), "c is worth picking");
+        assert!(ui.nodes[&format!("{GRID}.c.{TAG}.stripe")].props.iter().any(|p| p.contains(&color(GOOD))));
+        // a lane read on the enemy's first pick slot: an icon and a confidence bar
+        let lane = format!("main.red_picks.pick_slot_0.{LANE_TAG}");
+        assert!(ui.nodes[&format!("{lane}.icon")].props.iter().any(|p| p.contains("asset/base/ui/icons/")));
+        assert!(ui.exists(&format!("{lane}.s4")));
         assert!(!ui.exists(&format!("main.red_picks.pick_slot_1.{LANE_TAG}")));
 
         // nothing changed: nothing redrawn; the game rebuilt the screen: drawn again

@@ -112,7 +112,7 @@ fn pair_rows(map: &HashMap<(u16, u16), Effect>, meta: &Meta, labels: &Labels, li
             json!({
                 "a": labels.champion(meta.names.name(*a)),
                 "b": labels.champion(meta.names.name(*b)),
-                "lift": pct(points(e.value)),
+                "edge": pct(points(e.value)),
                 "games": e.tally.games,
                 "wr": e.tally.rate().map(pct),
             })
@@ -243,22 +243,22 @@ function table(cols,rows,sortIdx,desc=true){
  q.addEventListener('input',draw);draw();return $('div',{class:'wrap'},t)}
 const tierOrder={S:5,A:4,B:3,C:2,D:1};
 const lanes=['Top','Jg','Mid','Bot','Sup'];
-secs.champ.s.append($('p',{class:'note'},'Win rate = estimated chance to win with average team-mates and players this patch (±1 sd). Lanes = the same in each lane. Raw = plain result over the kept patches. 胜率 = 本版本在队友和选手都是平均水平时的估计胜率；分路 = 各位置的估计胜率；原始 = 保留版本内的实际战绩。'),
+secs.champ.s.append($('p',{class:'note'},'Power = how often a team wins with this champion this patch, its team-mates and players being average (±1 sd). Lanes = the same in each lane. Raw = plain result over the kept patches. 实力胜率 = 本版本中队友与选手都为平均水平时的胜率；分路 = 各位置的实力胜率；原始 = 保留版本内的实际战绩。'),
  table([
   {t:'Champion',l:1,k:r=>r.name},
   {t:'Tier',k:r=>tierOrder[r.tier]??0,h:r=>r.tier?`<span class="tier" style="background:var(--${r.tier})">${r.tier}</span>`:'<span class="dim">-</span>'},
-  {t:'Win %',k:r=>r.wr,h:r=>`${r.wr.toFixed(1)} <span class="dim">±${r.sd.toFixed(1)}</span>`},
+  {t:'Power %',k:r=>r.wr,h:r=>`${r.wr.toFixed(1)} <span class="dim">±${r.sd.toFixed(1)}</span>`},
   {t:'Δ prev',k:r=>r.prev==null?null:r.wr-r.prev,h:r=>r.prev==null?'':`<span class="${cls(r.wr-r.prev)}">${sign(r.wr-r.prev)}</span>`},
   {t:'Games',k:r=>r.games,h:r=>`${r.games} <span class="dim">/ ${r.window}</span>`},
   {t:'Raw %',k:r=>r.raw},
-  {t:'Pick %',k:r=>r.pick},{t:'Ban %',k:r=>r.ban},{t:'Presence',k:r=>r.pick+r.ban,h:r=>(r.pick+r.ban).toFixed(1)},
+  {t:'Pick %',k:r=>r.pick},{t:'Ban %',k:r=>r.ban},{t:'Contest',k:r=>r.pick+r.ban,h:r=>(r.pick+r.ban).toFixed(1)},
   ...lanes.map((n,i)=>({t:n,k:r=>r.lanes[i]?r.lanes[i][0]:null,h:r=>r.lanes[i]?`${r.lanes[i][0].toFixed(0)} <span class="dim">${r.lanes[i][1]}g</span>`:'<span class="dim">-</span>'})),
   {t:'Last change',k:r=>r.change?r.change[0]:null,h:r=>r.change?`<span class="${r.change[1]>0?'up':'down'}">${r.change[1]>0?'▲':'▼'} ${r.change[0]}</span>`:''},
  ],D.champions,2));
-secs.syn.s.append($('p',{class:'note'},'Lift = how much better (or worse) the pair does together than their own strengths predict, in win-rate points. Pairs with few games stay near 0. 提升 = 两人同队时比各自强度预期多赢（或少赢）的百分点；场次少的组合会被拉向 0。'),
- table([{t:'Champion',l:1,k:r=>r.a},{t:'With',l:1,k:r=>r.b},{t:'Lift',k:r=>r.lift,h:r=>`<span class="${cls(r.lift)}">${sign(r.lift)}</span>`},{t:'Games',k:r=>r.games},{t:'Raw %',k:r=>r.wr}],D.synergy,2));
+secs.syn.s.append($('p',{class:'note'},'Synergy = how many more games (in win-rate points) the pair wins together than their own strengths predict; pairs with few games stay near 0. 协同 = 两人同队时比各自实力预期多赢的胜率百分点；场次少的组合会被拉向 0。'),
+ table([{t:'Champion',l:1,k:r=>r.a},{t:'With',l:1,k:r=>r.b},{t:'Synergy',k:r=>r.edge,h:r=>`<span class="${cls(r.edge)}">${sign(r.edge)}</span>`},{t:'Games',k:r=>r.games},{t:'Raw %',k:r=>r.wr}],D.synergy,2));
 secs.ctr.s.append($('p',{class:'note'},'Edge = how much the first champion beats the second beyond their strengths (positive = good matchup for the first). 优势 = 第一个英雄对上第二个时超出强度预期的胜率百分点（正 = 克制对方）。'),
- table([{t:'Champion',l:1,k:r=>r.a},{t:'Against',l:1,k:r=>r.b},{t:'Edge',k:r=>r.lift,h:r=>`<span class="${cls(r.lift)}">${sign(r.lift)}</span>`},{t:'Games',k:r=>r.games},{t:'Raw %',k:r=>r.wr}],D.counter,2));
+ table([{t:'Champion',l:1,k:r=>r.a},{t:'Against',l:1,k:r=>r.b},{t:'Edge',k:r=>r.edge,h:r=>`<span class="${cls(r.edge)}">${sign(r.edge)}</span>`},{t:'Games',k:r=>r.games},{t:'Raw %',k:r=>r.wr}],D.counter,2));
 {const s=secs.players.s;s.append($('p',{class:'note'},'Your players: their own strength, and their best champions now (champion strength this patch + their mastery). 你的选手：本人实力，以及当前最适合的英雄（英雄本版本强度 + 选手熟练度）。'));
  if(!D.players.length)s.append($('p',{class:'dim'},'No line-up seen yet. 还没有读到阵容。'));
  for(const p of D.players){s.append($('div',{class:'player'},$('div',{html:`<b>${p.name}</b> <span class="dim">· ${p.games} games · own strength <span class="${cls(p.skill)}">${sign(p.skill)}</span></span>`}),
