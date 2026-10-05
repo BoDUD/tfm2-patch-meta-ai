@@ -1,5 +1,8 @@
 //! The meta panel, on any screen: F8 opens it and turns the page, and closes it after the last
-//! page. Keyboard only, so no click handler can be lost when the game rebuilds a screen.
+//! page; Esc closes it, and so does moving to another screen or tab. It never takes a click -
+//! every node lets the mouse through to the game underneath - so the game stays usable whatever
+//! happens to the keys. Keyboard only, so no click handler can be lost when the game rebuilds
+//! a screen.
 //!
 //! 1. **Tier list** - the strongest champions this patch: tier, estimated win rate, change since
 //!    the last patch, games, pick and ban rate, best lanes.
@@ -60,7 +63,12 @@ pub struct Panel {
     page: Option<usize>,
     parent: String,
     next_heal: u64,
+    /// The screen it was opened on: another screen closes it.
+    screen: String,
 }
+
+/// Keys that close the panel at once.
+const CLOSE_KEYS: [&str; 2] = ["Escape", "Esc"];
 
 fn pts(v: f32) -> f32 {
     (sigmoid(v) - 0.5) * 100.0
@@ -115,9 +123,9 @@ pub fn source(page: &Page, index: usize) -> String {
     }
     body.push_str(&label("note".into(), 28, 806, 1324, 13, DIM, false, &page.note));
     format!(
-        "{NODE}:color {{ width: 100%; height: 100%; color: #00000099; \
+        "{NODE}:empty {{ width: 100%; height: 100%; ignore_event: true; \
          #box:color {{ anchor_x: 0.5; pivot_x: 0.5; anchor_y: 0.5; pivot_y: 0.5; width: 1380px; height: 850px; \
-         color: #161721f8; rounding: Uniform {{ rounding: 14; }} {body}}} }}"
+         color: #161721f0; ignore_event: true; rounding: Uniform {{ rounding: 14; }} {body}}} }}"
     )
 }
 
@@ -135,18 +143,24 @@ impl Panel {
         names: &NameBook,
         context: &Context,
         opponent: Option<&str>,
+        screen: &str,
     ) {
-        let pressed = ui.keys_pressed().iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
+        let keys = ui.keys_pressed();
+        let pressed = keys.iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
+        let close = keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
         let parent = if ui.exists("main") { "main".to_string() } else { ui.children("").into_iter().next().unwrap_or_default() };
-        if pressed {
+        let moved = self.page.is_some() && screen != self.screen;
+        if pressed || ((close || moved) && self.page.is_some()) {
             if !self.parent.is_empty() {
                 ui.remove(&format!("{}.{NODE}", self.parent));
             }
             self.page = match self.page {
+                _ if close || moved => None,
                 None => Some(0),
                 Some(p) if p + 1 < PAGES => Some(p + 1),
                 Some(_) => None,
             };
+            self.screen = screen.to_string();
             self.next_heal = 0;
         }
         let Some(index) = self.page else { return };
@@ -409,7 +423,7 @@ mod tests {
         let mut panel = Panel::default();
         let press = |ui: &mut FakeUi, panel: &mut Panel, frame: u64| {
             ui.keys = vec!["F8".into()];
-            panel.tick(ui, frame, Some(&snapshot), &book, &context, Some("rivals"));
+            panel.tick(ui, frame, Some(&snapshot), &book, &context, Some("rivals"), "Main/Home");
             ui.keys.clear();
         };
         press(&mut ui, &mut panel, 1);
@@ -421,9 +435,25 @@ mod tests {
         assert!(ui.spawned.last().unwrap().1.contains("Model"));
         // rebuilt by the game: back after a moment
         ui.remove("main.pma_panel");
-        panel.tick(&mut ui, 1000, Some(&snapshot), &book, &context, None);
+        panel.tick(&mut ui, 1000, Some(&snapshot), &book, &context, None, "Main/Home");
         assert!(ui.exists("main.pma_panel"));
+        let source = ui.spawned.last().unwrap().1.clone();
         press(&mut ui, &mut panel, 1001);
         assert!(!ui.exists("main.pma_panel") && !panel.is_open());
+        // nothing in it takes a click
+        assert!(!source.contains("#00000099"), "no full-screen layer");
+        assert_eq!(source.matches("ignore_event: true").count(), source.matches(":label").count() + 2);
+
+        // Esc closes it; so does another screen or tab
+        press(&mut ui, &mut panel, 1100);
+        assert!(panel.is_open());
+        ui.keys = vec!["Escape".into()];
+        panel.tick(&mut ui, 1101, Some(&snapshot), &book, &context, None, "Main/Home");
+        ui.keys.clear();
+        assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
+        press(&mut ui, &mut panel, 1200);
+        assert!(panel.is_open());
+        panel.tick(&mut ui, 1201, Some(&snapshot), &book, &context, None, "Main/Squad");
+        assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
     }
 }

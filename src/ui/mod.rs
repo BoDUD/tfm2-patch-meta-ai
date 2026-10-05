@@ -35,6 +35,10 @@ pub trait Ui {
     fn set_visible(&mut self, path: &str, visible: bool) -> bool;
     /// Keys pressed this frame (engine key names, e.g. "F9").
     fn keys_pressed(&self) -> Vec<String>;
+    /// The management screen's tab ("Home", "Squad", ...), when on it.
+    fn main_tab(&self) -> Option<String> {
+        None
+    }
 }
 
 impl Ui for StableClient<'_> {
@@ -80,6 +84,9 @@ impl Ui for StableClient<'_> {
             .filter(|e| e.kind == Some(InputEventKindV1::KeyPressed))
             .map(|e| e.key)
             .collect()
+    }
+    fn main_tab(&self) -> Option<String> {
+        self.client_main_tab()
     }
 }
 
@@ -161,7 +168,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     }
     let snapshot = crate::shared::get();
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
-    st.panel.tick(ui, frame, snapshot.as_deref(), &st.names, &st.context, opponent.as_deref());
+    let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
+    st.panel.tick(ui, frame, snapshot.as_deref(), &st.names, &st.context, opponent.as_deref(), &screen);
 }
 
 /// Text for a `.ui` string literal.
