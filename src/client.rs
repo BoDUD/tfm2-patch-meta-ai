@@ -276,7 +276,8 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
     st.out_of_game = false;
     config::refresh(now);
     let cfg = config::get();
-    if !cfg.ban_pick_on() && !cfg.tier_list_on() {
+    // the model is needed by any of the features, not only the two that change the game
+    if !cfg.ban_pick_on() && !cfg.tier_list_on() && !cfg.draft_overlay && !cfg.report {
         if shared::get().is_some() {
             shared::clear();
         }
@@ -1157,6 +1158,20 @@ mod tests {
         frames(&mut g, 200, Instant::now());
         assert!(g.sent.is_empty(), "tier_list=auto leaves the list to the Toolbox");
         assert!(shared::get().is_some(), "ban/pick still works");
+        crate::compat::set(crate::compat::Others::default());
+    }
+
+    #[test]
+    fn the_model_runs_for_the_screens_when_other_mods_do_the_rest() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        crate::compat::set(crate::compat::Others::from_mods_json(
+            r#"{"enabled_mods":["drafters_toolkit","bows_terminator_draft"]}"#,
+        ));
+        let mut g = save();
+        frames(&mut g, 200, Instant::now());
+        assert!(g.sent.is_empty(), "the tier list is the Toolbox's");
+        assert!(shared::get().is_some(), "the overlay and the report still have a model");
         crate::compat::set(crate::compat::Others::default());
     }
 
