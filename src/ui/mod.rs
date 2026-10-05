@@ -13,11 +13,12 @@ pub mod names;
 pub mod panel;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::history::Role;
 
-use mod_api_stable::{ClientSceneKindV1, InputEventKindV1, StableClient};
+use mod_api_stable::{ClientSceneKindV1, InputEventKindV1, StableClient, UiEventKindV1};
 
 /// The UI calls the overlay needs (the game's client context, or a test double).
 pub trait Ui {
@@ -38,6 +39,11 @@ pub trait Ui {
     /// The management screen's tab ("Home", "Squad", ...), when on it.
     fn main_tab(&self) -> Option<String> {
         None
+    }
+    /// A click on `path` sets `flag`. The handler only sets a flag, so registering the same path
+    /// again (the game keeps handlers by path) or a click delivered twice does no harm.
+    fn on_click(&mut self, _path: &str, _flag: &'static AtomicBool) -> bool {
+        false
     }
 }
 
@@ -87,6 +93,14 @@ impl Ui for StableClient<'_> {
     }
     fn main_tab(&self) -> Option<String> {
         self.client_main_tab()
+    }
+    fn on_click(&mut self, path: &str, flag: &'static AtomicBool) -> bool {
+        self.ui_register_path_events(path, move |ctx| {
+            // a click (or a host that does not say which event); not hovers or node removal
+            if matches!(ctx.ui_current_event().and_then(|e| e.kind), None | Some(UiEventKindV1::Click)) {
+                flag.store(true, Ordering::SeqCst);
+            }
+        })
     }
 }
 
@@ -212,6 +226,18 @@ pub(crate) mod tests {
         pub nodes: BTreeMap<String, Node>,
         pub spawned: Vec<(String, String)>,
         pub keys: Vec<String>,
+        pub clicks: Vec<(String, &'static AtomicBool)>,
+    }
+
+    impl FakeUi {
+        /// The player clicks a node: every handler registered on it runs.
+        pub fn click(&self, path: &str) {
+            for (p, flag) in &self.clicks {
+                if p == path && self.nodes.contains_key(path) {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+        }
     }
 
     #[derive(Default, Clone)]
@@ -354,6 +380,10 @@ pub(crate) mod tests {
         }
         fn keys_pressed(&self) -> Vec<String> {
             self.keys.clone()
+        }
+        fn on_click(&mut self, path: &str, flag: &'static AtomicBool) -> bool {
+            self.clicks.push((path.to_string(), flag));
+            true
         }
     }
 

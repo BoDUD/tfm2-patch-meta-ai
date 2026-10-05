@@ -1,8 +1,7 @@
 //! The meta panel, on any screen: F8 opens it and turns the page, and closes it after the last
-//! page; Esc closes it, and so does moving to another screen or tab. It never takes a click -
-//! every node lets the mouse through to the game underneath - so the game stays usable whatever
-//! happens to the keys. Keyboard only, so no click handler can be lost when the game rebuilds
-//! a screen.
+//! page; Esc or its close button (top right) closes it, and so does moving to another screen or
+//! tab. Apart from the close button nothing in it takes a click - the mouse goes through to the
+//! game underneath - so the game stays usable whatever happens.
 //!
 //! 1. **Tier list** - the strongest champions this patch: tier, estimated win rate, change since
 //!    the last patch, games, pick and ban rate, best lanes.
@@ -14,6 +13,7 @@
 //! A page is one block of `.ui` source with its text in it: turning the page replaces the block.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::names::name_ref;
 use super::{color, quote, team_key, Context, Ui};
@@ -70,6 +70,9 @@ pub struct Panel {
 /// Keys that close the panel at once.
 const CLOSE_KEYS: [&str; 2] = ["Escape", "Esc"];
 
+/// Set by a click on the close button (the game calls the handler between frames).
+static CLOSE_CLICKED: AtomicBool = AtomicBool::new(false);
+
 fn pts(v: f32) -> f32 {
     (sigmoid(v) - 0.5) * 100.0
 }
@@ -103,14 +106,20 @@ pub fn source(page: &Page, index: usize) -> String {
     body.push_str(&label("title".into(), 28, 16, 1000, 22, TEXT, false, &page.title));
     body.push_str(&label(
         "pages".into(),
-        900,
+        800,
         18,
-        452,
+        500,
         13,
         DIM,
         true,
-        &format!("{HOTKEY}: page {}/{PAGES} · next / 下一页", index + 1),
+        &format!("page {}/{PAGES} · {HOTKEY} next 下一页 · Esc close 关闭", index + 1),
     ));
+    // the game's own close button look
+    body.push_str(
+        "#close:button { width: 22px; height: 22px; anchor_x: 1; pivot_x: 1; x: -24px; y: 20px; \
+         source: \"asset/base/ui/icons/cross\"; color: #c2c6ceff; hover: { color: #e8e8e8ff; } \
+         active: { color: #e8e8e8ff; } } ",
+    );
     for (i, (head, x, w, right)) in page.columns.iter().enumerate() {
         body.push_str(&label(format!("h{i}"), 28 + x, 60, *w, 13, DIM, *right, head));
     }
@@ -146,7 +155,8 @@ impl Panel {
     ) {
         let keys = ui.keys_pressed();
         let pressed = keys.iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
-        let close = keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
+        let clicked = CLOSE_CLICKED.swap(false, Ordering::SeqCst);
+        let close = clicked || keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
         let parent = if ui.exists("main") { "main".to_string() } else { ui.children("").into_iter().next().unwrap_or_default() };
         let moved = self.page.is_some() && screen != self.screen;
         if pressed || ((close || moved) && self.page.is_some()) {
@@ -184,7 +194,9 @@ impl Panel {
             },
             Some(s) => build(index, s, context, opponent),
         };
-        ui.spawn(&parent, &source(&page, index));
+        if ui.spawn(&parent, &source(&page, index)) {
+            ui.on_click(&format!("{parent}.{NODE}.box.close"), &CLOSE_CLICKED);
+        }
     }
 }
 
@@ -471,5 +483,14 @@ mod tests {
         assert!(panel.is_open());
         panel.tick(&mut ui, 1201, Some(&snapshot), &context, None, "Main/Squad");
         assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
+
+        // the close button
+        press(&mut ui, &mut panel, 1300);
+        assert!(ui.exists("main.pma_panel.box.close"));
+        ui.click("main.pma_panel.box.close");
+        panel.tick(&mut ui, 1301, Some(&snapshot), &context, None, "Main/Home");
+        assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
+        press(&mut ui, &mut panel, 1400);
+        assert!(panel.is_open(), "opens again after a click closed it");
     }
 }
