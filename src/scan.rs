@@ -1,15 +1,19 @@
-//! Reading the save's match records a few at a time, newest first, and counting games and wins
-//! per patch version and champion.
+//! Reading the save's match records a few at a time, newest first: every usable match is kept
+//! (`history::Game`), and games and wins are counted per patch version and champion.
 //!
 //! The scanner remembers the record **ids** it has read, never positions in an id list: the
 //! list may shrink or change completely between two calls (another save, a new game, pruned
-//! replays) and that must only mean fewer records, not an out-of-bounds index.
+//! replays) and that must only mean fewer records, not an out-of-bounds index. The game also
+//! hands ids out again after pruning, so an id that leaves the list is forgotten (read again if
+//! it comes back), while the games read so far are kept - keyed by the match's `seed`, so the
+//! same match under a new id replaces itself instead of counting twice.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use mod_api_stable::RecordKindV1;
 
+use crate::history::{Game, Names, Role, Slot};
 use crate::records::{compare_versions, parse_record, MatchSummary, Parsed, Player};
 
 /// What the scanner needs from the game (implemented by the client context, and by tests).
@@ -43,9 +47,12 @@ pub struct Counts {
     pub skipped_old: u32,
 }
 
-/// After this many records in a row older than the previous patch, the rest of the backlog is
-/// assumed to be older too and is skipped (only the current and previous patch are used).
+/// After this many records in a row older than every kept patch, the rest of the backlog is
+/// assumed to be older too and is skipped.
 const OLD_STREAK_STOP: u32 = 100;
+
+/// Patches whose games are read (the model keeps as many; see `meta::Settings::max_patches`).
+pub const KEPT_PATCHES: usize = 12;
 
 pub struct Scanner {
     pub kind: RecordKindV1,
@@ -58,12 +65,16 @@ pub struct Scanner {
     old_streak: u32,
     capped: bool,
     pub versions: BTreeMap<String, VersionStats>,
+    /// Every usable match, by [`match_key`].
+    pub games: BTreeMap<u64, Game>,
     pub counts: Counts,
     /// Every record id the game listed at the last refresh.
     pub listed: usize,
     /// The first parsed record and the first failure are described once in `diag.log`.
     pub first_match: Option<String>,
     pub first_problem: Option<String>,
+    /// The first usable record as the game gave it (written to `probe_*.json` once).
+    pub first_raw: Option<String>,
 }
 
 pub enum Step {
@@ -85,10 +96,12 @@ impl Scanner {
             old_streak: 0,
             capped: false,
             versions: BTreeMap::new(),
+            games: BTreeMap::new(),
             counts: Counts::default(),
             listed: 0,
             first_match: None,
             first_problem: None,
+            first_raw: None,
         }
     }
 
@@ -113,6 +126,7 @@ impl Scanner {
         }
         let ids = src.record_ids(self.kind);
         self.listed = ids.len();
+        self.forget_missing(&ids);
         let mut added = false;
         for id in ids {
             if self.done.contains(&id) || self.queued.contains(&id) || self.not_played.contains(&id) {
@@ -125,6 +139,13 @@ impl Scanner {
         if added {
             self.queue.sort_unstable();
         }
+    }
+
+    /// Ids no longer listed are forgotten: if the game hands one out again it is a new record.
+    fn forget_missing(&mut self, ids: &[usize]) {
+        let listed: HashSet<usize> = ids.iter().copied().collect();
+        self.done.retain(|id| listed.contains(id));
+        self.not_played.retain(|id| listed.contains(id));
     }
 
     /// Stops the backlog after `limit` records read in this save (newest first, so what is
@@ -149,8 +170,9 @@ impl Scanner {
         let newest = self.done.iter().copied().max().unwrap_or(0);
         let ids = src.record_ids(self.kind);
         self.listed = ids.len();
+        self.forget_missing(&ids);
         for id in ids {
-            if id > newest && !self.queued.contains(&id) && !self.not_played.contains(&id) {
+            if id > newest && !self.done.contains(&id) && !self.queued.contains(&id) && !self.not_played.contains(&id) {
                 self.queued.insert(id);
                 self.queue.push(id);
             }
@@ -159,7 +181,7 @@ impl Scanner {
     }
 
     /// Reads and counts the newest queued record.
-    pub fn step(&mut self, src: &mut impl Source) -> Step {
+    pub fn step(&mut self, src: &mut impl Source, names: &mut Names) -> Step {
         let Some(id) = self.queue.pop() else { return Step::Idle };
         self.queued.remove(&id);
         self.counts.read += 1;
@@ -178,9 +200,10 @@ impl Scanner {
                 }
                 if self.first_match.is_none() {
                     self.first_match = Some(describe(id, &summary, json.len()));
+                    self.first_raw = Some(json.clone());
                 }
                 self.track_age(&summary.version);
-                self.add(&summary);
+                self.add(id, &summary, names);
             }
             Parsed::NotPlayed => {
                 self.counts.not_played += 1;
@@ -201,12 +224,11 @@ impl Scanner {
         }
     }
 
-    /// Stops the backfill once it is clearly past the previous patch.
+    /// Stops the backfill once it is clearly past the oldest kept patch.
     fn track_age(&mut self, version: &str) {
-        let older_than_prev = self
-            .previous_version()
-            .is_some_and(|prev| compare_versions(version, &prev) == Ordering::Less);
-        self.old_streak = if older_than_prev { self.old_streak + 1 } else { 0 };
+        let oldest_kept = self.versions_newest_first().into_iter().nth(KEPT_PATCHES - 1);
+        let too_old = oldest_kept.is_some_and(|v| compare_versions(version, &v) == Ordering::Less);
+        self.old_streak = if too_old { self.old_streak + 1 } else { 0 };
         if self.old_streak >= OLD_STREAK_STOP {
             self.counts.skipped_old += self.queue.len() as u32;
             for id in self.queue.drain(..) {
@@ -217,7 +239,36 @@ impl Scanner {
         }
     }
 
-    fn add(&mut self, m: &MatchSummary) {
+    fn add(&mut self, id: usize, m: &MatchSummary, names: &mut Names) {
+        let key = match_key(id, m);
+        if self.games.contains_key(&key) {
+            // the same match under a new record id: it is already counted
+            return;
+        }
+        let side = |players: &[Player], names: &mut Names| -> Vec<Slot> {
+            players
+                .iter()
+                .map(|p| Slot {
+                    champ: names.id(&p.champion),
+                    role: p.position.as_deref().and_then(Role::parse),
+                    athlete: p.athlete,
+                })
+                .collect()
+        };
+        let game = Game {
+            record: id,
+            solo: self.solo,
+            version: m.version.clone(),
+            blue_win: m.blue_win,
+            teams: m.teams,
+            sides: [side(&m.blue, names), side(&m.red, names)],
+            bans: [
+                m.bans[0].iter().map(|b| names.id(b)).collect(),
+                m.bans[1].iter().map(|b| names.id(b)).collect(),
+            ],
+            length: None,
+        };
+        self.games.insert(key, game);
         let stats = self.versions.entry(m.version.clone()).or_default();
         stats.matches += 1;
         let mut count = |players: &[Player], won: bool| {
@@ -248,6 +299,19 @@ impl Scanner {
     pub fn previous_version(&self) -> Option<String> {
         self.versions_newest_first().into_iter().nth(1)
     }
+}
+
+/// Identifies a match across record ids: its seed, patch, champions and result (several
+/// matches could share a seed). Without a seed, the record id.
+fn match_key(id: usize, m: &MatchSummary) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let Some(seed) = m.seed else { return id as u64 | 1 << 63 };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (seed, &m.version, m.blue_win).hash(&mut h);
+    for p in m.blue.iter().chain(&m.red) {
+        p.champion.hash(&mut h);
+    }
+    h.finish() & !(1 << 63)
 }
 
 fn describe(id: usize, m: &MatchSummary, bytes: usize) -> String {
@@ -310,7 +374,8 @@ pub(crate) mod tests {
     }
 
     fn drain(scan: &mut Scanner, save: &mut FakeSave) {
-        while let Step::Read = scan.step(save) {}
+        let mut names = Names::default();
+        while let Step::Read = scan.step(save, &mut names) {}
     }
 
     #[test]
@@ -337,6 +402,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_shorter_or_different_id_list_is_fine() {
+        let mut names = Names::default();
         let mut save = FakeSave::default();
         for id in 1..=50 {
             save.records.insert(id, game("1.3", &["a"], &["b"], id % 2 == 0));
@@ -344,7 +410,7 @@ pub(crate) mod tests {
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
         scan.refresh(&mut save, 0);
         for _ in 0..10 {
-            scan.step(&mut save);
+            scan.step(&mut save, &mut names);
         }
         // records pruned / another save: the list shrinks to 3 ids, two of them unknown
         save.records.retain(|id, _| *id <= 3);
@@ -380,21 +446,48 @@ pub(crate) mod tests {
 
     #[test]
     fn stops_after_a_long_run_of_old_patches() {
+        // 20 patches of 50 records each, newest last; only the newest KEPT_PATCHES are wanted
         let mut save = FakeSave::default();
         for id in 1..=1000 {
-            let v = if id > 900 { "1.3" } else if id > 800 { "1.2" } else { "1.1" };
-            save.records.insert(id, game(v, &["a"], &["b"], true));
+            let v = format!("1.{}", (id - 1) / 50);
+            save.records.insert(id, game(&v, &["a"], &["b"], true));
         }
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
         scan.refresh(&mut save, 0);
         drain(&mut scan, &mut save);
-        assert_eq!(scan.counts.matches, 200 + OLD_STREAK_STOP);
-        assert_eq!(scan.counts.skipped_old, 800 - OLD_STREAK_STOP);
-        assert_eq!(save.reads, 200 + OLD_STREAK_STOP);
+        let kept = 50 * KEPT_PATCHES as u32;
+        assert_eq!(scan.counts.matches, kept + OLD_STREAK_STOP);
+        assert_eq!(scan.counts.skipped_old, 1000 - kept - OLD_STREAK_STOP);
+        assert_eq!(scan.games.len() as u32, kept + OLD_STREAK_STOP);
+    }
+
+    #[test]
+    fn a_reused_id_is_read_again_and_a_moved_match_counts_once() {
+        let mut save = FakeSave::default();
+        let with_seed = |seed: u32, champ: &str| {
+            game("1.3", &[champ], &["b"], true).replacen('{', &format!("{{\"seed\":{seed},"), 1)
+        };
+        save.records.insert(1, with_seed(10, "a"));
+        save.records.insert(2, with_seed(20, "c"));
+        let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
+        scan.refresh(&mut save, 0);
+        drain(&mut scan, &mut save);
+        assert_eq!(scan.games.len(), 2);
+        // the game prunes record 1 and later hands id 1 to a new match; match 20 moves to id 5
+        save.records.remove(&1);
+        scan.refresh(&mut save, 0);
+        save.records.insert(1, with_seed(30, "d"));
+        save.records.remove(&2);
+        save.records.insert(5, with_seed(20, "c"));
+        scan.refresh(&mut save, 0);
+        drain(&mut scan, &mut save);
+        assert_eq!(scan.games.len(), 3, "pruned games are kept, the moved one is not doubled");
+        assert_eq!(scan.versions["1.3"].matches, 3);
     }
 
     #[test]
     fn unplayed_rechecks_and_the_backlog_are_bounded() {
+        let mut names = Names::default();
         let mut save = FakeSave::default();
         let unplayed = r#"{"played":false,"version":"1.3","blue_team_win":false,"blue_team":[{"champion":"a"}],"red_team":[{"champion":"b"}]}"#;
         for id in 1..=1000 {
@@ -419,7 +512,7 @@ pub(crate) mod tests {
         let mut scan = Scanner::new(RecordKindV1::MatchReplay, false);
         scan.refresh(&mut save, 0);
         for _ in 0..50 {
-            scan.step(&mut save);
+            scan.step(&mut save, &mut names);
         }
         scan.cap_backlog(50);
         assert_eq!(scan.pending(), 0);

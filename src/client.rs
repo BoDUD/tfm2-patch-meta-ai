@@ -1,6 +1,7 @@
-//! Client extension: while a save is open, reads match records a little every frame, rebuilds
-//! the model every couple of seconds, publishes the draft tables and asks the server to write
-//! the tier list (only the server may change records).
+//! Client extension: while a save is open, reads match records a little every frame, has the
+//! model refitted in the background every few seconds (`worker`), publishes the result for the
+//! draft hook, writes the report files and asks the server to write the tier list (only the
+//! server may change records).
 //!
 //! Everything runs in `post_update` under one lock that tolerates poisoning, and nothing in it
 //! indexes a list it did not just measure, so one bad record or a save switch cannot stop it.
@@ -13,13 +14,18 @@ use std::time::{Duration, Instant};
 use mod_api_stable::{ClientSceneKindV1, RecordKindV1, StableClient, StableExtension};
 use serde_json::Value;
 
+use crate::advisor::Damage;
 use crate::config::{self, Config};
-use crate::model::{self, Input, Sample, Tier};
+use crate::history::{Game as Match, Names};
+use crate::meta::Backtest;
+use crate::model::Tier;
 use crate::patchnotes::{self, PatchNote};
 use crate::records::{compare_versions, same_version_shape};
+use crate::report::{self, Labels};
 use crate::scan::{Scanner, Source, Step, VersionStats};
 use crate::server::{Request, APPLY_TIERS, FIELD, RESULT_EVENT};
-use crate::{diag, draft, shared};
+use crate::worker::{Job, Worker};
+use crate::{diag, meta, shared};
 
 /// Everything the client half needs from the game (the client context, or a test double).
 pub trait Game: Source {
@@ -32,6 +38,21 @@ pub trait Game: Source {
     /// The screen inside the save (`None` when the game does not say).
     fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
         None
+    }
+    /// Physical or magic damage, from the champion's tags.
+    fn champion_damage(&mut self, _name: &str) -> Option<Damage> {
+        None
+    }
+    /// The champion's display name.
+    fn champion_label(&mut self, _name: &str) -> Option<String> {
+        None
+    }
+    fn athlete_name(&mut self, _athlete: u32) -> Option<String> {
+        None
+    }
+    /// Fit in a background thread (tests fit in the frame, to stay deterministic).
+    fn threaded(&self) -> bool {
+        false
     }
 }
 
@@ -77,6 +98,26 @@ impl Game for ClientGame<'_, '_> {
     fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
         self.ctx.client_scene_kind()
     }
+    fn champion_damage(&mut self, name: &str) -> Option<Damage> {
+        use mod_api_stable::ChampionTagV1;
+        let tags = self.ctx.champion_brief(name)?.tags;
+        let (ad, ap) = (tags.contains(&ChampionTagV1::Ad), tags.contains(&ChampionTagV1::Ap));
+        Some(match (ad, ap) {
+            (true, false) => Damage::Physical,
+            (false, true) => Damage::Magic,
+            _ => Damage::Mixed,
+        })
+    }
+    fn champion_label(&mut self, name: &str) -> Option<String> {
+        let key = format!("#asset/base/text/champion?description.{name}.name");
+        self.ctx.i18n(&key).filter(|s| !s.is_empty() && !s.starts_with('#'))
+    }
+    fn athlete_name(&mut self, athlete: u32) -> Option<String> {
+        self.ctx.athlete_name(athlete as usize)
+    }
+    fn threaded(&self) -> bool {
+        true
+    }
 }
 
 pub struct ClientExt;
@@ -93,6 +134,7 @@ const LIST_EVERY: Duration = Duration::from_secs(10);
 /// Unplayed solo-rank matches looked at again once per in-game day, oldest first.
 const RECHECK_UNPLAYED: usize = 200;
 const REBUILD_EVERY: Duration = Duration::from_secs(5);
+const REPORT_EVERY: Duration = Duration::from_secs(30);
 const NEWS_EVERY: Duration = Duration::from_secs(300);
 /// Records read per save at most (newest first); older ones add little to the current patch.
 const BACKLOG_COMPETITION: u32 = 3000;
@@ -125,10 +167,24 @@ struct State {
     news_version: Option<String>,
     table_written_at: Option<Instant>,
     table: Option<String>,
+    report_written_at: Option<Instant>,
+    report: Option<String>,
     last_summary: String,
     /// The tier plan was built after every listed record had been read.
     plan_complete: bool,
     tiers: TierSync,
+    names: Names,
+    worker: Option<Worker>,
+    /// Rebuilds submitted, and the one a result has to match to count.
+    serial: u64,
+    /// Whether the newest submitted rebuild had read every listed record.
+    submitted_complete: bool,
+    backtest: Option<Backtest>,
+    backtest_done: bool,
+    labels: Labels,
+    damage: HashMap<u16, Damage>,
+    champions: Vec<String>,
+    probes_written: bool,
 }
 
 impl State {
@@ -152,9 +208,21 @@ impl State {
             news_version: None,
             table_written_at: None,
             table: None,
+            report_written_at: None,
+            report: None,
             last_summary: String::new(),
             plan_complete: false,
             tiers: TierSync::default(),
+            names: Names::default(),
+            worker: None,
+            serial: 0,
+            submitted_complete: false,
+            backtest: None,
+            backtest_done: false,
+            labels: Labels::default(),
+            damage: HashMap::new(),
+            champions: Vec::new(),
+            probes_written: false,
         }
     }
 }
@@ -261,13 +329,19 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         st.next_rebuild = Some(now + REBUILD_EVERY);
         st.dirty = false;
         st.rebuilt_with = Some(Arc::clone(cfg));
-        rebuild(st, game, cfg, team, now);
-        st.plan_complete = caught_up;
+        rebuild(st, game, cfg, team, now, caught_up);
     }
+    collect(st, cfg, team);
     if st.table.is_some() && due(st.table_written_at.map(|t| t + TABLE_EVERY), now) {
         st.table_written_at = Some(now);
         if let Some(text) = st.table.take() {
             diag::write_table(&text);
+        }
+    }
+    if st.report.is_some() && due(st.report_written_at.map(|t| t + REPORT_EVERY), now) {
+        st.report_written_at = Some(now);
+        if let Some(text) = st.report.take() {
+            diag::write_file(diag::REPORT_FILE, &text);
         }
     }
 
@@ -287,9 +361,9 @@ fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
     let frame = Instant::now();
     for _ in 0..MAX_READS_PER_FRAME {
         let step = if st.comp.pending() > 0 {
-            st.comp.step(game)
+            st.comp.step(game, &mut st.names)
         } else if cfg.solo_weight > 0.0 && st.solo.pending() > 0 {
-            st.solo.step(game)
+            st.solo.step(game, &mut st.names)
         } else {
             Step::Idle
         };
@@ -305,6 +379,16 @@ fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
 }
 
 fn report_probes(st: &mut State) {
+    if !st.probes_written {
+        if let Some(raw) = &st.comp.first_raw {
+            st.probes_written = true;
+            diag::write_file("probe_competition.json", &pretty(raw));
+            diag::log("wrote probe_competition.json (one competition record as the game gives it)");
+        }
+    }
+    if let Some(raw) = st.solo.first_raw.take() {
+        diag::write_file("probe_solo_rank.json", &pretty(&raw));
+    }
     for (name, scan) in [("competition", &st.comp), ("solo rank", &st.solo)] {
         if let Some(text) = &scan.first_match {
             diag::log_once(&format!("probe-match-{name}"), &format!("[probe] {name} {text}"));
@@ -378,8 +462,33 @@ fn current_version(
     }
 }
 
-fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant) {
-    // the patch notes (re-read every 30 s; they change once per in-game patch)
+/// A record as indented JSON, with very long arrays (replay inputs) cut short.
+fn pretty(raw: &str) -> String {
+    fn trim(v: &mut Value) {
+        match v {
+            Value::Array(items) => {
+                if items.len() > 12 {
+                    let n = items.len();
+                    items.truncate(12);
+                    items.push(Value::String(format!("... {} more", n - 12)));
+                }
+                items.iter_mut().for_each(trim);
+            }
+            Value::Object(map) => map.values_mut().for_each(trim),
+            _ => {}
+        }
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(mut v) => {
+            trim(&mut v);
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| raw.to_string())
+        }
+        Err(_) => raw.to_string(),
+    }
+}
+
+fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, caught_up: bool) {
+    // the patch notes (re-read every 5 minutes; they change once per in-game patch)
     let played_newest = st.comp.current_version().or_else(|| st.solo.current_version());
     if due(st.news_read_at.map(|t| t + NEWS_EVERY), now) || played_newest != st.news_version {
         st.news_read_at = Some(now);
@@ -412,188 +521,169 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         }
     };
     let Some(current) = current else { return };
-    let previous = if Some(&current) != record_current.as_ref() {
-        record_current.clone()
-    } else {
-        st.comp.versions_newest_first().into_iter().find(|v| compare_versions(v, &current).is_lt())
-    };
-    let note = st.notes.iter().rev().find(|n| n.is_for(&current));
 
-    let empty = VersionStats::default();
-    let cur_stats = st.comp.versions.get(&current).unwrap_or(&empty);
-    let prev_stats = previous.as_ref().and_then(|p| st.comp.versions.get(p)).unwrap_or(&empty);
-    let solo_stats = st.solo.versions.get(&current).unwrap_or(&empty);
-
-    let mut champions = game.champion_names();
-    if champions.is_empty() {
-        champions = cur_stats.champs.keys().chain(prev_stats.champs.keys()).cloned().collect();
-        champions.sort();
-        champions.dedup();
+    // the champion list, names and damage types (once per save)
+    if st.champions.is_empty() {
+        let mut champions = game.champion_names();
+        if champions.is_empty() {
+            // the host does not list champions: rate the ones seen in matches
+            champions = st.comp.versions.values().flat_map(|v| v.champs.keys().cloned()).collect();
+            champions.sort();
+            champions.dedup();
+        }
+        for name in &champions {
+            let id = st.names.id(name);
+            if let Some(d) = game.champion_damage(name) {
+                st.damage.insert(id, d);
+            }
+            if let Some(label) = game.champion_label(name) {
+                st.labels.champions.insert(name.clone(), label);
+            }
+        }
+        st.labels.team_name = game.team_name(team).unwrap_or_default();
+        st.champions = champions;
     }
-    let unknown: Vec<&String> =
-        cur_stats.champs.keys().filter(|c| !champions.contains(c)).take(5).collect();
+    let unknown: Vec<&str> = (0..st.names.len() as u16)
+        .map(|id| st.names.name(id))
+        .filter(|n| !st.champions.iter().any(|c| c == n))
+        .take(5)
+        .collect();
     if !unknown.is_empty() {
         diag::log_once(
             "probe-unknown",
-            &format!("[probe] champions in matches but not selectable (ignored), e.g. {unknown:?}"),
+            &format!("[probe] champions in matches but not selectable (rated anyway), e.g. {unknown:?}"),
         );
     }
 
-    let sample = |stats: &VersionStats, name: &str| {
-        stats.champs.get(name).map_or(Sample::default(), |c| Sample::new(c.m, c.w))
-    };
-    let matches = (cur_stats.matches + prev_stats.matches) as f32;
-    let mut rows = Vec::with_capacity(champions.len());
-    for name in &champions {
-        let input = Input {
-            champion: name,
-            cur: sample(cur_stats, name),
-            prev: sample(prev_stats, name),
-            solo: sample(solo_stats, name),
-            patch_dir: note.map_or(0, |n| n.direction(name)),
-        };
-        let est = model::estimate(cfg, &input);
-        let presence = if matches > 0.0 { (input.cur.m + input.prev.m) / matches } else { 0.0 };
-        rows.push(Row { name: name.clone(), input_cur: input.cur, input_prev: input.prev, input_solo: input.solo, patch_dir: input.patch_dir, est, presence, pick: 0.0, ban: 0.0, tier: None });
-    }
-    let typical = if rows.is_empty() { 0.0 } else { rows.iter().map(|r| r.presence).sum::<f32>() / rows.len() as f32 };
-    let mut tables = shared::Tables::default();
-    for row in &mut rows {
-        let (pick, ban) = draft::amounts(cfg, row.est.value, row.presence, typical);
-        row.pick = pick;
-        row.ban = ban;
-        if pick.abs() > 1e-4 {
-            tables.pick.insert(row.name.clone(), pick);
-        }
-        if ban.abs() > 1e-4 {
-            tables.ban.insert(row.name.clone(), ban);
-        }
-    }
-    shared::publish(tables);
-
-    let mut ranked: Vec<(String, f32)> = rows
-        .iter()
-        .filter(|r| r.est.evidence >= cfg.min_games && r.est.evidence > 0.0)
-        .map(|r| (r.name.clone(), r.est.score()))
-        .collect();
-    let tiers: HashMap<String, Tier> = model::tiers_by_share(cfg, &mut ranked).into_iter().collect();
-    for row in &mut rows {
-        row.tier = tiers.get(&row.name).copied();
-    }
-
-    let mut plan = BTreeMap::new();
-    for row in &rows {
-        match row.tier {
-            Some(tier) => {
-                plan.insert(row.name.clone(), tier.as_str().to_string());
+    // the player's line-up: the athletes of their newest competition match
+    let newest_own = st
+        .comp
+        .games
+        .values()
+        .filter(|g| g.teams.contains(&Some(team as u32)))
+        .max_by_key(|g| g.record);
+    if let Some(g) = newest_own {
+        let side = if g.teams[0] == Some(team as u32) { 0 } else { 1 };
+        let roster: Vec<u32> = g.sides[side].iter().filter_map(|s| s.athlete).collect();
+        if roster != st.labels.roster {
+            for a in &roster {
+                if !st.labels.athletes.contains_key(a) {
+                    if let Some(name) = game.athlete_name(*a) {
+                        st.labels.athletes.insert(*a, name);
+                    }
+                }
             }
-            None if cfg.clear_unranked => {
-                plan.insert(row.name.clone(), Tier::NoTier.as_str().to_string());
+            st.labels.roster = roster;
+        }
+    }
+    st.labels.date = game.game_date();
+
+    let mut games: Vec<Match> = st.comp.games.values().cloned().collect();
+    if cfg.solo_weight > 0.0 {
+        games.extend(st.solo.games.values().cloned());
+    }
+    st.serial += 1;
+    st.submitted_complete = caught_up;
+    // the backtest once per save, when everything has been read
+    let backtest = caught_up && !st.backtest_done;
+    st.backtest_done |= backtest;
+    let job = Job {
+        serial: st.serial,
+        games,
+        names: st.names.clone(),
+        champions: st.champions.clone(),
+        notes: st.notes.clone(),
+        current,
+        settings: cfg.model(),
+        backtest,
+    };
+    let threaded = game.threaded();
+    st.worker.get_or_insert_with(|| Worker::new(threaded)).submit(job);
+}
+
+/// Picks up a finished fit: publishes it for the draft hook, plans the tier list, prepares the
+/// report files.
+fn collect(st: &mut State, cfg: &Config, team: usize) {
+    let Some(done) = st.worker.as_mut().and_then(Worker::take) else { return };
+    // a result of an older rebuild is still the best there is until the newest one lands
+    let complete = done.serial == st.serial && st.submitted_complete;
+    if done.backtest.is_some() {
+        st.backtest = done.backtest;
+        if let Some(bt) = &st.backtest {
+            diag::log(&format!("[model] {}", report::backtest_line(bt)));
+        }
+    }
+    let meta = done.meta;
+
+    let shares = [cfg.s_percent, cfg.a_percent, cfg.b_percent, cfg.c_percent];
+    let tiers = meta::tiers(&meta, cfg.min_games, shares);
+    let mut plan = BTreeMap::new();
+    for c in &meta.champions {
+        match tiers.get(&c.name) {
+            Some(tier) => {
+                plan.insert(c.name.clone(), tier.as_str().to_string());
+            }
+            None if cfg.clear_unranked && st.champions.contains(&c.name) => {
+                plan.insert(c.name.clone(), Tier::NoTier.as_str().to_string());
             }
             None => {}
         }
     }
     // nothing ranked yet (a new save): leave the team's list alone
-    if !ranked.is_empty() {
+    if !tiers.is_empty() {
         st.tiers.set_plan(team, plan, !cfg.clear_unranked);
     }
+    st.plan_complete = complete;
 
+    let note = st.notes.iter().rev().find(|n| n.is_for(&meta.current));
     let summary = format!(
-        "patch {current} (previous {}): competition {} matches this patch, {} previous; solo rank {}; \
-         patch notes {}; ranked {}/{} champions{}",
-        previous.as_deref().unwrap_or("-"),
-        cur_stats.matches,
-        prev_stats.matches,
-        solo_stats.matches,
+        "patch {} (kept {}): competition {} matches this patch, {} kept; solo rank {}; patch notes {}; \
+         ranked {}/{} champions{}",
+        meta.current,
+        meta.versions.len(),
+        meta.current_matches,
+        meta.matches,
+        meta.solo_matches,
         note.map_or("none".to_string(), |n| {
             let buffs = n.changes.values().filter(|v| **v > 0).count();
             let nerfs = n.changes.values().filter(|v| **v < 0).count();
             format!("{buffs} buffed, {nerfs} nerfed")
         }),
-        ranked.len(),
-        rows.len(),
-        tier_counts(&rows)
+        tiers.len(),
+        st.champions.len(),
+        tier_counts(&tiers)
     );
     if summary != st.last_summary {
-        diag::log(&format!("[rebuild] {summary}"));
-        st.last_summary = summary;
+        diag::log(&format!("[rebuild] {summary} (fit {} ms, {} iterations)", done.millis, meta.sweeps));
         if cfg.verbose {
-            let mut by_pick: Vec<&Row> = rows.iter().collect();
-            by_pick.sort_by(|a, b| b.pick.partial_cmp(&a.pick).unwrap_or(std::cmp::Ordering::Equal));
-            let show = |r: &&Row| format!("{} {:+.2}", r.name, r.pick);
-            let top: Vec<String> = by_pick.iter().take(5).map(show).collect();
-            let bottom: Vec<String> = by_pick.iter().rev().take(5).map(show).collect();
-            diag::log(&format!("[rebuild] picks up: {}; down: {}", top.join(", "), bottom.join(", ")));
+            let mut by: Vec<&meta::Champion> = meta.champions.iter().filter(|c| c.window.games > 0).collect();
+            by.sort_by(|a, b| b.strength.partial_cmp(&a.strength).unwrap_or(std::cmp::Ordering::Equal));
+            let show = |c: &&meta::Champion| format!("{} {:.1}%", c.name, c.win_rate() * 100.0);
+            let top: Vec<String> = by.iter().take(5).map(show).collect();
+            let bottom: Vec<String> = by.iter().rev().take(5).map(show).collect();
+            diag::log(&format!("[rebuild] strongest: {}; weakest: {}", top.join(", "), bottom.join(", ")));
         }
+        st.last_summary = summary;
     }
-    st.table = Some(table(&current, previous.as_deref(), &st.last_summary, &mut rows));
+    let tier_map: HashMap<String, Tier> = tiers.into_iter().collect();
+    st.table = Some(report::table(&meta, &tier_map, &st.labels, &st.last_summary, st.backtest.as_ref()));
+    if cfg.report {
+        st.report = Some(report::html(&meta, &tier_map, &st.labels, st.backtest.as_ref()));
+    }
+    shared::publish(shared::Snapshot { meta, damage: st.damage.clone() });
 }
 
-struct Row {
-    name: String,
-    input_cur: Sample,
-    input_prev: Sample,
-    input_solo: Sample,
-    patch_dir: i32,
-    est: model::Estimate,
-    presence: f32,
-    pick: f32,
-    ban: f32,
-    tier: Option<Tier>,
-}
-
-fn tier_counts(rows: &[Row]) -> String {
+fn tier_counts(tiers: &BTreeMap<String, Tier>) -> String {
     let mut counts = [0usize; 5];
-    for row in rows {
-        if let Some(tier) = row.tier {
-            if let Some(slot) = counts.get_mut(tier as usize) {
-                *slot += 1;
-            }
+    for tier in tiers.values() {
+        if let Some(slot) = counts.get_mut(*tier as usize) {
+            *slot += 1;
         }
     }
     if counts.iter().all(|c| *c == 0) {
         return String::new();
     }
     format!(" (S {} A {} B {} C {} D {})", counts[0], counts[1], counts[2], counts[3], counts[4])
-}
-
-fn table(current: &str, previous: Option<&str>, summary: &str, rows: &mut [Row]) -> String {
-    rows.sort_by(|a, b| b.est.score().partial_cmp(&a.est.score()).unwrap_or(std::cmp::Ordering::Equal));
-    let mut out = format!(
-        "{} {} - patch {current} (previous {})\n{summary}\n\n\
-         tier   = tier written to your team (- = not enough games)\n\
-         win%   = estimated win rate this patch, +- its standard error; start = where it started\n\
-         games  = this patch / previous patch / solo rank; carried = previous-patch games counted\n\
-         pick, ban = added to the AI's draft scores\n\n",
-        crate::MOD_ID,
-        crate::VERSION,
-        previous.unwrap_or("-")
-    );
-    out.push_str(&format!(
-        "{:<22} {:>4} {:>13} {:>6} {:>15} {:>7} {:>5} {:>6} {:>6} {:>6}\n",
-        "champion", "tier", "win%", "start", "games c/p/s", "carried", "notes", "sure", "pick", "ban"
-    ));
-    for r in rows.iter() {
-        out.push_str(&format!(
-            "{:<22} {:>4} {:>7.1}+-{:<4.1} {:>6.1} {:>15} {:>7.0} {:>5} {:>5.0}% {:>+6.2} {:>+6.2}\n",
-            diag::clip(&r.name, 22),
-            r.tier.map_or("-", Tier::as_str),
-            r.est.p * 100.0,
-            r.est.se * 100.0,
-            r.est.start * 100.0,
-            format!("{}/{}/{}", r.input_cur.m, r.input_prev.m, r.input_solo.m),
-            r.est.carried,
-            match r.patch_dir.signum() {
-                1 => "buff",
-                -1 => "nerf",
-                _ => "",
-            },
-            r.est.certainty * 100.0,
-            r.pick,
-            r.ban
-        ));
-    }
-    out
 }
 
 /// Keeps the team's tier list in line with the plan: sends it when it changes, waits for the
@@ -887,10 +977,12 @@ mod tests {
         with_temp_dir();
         let mut g = save();
         let now = frames(&mut g, 200, Instant::now());
-        let tables = shared::get().expect("tables published");
-        assert!(tables.pick["a"] > 0.3, "{:?}", tables.pick);
-        assert!(tables.pick["j"] < -0.3);
-        assert!(tables.ban["a"] > 0.0 && tables.ban["j"] < 0.0);
+        let snapshot = shared::get().expect("model published");
+        let wr = |n: &str| snapshot.meta.champion(n).unwrap().win_rate();
+        assert!(wr("a") > 0.6 && wr("j") < 0.4, "a {} j {}", wr("a"), wr("j"));
+        let a = snapshot.meta.names.get("a").unwrap();
+        assert!(crate::draft::value(&snapshot, a, &[], &[], false) > 0.3);
+        assert!(crate::draft::value(&snapshot, a, &[], &[], true) > 0.0);
         // tiers were sent once, accepted, and merged into the existing list ("z" kept)
         assert_eq!(g.sent.len(), 1, "{:?}", g.sent);
         assert_eq!(g.tiers["a"], "S");
@@ -946,8 +1038,7 @@ mod tests {
         g.replays.retain(|id, _| *id <= 3);
         g.team_name = "Other".into();
         let now = frames(&mut g, 100, now);
-        let tables = shared::get();
-        assert!(tables.is_some(), "rebuilt from the new save");
+        assert!(shared::get().is_some(), "rebuilt from the new save");
         // leaving the game clears everything
         tick(&mut g, false, now);
         assert!(shared::get().is_none());

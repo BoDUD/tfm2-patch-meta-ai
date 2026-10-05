@@ -7,6 +7,10 @@
 //! built). When a field is not where it used to be, the whole document is searched for it, so a
 //! reshuffled record still parses, and the probe in `diag.log` says which layout was found.
 //! Only real player entries count - a `champion` key in bans or other nested data does not.
+//!
+//! Also read when present (game 0.6 `MatchReplayData`): `seed` (the same match keeps it when
+//! the game hands the record a new id), `blue_team_id` / `red_team_id`, `blue_ban` / `red_ban`,
+//! and each player's athlete id (`athlete` or `athlete_id`, a number or an object with `id`).
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -15,9 +19,10 @@ use serde_json::{Map, Value};
 pub struct Player {
     pub champion: String,
     pub position: Option<String>,
+    pub athlete: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MatchSummary {
     pub version: String,
     pub blue_win: bool,
@@ -25,6 +30,10 @@ pub struct MatchSummary {
     pub red: Vec<Player>,
     /// The layout differed from 0.6.0's and the fields were found by searching.
     pub searched: bool,
+    pub seed: Option<u64>,
+    /// Blue, red.
+    pub teams: [Option<u32>; 2],
+    pub bans: [Vec<String>; 2],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -48,6 +57,16 @@ struct Layout {
     red_team: Option<Value>,
     #[serde(default)]
     played: Option<Value>,
+    #[serde(default)]
+    seed: Option<Value>,
+    #[serde(default)]
+    blue_team_id: Option<Value>,
+    #[serde(default)]
+    red_team_id: Option<Value>,
+    #[serde(default)]
+    blue_ban: Option<Value>,
+    #[serde(default)]
+    red_ban: Option<Value>,
 }
 
 struct Fields<'a> {
@@ -56,6 +75,9 @@ struct Fields<'a> {
     blue: Option<&'a Value>,
     red: Option<&'a Value>,
     played: Option<&'a Value>,
+    seed: Option<&'a Value>,
+    teams: [Option<&'a Value>; 2],
+    bans: [Option<&'a Value>; 2],
 }
 
 /// Parses one record. `solo` records must say they were played (`"played": true`); unplayed
@@ -68,6 +90,9 @@ pub fn parse_record(json: &str, solo: bool) -> Parsed {
             blue: layout.blue_team.as_ref(),
             red: layout.red_team.as_ref(),
             played: layout.played.as_ref(),
+            seed: layout.seed.as_ref(),
+            teams: [layout.blue_team_id.as_ref(), layout.red_team_id.as_ref()],
+            bans: [layout.blue_ban.as_ref(), layout.red_ban.as_ref()],
         };
         if let Ok(parsed) = from_fields(&fields, solo, false) {
             return parsed;
@@ -84,6 +109,9 @@ pub fn parse_record(json: &str, solo: bool) -> Parsed {
         blue: find_key(&doc, "blue_team"),
         red: find_key(&doc, "red_team"),
         played: find_key(&doc, "played"),
+        seed: find_key(&doc, "seed"),
+        teams: [find_key(&doc, "blue_team_id"), find_key(&doc, "red_team_id")],
+        bans: [find_key(&doc, "blue_ban"), find_key(&doc, "red_ban")],
     };
     match from_fields(&fields, solo, true) {
         Ok(parsed) => parsed,
@@ -107,7 +135,60 @@ fn from_fields(f: &Fields<'_>, solo: bool, searched: bool) -> Result<Parsed, &'s
     if blue.is_empty() && red.is_empty() {
         return Ok(Parsed::Invalid("no champions in blue_team / red_team".to_string()));
     }
-    Ok(Parsed::Match(MatchSummary { version, blue_win, blue, red, searched }))
+    Ok(Parsed::Match(MatchSummary {
+        version,
+        blue_win,
+        blue,
+        red,
+        searched,
+        seed: f.seed.and_then(as_u64),
+        teams: [f.teams[0].and_then(id), f.teams[1].and_then(id)],
+        bans: [f.bans[0].map(names).unwrap_or_default(), f.bans[1].map(names).unwrap_or_default()],
+    }))
+}
+
+fn as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64().or_else(|| n.as_i64().map(|i| i as u64)),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// An id: a number, a numeric string, `{"id": n}` or a one-variant enum `{"Some": n}`.
+fn id(v: &Value) -> Option<u32> {
+    match v {
+        Value::Object(map) => ["id", "athlete_id", "team_id", "Some"]
+            .iter()
+            .find_map(|k| map.get(*k))
+            .and_then(id),
+        other => as_u64(other).and_then(|n| u32::try_from(n).ok()),
+    }
+}
+
+/// Champion names in a ban list: strings, `{"champion": ...}` / `{"name": ...}` objects, or
+/// `null` for an empty ban, at any nesting.
+fn names(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, out: &mut Vec<String>, depth: usize) {
+        if depth > 4 {
+            return;
+        }
+        match v {
+            Value::String(s) if !s.is_empty() => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|i| walk(i, out, depth + 1)),
+            Value::Object(map) => {
+                if let Some(name) = ["champion", "name", "key"].iter().find_map(|k| map.get(*k)) {
+                    walk(name, out, depth + 1);
+                } else {
+                    map.values().for_each(|i| walk(i, out, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut out, 0);
+    out
 }
 
 fn as_bool(v: &Value) -> Option<bool> {
@@ -214,7 +295,8 @@ fn player(map: &Map<String, Value>) -> Option<Player> {
         .iter()
         .find_map(|k| map.get(*k))
         .and_then(label);
-    Some(Player { champion, position })
+    let athlete = ["athlete", "athlete_id"].iter().find_map(|k| map.get(*k)).and_then(id);
+    Some(Player { champion, position, athlete })
 }
 
 /// Lane labels: `"Top"`, or a unit enum written as `{"Top": null}`, or an index.
@@ -316,6 +398,8 @@ mod tests {
 
     const REPLAY_060: &str = r#"{
         "version": "1.3", "seed": 99, "blue_team_win": true,
+        "blue_team_id": 7, "red_team_id": {"id": 12},
+        "blue_ban": ["monk", null, {"champion": "ninja"}], "red_ban": [{"name": "sniper"}],
         "blue_team": [
             {"athlete": 1, "champion": "fighter", "position": "Top", "items": [{"champion": "x"}]},
             {"athlete": 2, "champion": "ninja", "position": "Jungle"},
@@ -338,8 +422,15 @@ mod tests {
         assert!(m.blue_win && !m.searched);
         assert_eq!(m.blue.len(), 5);
         assert_eq!(m.red.len(), 5);
-        assert_eq!(m.blue[0], Player { champion: "fighter".into(), position: Some("Top".into()) });
+        assert_eq!(
+            m.blue[0],
+            Player { champion: "fighter".into(), position: Some("Top".into()), athlete: Some(1) }
+        );
         assert_eq!(m.red[4].champion, "shaman");
+        assert_eq!(m.red[4].athlete, None);
+        assert_eq!(m.seed, Some(99));
+        assert_eq!(m.teams, [Some(7), Some(12)]);
+        assert_eq!(m.bans, [vec!["monk".to_string(), "ninja".to_string()], vec!["sniper".to_string()]]);
     }
 
     #[test]
@@ -351,8 +442,9 @@ mod tests {
         let Parsed::Match(m) = parse_record(json, false) else { panic!() };
         assert_eq!(m.version, "2.10");
         assert!(!m.blue_win && m.searched);
-        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()) }]);
-        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()) }]);
+        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()), athlete: None }]);
+        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()), athlete: None }]);
+        assert_eq!(m.bans, [Vec::<String>::new(), Vec::new()], "bans inside a team are not read");
     }
 
     #[test]
