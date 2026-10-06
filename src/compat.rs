@@ -26,6 +26,11 @@ const TIER_WRITERS: [(&str, &str); 2] = [
     ("draft_winrate_penalty", "Win-Rate Ban/Pick AI + Champion Tiers"),
 ];
 
+/// tfm2mods' Champion Position Lock (and flover's rework, same id): keeps champions to the
+/// positions the player listed them for, in every draft. It decides the AI's picks itself where
+/// its rules require, which wins over this mod's score nudges - nothing to step aside from.
+const POSITION_LOCK: &str = "tfm2_champ_pos_lock";
+
 /// Mods that drive the AI's bans and picks. Matched as a substring: the Terminator's mod id
 /// is not published.
 const DRAFT_DRIVERS: [(&str, &str); 2] = [
@@ -74,6 +79,11 @@ impl Others {
         self.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == "drafters_toolkit"))
     }
 
+    /// Champion Position Lock is enabled.
+    pub fn position_lock(&self) -> bool {
+        self.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == POSITION_LOCK))
+    }
+
     pub fn describe(&self) -> String {
         match &self.enabled {
             None => "enabled mods: unknown (mods.json not readable)".to_string(),
@@ -107,6 +117,9 @@ pub fn load() {
     if let Some(name) = others.draft_driver() {
         diag::log(&format!("\"{name}\" also drives the AI's bans and picks: ban_pick=auto leaves it to that mod"));
     }
+    if others.position_lock() {
+        diag::log("Champion Position Lock is enabled: its locks decide the picks; advice skips champions the ban/pick screen marks as not pickable");
+    }
     *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(others);
 }
 
@@ -136,6 +149,9 @@ mod tests {
         let o = Others::from_mods_json(r#"{"enabled_mods":["bows_terminator_draft"]}"#);
         assert_eq!(o.draft_driver(), Some("Bows' Terminator Draft AI"));
         assert_eq!(o.tier_writer(), None);
+
+        let o = Others::from_mods_json(r#"{"enabled_mods":["patch_meta_ai","tfm2_champ_pos_lock"]}"#);
+        assert!(o.position_lock() && o.tier_writer().is_none() && o.draft_driver().is_none());
 
         let o = Others::from_mods_json(r#"{"enabled_mods":["draft_winrate_penalty"]}"#);
         assert!(o.tier_writer().is_some() && o.draft_driver().is_some());

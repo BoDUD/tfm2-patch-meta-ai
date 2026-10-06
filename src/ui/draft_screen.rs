@@ -12,8 +12,9 @@
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
-//! badge is visible once that side picked it, with the pick number in `<badge>.text`, and its
-//! `ban` icon once it is banned. Team names sit in `main.bottom.<side>_side.name` with the
+//! badge is visible once that side picked it, with the pick number in `<badge>.text`, its
+//! `ban` icon once it is banned, and its `fearless_x` once Fearless rules lock it (used in an
+//! earlier game of the series) - such a card is not offered as advice and gets no value. Team names sit in `main.bottom.<side>_side.name` with the
 //! league rank appended ("Samsung Galaxy #1"). Labels read back the raw text they were given,
 //! so champion names are written as the game's own name reference and the game shows them in
 //! its language. Both bottom corners of the screen are empty in the game's layout.
@@ -67,6 +68,15 @@ pub struct Card {
     pub blue: Option<u32>,
     pub red: Option<u32>,
     pub banned: bool,
+    /// Not pickable now (Fearless).
+    pub locked: bool,
+}
+
+impl Card {
+    /// Still on offer: not picked, banned or locked.
+    pub fn open(&self) -> bool {
+        self.blue.is_none() && self.red.is_none() && !self.banned && !self.locked
+    }
 }
 
 #[derive(Default)]
@@ -118,6 +128,7 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
                 blue: badge("blue"),
                 red: badge("red"),
                 banned: visible(ui, &format!("{path}.ban")),
+                locked: visible(ui, &format!("{path}.fearless_x")),
                 path,
             }
         })
@@ -314,7 +325,7 @@ impl DraftScreen {
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for c in &cards {
-            (&c.champ, c.blue, c.red, c.banned).hash(&mut h);
+            (&c.champ, c.blue, c.red, c.banned, c.locked).hash(&mut h);
         }
         (side, Arc::as_ptr(snapshot) as usize).hash(&mut h);
         let key = h.finish() | 1 << 63;
@@ -364,7 +375,7 @@ impl DraftScreen {
         let (ally, enemy) = if side == 0 { (blue, red) } else { (red, blue) };
         let damage = |c: u16| snapshot.damage_of(c);
         let open: Vec<u16> =
-            cards.iter().filter(|c| c.blue.is_none() && c.red.is_none() && !c.banned).filter_map(&id).collect();
+            cards.iter().filter(|c| c.open()).filter_map(&id).collect();
 
         // win chance
         let p = advisor::win_probability(meta, &ally, &enemy);
@@ -502,6 +513,7 @@ mod tests {
                 ui.add(&format!("{path}.{badge}"), "color").visible = false;
                 ui.add(&format!("{path}.{badge}.text"), "label");
             }
+            ui.add(&format!("{path}.fearless_x"), "image").visible = false;
         }
         ui
     }
@@ -534,6 +546,8 @@ mod tests {
         pick(&mut ui, "a", "red", 1); // the enemy took "a"
         pick(&mut ui, "b", "blue", 1); // we took "b"
         ui.nodes.get_mut(&format!("{GRID}.e.ban")).unwrap().visible = true;
+        // Fearless: "g" was played earlier in the series
+        ui.add(&format!("{GRID}.g.fearless_x"), "image").visible = true;
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
         let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
@@ -546,6 +560,7 @@ mod tests {
         let card = |n: &str| cards.iter().find(|c| c.champ.as_deref() == Some(n)).unwrap();
         assert_eq!(card("a").red, Some(1));
         assert!(card("e").banned && !card("d").banned);
+        assert!(card("g").locked && !card("g").open() && card("d").open());
         assert_eq!(player_side(&ui, "mods fc"), Some(0), "the rank after the name is ignored");
         assert_eq!(screen.enemy_team.as_deref(), Some("rivals"));
 
@@ -559,6 +574,10 @@ mod tests {
         // grid values on open cards only
         assert_eq!(ui.visible(&format!("{GRID}.a.{TAG}")), Some(false), "picked");
         assert_eq!(ui.visible(&format!("{GRID}.e.{TAG}")), Some(false), "banned");
+        assert_eq!(ui.visible(&format!("{GRID}.g.{TAG}")), Some(false), "locked by Fearless");
+        for row in 0..3 {
+            assert_ne!(text(&format!("main.pma.advice.c{row}")), name_ref("g"), "a locked champion is never advised");
+        }
         assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(true));
         assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('▲'), "c is worth picking");
         assert!(ui.nodes[&format!("{GRID}.c.{TAG}.stripe")].props.iter().any(|p| p.contains(&color(GOOD))));
