@@ -608,10 +608,6 @@ mod tests {
                 ui.add(&format!("{path}.{badge}.text"), "label");
             }
             ui.add(&format!("{path}.fearless_x"), "image").visible = false;
-            // main positions: "a".."e" top, the rest support
-            let lane = if "abcde".contains(n) { "top" } else { "support" };
-            ui.add(&format!("{path}.pos_tooltip.row1.text"), "label").text = Some(format!("#asset/base/text/ui?position.{lane}"));
-            ui.add(&format!("{path}.pos_tooltip.row2.text"), "label").text = Some(format!("#asset/base/text/ui?position.{lane}"));
         }
         ui
     }
