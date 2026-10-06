@@ -32,7 +32,6 @@ mod paths;
 pub mod patchnotes;
 mod perf;
 pub mod plan;
-pub mod poslock;
 pub mod records;
 pub mod report;
 pub mod scan;
@@ -63,7 +62,6 @@ fn init(host: &StableHost) -> StableMod {
     host.log(LogLevel::Info, &header);
     compat::load();
     config::load_now();
-    poslock::load();
 
     let mut decl = StableMod::new(MOD_ID);
     decl.set_extension(client::ClientExt);

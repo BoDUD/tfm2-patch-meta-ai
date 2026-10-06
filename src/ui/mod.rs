@@ -260,7 +260,6 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             rosters: &st.context.rosters,
             grid_values: cfg.grid_values,
             lane_tags: cfg.lane_tags,
-            lock: cfg.position_lock_on().then(|| cfg.lock_rules()),
         };
         time(Part::Draft, || st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view));
     }

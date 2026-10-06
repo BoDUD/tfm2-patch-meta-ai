@@ -12,9 +12,8 @@
 //! - **swap phase**: the best way to seat the team's five champions on its players
 //!   (`plan::best_seating`) in place of the advice, with what it is worth over the usual lanes;
 //! - **Fearless**: how many champions the series has locked, next to the win chance;
-//! - **position lock** (`poslock`): in the pick phase, a card the player's team may not pick is
-//!   covered by a dimmed layer with a lock that takes the click; advice and values skip it. The
-//!   cards' main positions (`pos_tooltip.row1/row2`) are learned for the lock on the way.
+//! - **position locks** are another mod's job (Smart Position Lock): a card it covered with its
+//!   lock layer (`spl_lock`) is not advised as a pick and gets no value.
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
@@ -58,9 +57,8 @@ const DIM: u32 = 0xa3a9b6ff;
 const TEXT: u32 = 0xe8e8e8ff;
 const PANEL: u32 = 0x161721f0;
 
-/// The layer over a card the position lock rules out.
-const LOCK: &str = "pma_lock";
-const HEADER_STEP: &str = "main.header.step";
+/// The layer Smart Position Lock puts over a card the player's team may not pick.
+const POSITION_LOCK: &str = "spl_lock";
 const SWAP: &str = "main.swap";
 const SWAP_TABLES: [&str; 2] = ["main.swap.blue_table", "main.swap.red_table"];
 
@@ -71,8 +69,6 @@ pub struct View<'a> {
     pub rosters: &'a HashMap<String, Vec<(u32, Option<Role>)>>,
     pub grid_values: bool,
     pub lane_tags: bool,
-    /// The position lock's rules, when it is on.
-    pub lock: Option<crate::poslock::Rules>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +81,8 @@ pub struct Card {
     pub banned: bool,
     /// Not pickable now (Fearless).
     pub locked: bool,
+    /// Another mod's position lock covers it: the player's team may not pick it now.
+    pub held: bool,
 }
 
 impl Card {
@@ -94,13 +92,10 @@ impl Card {
     }
 }
 
-/// Which side the player is, and whether the position lock applies now (the pick phase, with
-/// the player's side known).
+/// Which side the player is, and whether it is the swap phase (with the player's side known).
 #[derive(Clone, Copy)]
 struct Turn {
     side: usize,
-    locking: bool,
-    /// The swap phase, with the player's side known.
     swapping: bool,
 }
 
@@ -116,8 +111,6 @@ pub struct DraftScreen {
     /// The draft and model the overlay was last drawn for.
     drawn: Option<u64>,
     tagged: HashMap<String, bool>,
-    /// Cards covered by the lock layer, as last written.
-    locked: HashMap<String, bool>,
     reported: bool,
 }
 
@@ -159,6 +152,7 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
                 red: badge("red"),
                 banned: visible(ui, &format!("{path}.ban")),
                 locked: visible(ui, &format!("{path}.fearless_x")),
+                held: visible(ui, &format!("{path}.{POSITION_LOCK}")),
                 path,
             }
         })
@@ -250,39 +244,6 @@ fn chip_source() -> String {
     )
 }
 
-/// The lock layer: the card dimmed, a lock in the middle; a button, so it takes the click.
-fn lock_source() -> String {
-    format!(
-        "{LOCK}:color_icon_button {{ width: 100%; height: 100%; btn: {{ color: #07080bb8; }} \
-         hover: {{ btn: {{ color: #07080bb8; }} }} \
-         #icon:image {{ width: 24px; height: 24px; anchor_x: 0.5; anchor_y: 0.5; pivot_x: 0.5; pivot_y: 0.38; \
-         source: \"asset/base/ui/icons/lock\"; color: #c2c6ceff; ignore_event: true; }} }}"
-    )
-}
-
-/// The main positions on the cards (`pos_tooltip.row1/row2`, the game's position text
-/// references), learned once per champion for the position lock.
-fn learn_positions(ui: &impl Ui, cards: &[Card]) {
-    let mut learned = false;
-    for c in cards {
-        let Some(champ) = c.champ.as_deref() else { continue };
-        if crate::poslock::knows(champ) {
-            continue;
-        }
-        let mut lanes = [false; 5];
-        for row in ["row1", "row2"] {
-            let text = ui.text(&format!("{}.pos_tooltip.{row}.text", c.path)).unwrap_or_default();
-            if let Some(r) = text.strip_prefix("#asset/base/text/ui?position.").and_then(Role::parse) {
-                lanes[r.index()] = true;
-            }
-        }
-        learned |= crate::poslock::learn(champ, lanes);
-    }
-    if learned {
-        crate::poslock::save();
-    }
-}
-
 /// Steps of the lane read's confidence bar.
 const LANE_STEPS: usize = 5;
 
@@ -347,8 +308,6 @@ impl DraftScreen {
                 self.on = false;
                 self.drawn = None;
                 self.tagged.clear();
-                self.locked.clear();
-                crate::poslock::save();
             }
             return;
         }
@@ -386,10 +345,6 @@ impl DraftScreen {
         let meta = &snapshot.meta;
         let known = |c: &str| meta.names.get(c).is_some();
         let cards = read_grid(ui, &known, names);
-        if view.lock.is_some() {
-            learn_positions(ui, &cards);
-        }
-        let pick_phase = ui.text(HEADER_STEP).is_some_and(|t| t.contains("pick_phase"));
         let swap_phase = ui.visible(SWAP) == Some(true);
         if !self.reported {
             self.reported = true;
@@ -404,16 +359,16 @@ impl DraftScreen {
                 }
             ));
         }
-        // the lock needs to know which team is the player's: without it, lock nothing
-        let lock_ok = side.is_some();
+        // the seating needs to know which team is the player's
+        let side_known = side.is_some();
         let side = side.unwrap_or(0);
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for c in &cards {
-            (&c.champ, c.blue, c.red, c.banned, c.locked).hash(&mut h);
+            (&c.champ, c.blue, c.red, c.banned, c.locked, c.held).hash(&mut h);
         }
-        (side, Arc::as_ptr(snapshot) as usize, pick_phase, swap_phase, view.lock.is_some()).hash(&mut h);
+        (side, Arc::as_ptr(snapshot) as usize, swap_phase).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -434,7 +389,7 @@ impl DraftScreen {
             ui.text(path).and_then(|t| view.rosters.get(&team_key(&t)).cloned()).unwrap_or_default()
         };
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
-        let turn = Turn { side, locking: pick_phase && lock_ok, swapping: swap_phase && lock_ok };
+        let turn = Turn { side, swapping: swap_phase && side_known };
         self.draw(ui, snapshot, &cards, turn, &rosters, view);
     }
 
@@ -481,7 +436,7 @@ impl DraftScreen {
         rosters: &[Vec<(u32, Option<Role>)>; 2],
         view: &View<'_>,
     ) {
-        let (side, pick_phase) = (turn.side, turn.locking);
+        let side = turn.side;
         let (players, enemy_players) = (&rosters[side], &rosters[1 - side]);
         let meta = &snapshot.meta;
         let id = |c: &Card| c.champ.as_deref().and_then(|n| meta.names.get(n));
@@ -499,12 +454,8 @@ impl DraftScreen {
         let damage = |c: u16| snapshot.damage_of(c);
         let open: Vec<u16> =
             cards.iter().filter(|c| c.open()).filter_map(&id).collect();
-        // the champions the player's team may pick (all open ones without the lock, outside the
-        // pick phase, or when it is not known which team is the player's)
-        let pickable: Vec<u16> = match &view.lock {
-            Some(rules) if pick_phase => crate::poslock::pickable(meta, rules, &ally, &open),
-            _ => open.clone(),
-        };
+        // the champions the player's team may pick: open, and not held by a position lock
+        let pickable: Vec<u16> = cards.iter().filter(|c| c.open() && !c.held).filter_map(&id).collect();
 
         // win chance
         let p = advisor::win_probability(meta, &ally, &enemy);
@@ -593,24 +544,6 @@ impl DraftScreen {
                     ui.set_properties(&format!("{tag}.text"), &format!("color: {};", color(c)));
                     ui.set_properties(&format!("{tag}.stripe"), &format!("color: {};", color(c)));
                 }
-            }
-        }
-
-        // the position lock: a dimmed layer that takes the click, on open cards the team may not
-        // pick, in the pick phase only (bans are free)
-        for c in cards.iter().filter(|c| c.champ.is_some()) {
-            // (pick_phase is false here unless the player's side is known)
-            let ruled_out = view.lock.is_some() && pick_phase && c.open() && id(c).is_some_and(|x| !pickable.contains(&x));
-            let layer = format!("{}.{LOCK}", c.path);
-            if ruled_out && !ui.exists(&layer) {
-                if !ui.spawn(&c.path, &lock_source()) {
-                    continue;
-                }
-                self.locked.insert(layer.clone(), true);
-            }
-            if self.locked.get(&layer) != Some(&ruled_out) && ui.exists(&layer) {
-                ui.set_visible(&layer, ruled_out);
-                self.locked.insert(layer, ruled_out);
             }
         }
 
@@ -713,9 +646,11 @@ mod tests {
         ui.nodes.get_mut(&format!("{GRID}.e.ban")).unwrap().visible = true;
         // Fearless: "g" was played earlier in the series
         ui.add(&format!("{GRID}.g.fearless_x"), "image").visible = true;
+        // Smart Position Lock holds "c" (the strongest) for the player's team
+        ui.add(&format!("{GRID}.c.{POSITION_LOCK}"), "color_icon_button");
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: None };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
@@ -726,6 +661,7 @@ mod tests {
         assert_eq!(card("a").red, Some(1));
         assert!(card("e").banned && !card("d").banned);
         assert!(card("g").locked && !card("g").open() && card("d").open());
+        assert!(card("c").held && card("c").open() && !card("d").held);
         assert_eq!(player_side(&ui, "mods fc"), Some(0), "the rank after the name is ignored");
         assert_eq!(screen.enemy_team.as_deref(), Some("rivals"));
 
@@ -734,7 +670,7 @@ mod tests {
         // champion names are the game's name references, shown in its language
         assert!(text("main.pma.advice.c0").starts_with("#asset/base/text/champion?description."));
         let advised = [text("main.pma.advice.c0"), text("main.pma.advice.c1")];
-        assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
+        assert!(!advised.contains(&name_ref("c")), "held by the position lock: {advised:?}");
         assert_eq!(text("main.pma.advice.k2"), "Ban 禁");
         // grid values on open cards only
         assert_eq!(ui.visible(&format!("{GRID}.a.{TAG}")), Some(false), "picked");
@@ -743,7 +679,15 @@ mod tests {
         for row in 0..3 {
             assert_ne!(text(&format!("main.pma.advice.c{row}")), name_ref("g"), "a locked champion is never advised");
         }
-        assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(true));
+        assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(false), "held by the position lock");
+        assert_eq!(ui.visible(&format!("{GRID}.d.{TAG}")), Some(true));
+
+        // the lock lets go of "c": it is the best pick again
+        ui.remove(&format!("{GRID}.c.{POSITION_LOCK}"));
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        let text = |p: &str| ui.text(p).unwrap_or_default();
+        let advised = [text("main.pma.advice.c0"), text("main.pma.advice.c1")];
+        assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
         assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('▲'), "c is worth picking");
         assert!(ui.nodes[&format!("{GRID}.c.{TAG}.stripe")].props.iter().any(|p| p.contains(&color(GOOD))));
         // a lane read on the enemy's first pick slot: an icon and a confidence bar
@@ -754,47 +698,11 @@ mod tests {
 
         // nothing changed: nothing redrawn; the game rebuilt the screen: drawn again
         let spawned = ui.spawned.len();
-        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
         assert_eq!(ui.spawned.len(), spawned);
         ui.remove("main.pma");
-        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
+        screen.tick(&mut ui, 3 * READ_EVERY, Some(&snapshot), &book, &view);
         assert!(ui.exists("main.pma.win.value"));
-    }
-
-    #[test]
-    fn the_position_lock_greys_out_what_the_team_cannot_seat() {
-        let _serial = crate::tests::serial();
-        crate::poslock::clear();
-        let snapshot = snapshot(2000);
-        let book = NameBook::default();
-        let rosters = HashMap::new();
-        // main positions only (history plays everyone everywhere in the simulation)
-        let rules = crate::poslock::Rules { min_games: 1_000_000, share: 0.5 };
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: Some(rules) };
-        let mut ui = screen();
-        ui.add(HEADER_STEP, "label").text = Some("#asset/base/text/ui?banpick.pick_phase".into());
-        pick(&mut ui, "a", "blue", 1); // we took a top-only champion
-        let mut screen = DraftScreen::default();
-        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
-        assert!(crate::poslock::knows("c"), "main positions learned from the cards");
-        // the other top-only champions are locked; support ones are not
-        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(true));
-        assert!(!ui.exists(&format!("{GRID}.h.{LOCK}")) || ui.visible(&format!("{GRID}.h.{LOCK}")) == Some(false));
-        assert!(!ui.exists(&format!("{GRID}.a.{LOCK}")), "picked cards are not covered");
-        // ...and never advised
-        for row in 0..2 {
-            assert_ne!(ui.text(&format!("main.pma.advice.c{row}")).unwrap_or_default(), name_ref("c"));
-        }
-        // the ban phase: nothing locked
-        ui.nodes.get_mut(HEADER_STEP).unwrap().text = Some("#asset/base/text/ui?banpick.ban_phase".into());
-        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
-        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(false));
-        // the player's team unknown (names do not match): nothing locked either
-        ui.nodes.get_mut(HEADER_STEP).unwrap().text = Some("#asset/base/text/ui?banpick.pick_phase".into());
-        let stranger = View { team_name: "Somebody Else", ..view };
-        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &stranger);
-        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(false));
-        crate::poslock::clear();
     }
 
     #[test]
@@ -802,7 +710,7 @@ mod tests {
         let snapshot = snapshot(1500);
         let book = NameBook::default();
         let rosters = HashMap::new();
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: None };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
         let mut ui = screen();
         for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             pick(&mut ui, n, "blue", i as u32 + 1);
@@ -835,7 +743,7 @@ mod tests {
     fn says_so_when_there_is_too_little_data() {
         let book = NameBook::default();
         let rosters = HashMap::new();
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: None };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
         for snapshot in [None, Some(snapshot(5))] {
             let mut ui = screen();
             let mut screen = DraftScreen::default();
