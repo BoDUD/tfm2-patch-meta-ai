@@ -288,6 +288,8 @@ pub(crate) mod tests {
         pub handlers: Vec<String>,
         pub icons: BTreeMap<String, String>,
         pub texts: Vec<String>,
+        /// Every reference under this prefix exists (a merged text document).
+        pub text_prefix: Option<String>,
     }
 
     impl FakeUi {
@@ -447,8 +449,8 @@ pub(crate) mod tests {
             self.handlers.push(path.to_string());
             true
         }
-        fn set_champion_icon(&mut self, path: &str, champion: &str, _size: f32) -> bool {
-            if !self.nodes.contains_key(path) {
+        fn set_champion_icon(&mut self, path: &str, champion: &str, size: f32) -> bool {
+            if !self.nodes.contains_key(path) || size <= 0.0 {
                 return false;
             }
             self.icons.insert(path.to_string(), champion.to_string());
@@ -456,6 +458,7 @@ pub(crate) mod tests {
         }
         fn has_text(&self, reference: &str) -> bool {
             self.texts.iter().any(|t| t == reference)
+                || self.text_prefix.as_ref().is_some_and(|p| reference.starts_with(p.as_str()))
         }
     }
 

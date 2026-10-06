@@ -539,8 +539,14 @@ impl MetaPage {
         }
         self.drawn = Some(key);
         self.register_tabs(ui);
-        for (path, champ) in icons {
-            ui.set_champion_icon(&format!("{BODY}.{path}"), &champ, 0.0);
+        let mut missing = 0;
+        for (path, champ, size) in icons {
+            if !ui.set_champion_icon(&format!("{BODY}.{path}"), &champ, size) {
+                missing += 1;
+            }
+        }
+        if missing > 0 {
+            crate::diag::log_once("page-icons", &format!("[ui] meta page: {missing} champion portraits could not be drawn"));
         }
         for (path, c) in links {
             let full = format!("{BODY}.{path}");
@@ -906,8 +912,18 @@ fn fill_row(ui: &mut impl Ui, i: usize, r: &RowData<'_>) {
     }
 }
 
-/// Icons to fill after spawning (path under the body, champion) and clickable champions.
-type Extras = (String, Vec<(String, String)>, Vec<(String, u16)>);
+/// A portrait to fill after spawning: path under the body, champion, icon size.
+type Icon = (String, String, f32);
+
+/// Icons to fill after spawning and clickable champions (path under the body, champion).
+type Extras = (String, Vec<Icon>, Vec<(String, u16)>);
+
+/// Rows of a champion list on a champion page, and the list's height (always the same, so the
+/// page below a short list does not move up into a gap).
+const LIST_ROWS: usize = 6;
+const LIST_H: u32 = 48 + 48 * LIST_ROWS as u32 + 12;
+/// Effects smaller than this (win-rate points) are not worth a line.
+const MIN_EFFECT: f32 = 0.1;
 
 /// A titled list of champions with a number: portraits, names, values, games.
 fn champ_list(
@@ -918,12 +934,16 @@ fn champ_list(
     title: &str,
     items: &[(u16, f32, u32)],
     meta: &Meta,
-    icons: &mut Vec<(String, String)>,
+    icons: &mut Vec<Icon>,
     links: &mut Vec<(String, u16)>,
     base: &str,
+    empty: &str,
 ) -> String {
     let mut inner = bold("title", 20, 12, w - 40, 24, 18, TEXT, "Left", title);
-    for (k, (c, v, g)) in items.iter().enumerate() {
+    if items.is_empty() {
+        inner.push_str(&label("none", 20, 56, w - 40, 24, 14, DIM, "Left", empty));
+    }
+    for (k, (c, v, g)) in items.iter().take(LIST_ROWS).enumerate() {
         let y0 = 48 + k as i32 * 48;
         let row = format!(
             "{}{}{}{}",
@@ -933,10 +953,10 @@ fn champ_list(
             label("g", w as i32 - 70, 16, 50, 18, 13, DIM, "Right", &format!("{g}")),
         );
         inner.push_str(&hot(&format!("i{k}"), 0, y0, w, 48, &row));
-        icons.push((format!("{base}.{id}.i{k}.face.icon"), meta.names.name(*c).to_string()));
+        icons.push((format!("{base}.{id}.i{k}.face.icon"), meta.names.name(*c).to_string(), 36.0));
         links.push((format!("{base}.{id}.i{k}"), *c));
     }
-    rect(id, x, y, w, 48 + 48 * items.len().max(1) as u32 + 12, PANEL, 12, &inner)
+    rect(id, x, y, w, LIST_H, PANEL, 12, &inner)
 }
 
 fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<String, Tier>, champ: u16, context: &Context) -> Extras {
@@ -948,9 +968,16 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
     let mut s = String::new();
     s.push_str(&format!(
         "#detail:empty {{ y: 52px; width: 1600px; height: 916px; \
-         #back:color_icon_button {{ @\"asset/base/style/main#secondary_button\"; x: 0px; y: 0px; width: 140px; height: 40px; \
-         text: {{ font: \"asset/base/font/set/bold\"; text: {}; align_x: Center; align_y: Center; size: 16; }} }} ",
-        quote(&format!("← {back}"))
+         #back:color_icon_button {{ x: 0px; y: 0px; width: 140px; height: 40px; btn: {{ color: {}; }} \
+         hover: {{ btn: {{ color: #ffffffff; }} }} rounding: Uniform {{ rounding: 8; }} \
+         #arrow:label {{ @\"asset/base/style/main#bold_label\"; x: 14px; y: 0px; width: 24px; height: 40px; size: 16; \
+         color: {}; align_x: Left; align_y: Center; ignore_event: true; text: \"←\"; }} \
+         #text:label {{ @\"asset/base/style/main#bold_label\"; x: 38px; y: 0px; width: 92px; height: 40px; size: 16; \
+         color: {}; align_x: Left; align_y: Center; ignore_event: true; text: {}; }} }} ",
+        color(LIT),
+        color(LIT_TEXT),
+        color(LIT_TEXT),
+        quote(&back)
     ));
     // header card
     let delta = c.previous.map(|p| (c.win_rate() - sigmoid(p)) * 100.0);
@@ -977,7 +1004,7 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
         .concat()
     );
     s.push_str(&rect("head", 0, 52, 1600, 128, PANEL, 12, &header));
-    icons.push(("detail.head.face.icon".into(), c.name.clone()));
+    icons.push(("detail.head.face.icon".into(), c.name.clone(), 84.0));
     // lanes
     let mut lanes = bold("title", 20, 10, 400, 24, 18, TEXT, "Left", &t.get("by_lane", "By Lane"));
     let share = c.role_share();
@@ -991,7 +1018,11 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
             label("lane", 48, 14, 200, 28, 16, DIM, "Left", &lane_text(*r)),
             bold("wr", 16, 46, 140, 34, 26, if e.tally.games > 0 { TEXT } else { DIM }, "Left", &if e.tally.games > 0 { format!("{:.1}%", wr * 100.0) } else { "-".into() }),
             label("g", 160, 52, 120, 24, 14, DIM, "Right", &format!("{}g · {:.0}%", e.tally.games, share[r.index()] * 100.0)),
-            rect("bar", 16, 86, 268, 4, SLOT, 2, &rect("fill", 0, 0, ((share[r.index()] * 268.0) as u32).max(2), 4, ACCENT, 2, "")),
+            rect("bar", 16, 86, 268, 4, 0x2a2c38ff, 2, &if share[r.index()] > 0.0 {
+                rect("fill", 0, 0, ((share[r.index()] * 268.0) as u32).max(4), 4, ACCENT, 2, "")
+            } else {
+                String::new()
+            }),
         );
         lanes.push_str(&rect(&format!("l{k}"), x, 42, 300, 100, SLOT, 10, &card));
     }
@@ -1016,12 +1047,13 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
         .filter(|x| x.2 >= 2)
         .collect();
     against.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let strong: Vec<_> = against.iter().filter(|x| x.1 > 0.0).take(6).copied().collect();
-    let weak: Vec<_> = against.iter().rev().filter(|x| x.1 < 0.0).take(6).copied().collect();
-    let best: Vec<_> = with.iter().filter(|x| x.1 > 0.0).take(6).copied().collect();
-    s.push_str(&champ_list("with", 0, 360, 520, &t.get("best_with", "Best Partners"), &best, meta, &mut icons, &mut links, "detail"));
-    s.push_str(&champ_list("strong", 540, 360, 520, &t.get("strong_against", "Edge Over"), &strong, meta, &mut icons, &mut links, "detail"));
-    s.push_str(&champ_list("weak", 1080, 360, 520, &t.get("weak_against", "Edge Against"), &weak, meta, &mut icons, &mut links, "detail"));
+    let strong: Vec<_> = against.iter().filter(|x| x.1 >= MIN_EFFECT).take(LIST_ROWS).copied().collect();
+    let weak: Vec<_> = against.iter().rev().filter(|x| x.1 <= -MIN_EFFECT).take(LIST_ROWS).copied().collect();
+    let best: Vec<_> = with.iter().filter(|x| x.1 >= MIN_EFFECT).take(LIST_ROWS).copied().collect();
+    let empty = t.get("no_pairs", "Not enough games together yet.");
+    s.push_str(&champ_list("with", 0, 360, 520, &t.get("best_with", "Best Partners"), &best, meta, &mut icons, &mut links, "detail", &empty));
+    s.push_str(&champ_list("strong", 540, 360, 520, &t.get("strong_against", "Edge Over"), &strong, meta, &mut icons, &mut links, "detail", &empty));
+    s.push_str(&champ_list("weak", 1080, 360, 520, &t.get("weak_against", "Edge Against"), &weak, meta, &mut icons, &mut links, "detail", &empty));
     // patch history and best players
     let mut history = bold("title", 20, 10, 400, 24, 18, TEXT, "Left", &t.get("patch_history", "Patch History"));
     let n = c.history.len().max(1);
@@ -1042,14 +1074,16 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
     let mut players: Vec<(u32, Effect)> = meta.mastery.iter().filter(|((_, ch), e)| *ch == champ && e.tally.games >= 2).map(|((a, _), e)| (*a, *e)).collect();
     players.sort_by(|a, b| b.1.value.partial_cmp(&a.1.value).unwrap_or(std::cmp::Ordering::Equal));
     let mut top = bold("title", 20, 10, 400, 24, 18, TEXT, "Left", &t.get("top_players", "Best Players"));
+    if players.is_empty() {
+        top.push_str(&label("none", 20, 46, 520, 24, 14, DIM, "Left", &t.get("no_players", "No player has played it enough yet.")));
+    }
     for (k, (a, e)) in players.iter().take(5).enumerate() {
         let y0 = 42 + k as i32 * 30;
         top.push_str(&label(&format!("n{k}"), 20, y0, 300, 26, 16, TEXT, "Left", &context.athletes.get(a).cloned().unwrap_or_else(|| format!("#{a}"))));
         top.push_str(&label(&format!("v{k}"), 330, y0, 90, 26, 16, tone(pts(e.value)), "Right", &signed(pts(e.value))));
         top.push_str(&label(&format!("g{k}"), 430, y0, 120, 26, 13, DIM, "Right", &format!("{}g · {:.0}%", e.tally.games, e.tally.rate().unwrap_or(0.0) * 100.0)));
     }
-    let lists_h: i32 = 48 + 48 * 6 + 12;
-    let y_bottom = 360 + lists_h + 12;
+    let y_bottom = 360 + LIST_H as i32 + 12;
     s.push_str(&rect("hist", 0, y_bottom, 1000, 204, PANEL, 12, &history));
     s.push_str(&rect("players", 1020, y_bottom, 580, 204, PANEL, 12, &top));
     s.push_str("} ");
@@ -1077,7 +1111,7 @@ fn pairs_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta) -> Extras {
         .filter(|(_, e)| e.tally.games >= 3 && e.value > 0.0)
         .collect();
     edges.sort_by(|a, b| b.1.value.partial_cmp(&a.1.value).unwrap_or(std::cmp::Ordering::Equal));
-    let column = |id: &str, x: i32, title: &str, joiner: &str, list: Vec<((u16, u16), Effect)>, icons: &mut Vec<(String, String)>| {
+    let column = |id: &str, x: i32, title: &str, joiner: &str, list: Vec<((u16, u16), Effect)>, icons: &mut Vec<Icon>| {
         let mut inner = bold("title", 24, 14, 600, 28, 20, TEXT, "Left", title);
         for (k, ((a, b), e)) in list.iter().take(14).enumerate() {
             let y0 = 56 + k as i32 * 56;
@@ -1092,8 +1126,8 @@ fn pairs_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta) -> Extras {
                 label("g", 690, 20, 70, 18, 13, DIM, "Right", &format!("{}g", e.tally.games)),
             );
             inner.push_str(&format!("#i{k}:empty {{ y: {y0}px; width: 780px; height: 56px; {row}#line:color {{ y: 56px; width: 100%; height: 1px; color: {}; ignore_event: true; }} }} ", color(LINE)));
-            icons.push((format!("{id}.i{k}.fa.icon"), meta.names.name(*a).to_string()));
-            icons.push((format!("{id}.i{k}.fb.icon"), meta.names.name(*b).to_string()));
+            icons.push((format!("{id}.i{k}.fa.icon"), meta.names.name(*a).to_string(), 36.0));
+            icons.push((format!("{id}.i{k}.fb.icon"), meta.names.name(*b).to_string(), 36.0));
         }
         rect(id, x, 52, 790, 876, PANEL, 12, &inner)
     };
@@ -1137,7 +1171,10 @@ fn players_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context, o
         let x = k as i32 * 810;
         let roster = team.as_ref().and_then(|tm| context.rosters.get(tm)).cloned().unwrap_or_default();
         let name = team.as_ref().and_then(|tm| context.team_labels.get(tm)).cloned().unwrap_or_default();
-        let mut inner = bold("title", 24, 14, 740, 28, 20, TEXT, "Left", &if name.is_empty() { title.clone() } else { format!("{title} · {name}") });
+        // a label shows a text reference only when it is the label's whole text: the team's
+        // name goes in a label of its own
+        let mut inner = bold("title", 24, 14, 360, 28, 20, TEXT, "Left", title);
+        inner.push_str(&bold("team", 390, 14, 376, 28, 20, ACCENT, "Right", &name));
         if roster.is_empty() {
             inner.push_str(&label("none", 24, 60, 740, 24, 16, DIM, "Left", &no_roster));
         }
@@ -1158,7 +1195,7 @@ fn players_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context, o
                 card.push_str(&portrait(&format!("c{j}"), cx, 52, 56));
                 card.push_str(&bold(&format!("v{j}"), cx + 62, 56, 80, 24, 18, TEXT, "Left", &format!("{:.0}%", sigmoid(*v) * 100.0)));
                 card.push_str(&label(&format!("g{j}"), cx + 62, 82, 80, 20, 12, DIM, "Left", &format!("{g}g")));
-                icons.push((format!("{id}.p{p}.c{j}.icon"), meta.names.name(*c).to_string()));
+                icons.push((format!("{id}.p{p}.c{j}.icon"), meta.names.name(*c).to_string(), 52.0));
             }
             inner.push_str(&rect(&format!("p{p}"), 16, y0, 758, 148, SLOT, 10, &card));
         }
@@ -1181,13 +1218,16 @@ fn model_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context) -> 
     s.push_str(&card("brier", 406, &bt.map_or("—".into(), |b| format!("{:.3} / {:.3}", b.brier, b.coin_brier)), &t.get("brier", "Brier Score")));
     s.push_str(&card("games", 812, &bt.map_or("—".into(), |b| b.games.to_string()), &t.get("checked_games", "Held-out Matches")));
     s.push_str(&card("side", 1218, &signed(pts(meta.side)), &t.get("blue_side", "Blue Side Edge")));
-    let info = format!(
-        "{}{}{}",
-        bold("m", 24, 20, 1500, 30, 20, TEXT, "Left", &format!("{} · {} ({}: {})", meta.current, meta.versions.join(" · "), t.get("this_patch", "This Patch"), meta.current_matches)),
-        label("n", 24, 60, 1500, 28, 16, DIM, "Left", &format!("{}: {} + {} solo", t.get("matches", "Matches"), meta.matches, meta.solo_matches)),
-        label("note", 24, 96, 1500, 28, 16, DIM, "Left", &t.get("note_model", "Fitted on all but the newest matches, then scored on those it never saw.")),
-    );
-    s.push_str(&rect("info", 0, 222, 1600, 140, PANEL, 12, &info));
+    // numbers and their captions in labels of their own (a caption is a text reference)
+    let info = [
+        stat("patch", 24, &meta.current, &t.get("this_patch", "This Patch")),
+        stat("current", 424, &meta.current_matches.to_string(), &t.get("this_patch_matches", "Matches This Patch")),
+        stat("matches", 824, &meta.matches.to_string(), &t.get("matches", "Matches")),
+        stat("solo", 1224, &meta.solo_matches.to_string(), &t.get("solo_matches", "Solo Rank Games")),
+        label("note", 24, 112, 1550, 24, 14, DIM, "Left", &t.get("note_model", "Fitted on all but the newest matches, then scored on those it never saw.")),
+    ]
+    .concat();
+    s.push_str(&rect("info", 0, 222, 1600, 152, PANEL, 12, &info));
     s
 }
 
@@ -1228,6 +1268,45 @@ mod tests {
         let clicks = take_clicks();
         let keys = ui.keys.clone();
         page.tick(ui, &Frame { frame: n, snapshot: Some(snapshot), context, opponent: Some("rivals"), screen, clicks: &clicks, keys: &keys });
+    }
+
+    /// A label shows a reference only when the reference is its whole text: no reference may
+    /// be part of a longer text anywhere on the page.
+    fn assert_whole_references(ui: &FakeUi) {
+        for (_, source) in &ui.spawned {
+            for part in source.split("text: \"").skip(1) {
+                let text = part.split('"').next().unwrap_or("");
+                if text.contains("#asset/") {
+                    assert!(text.starts_with("#asset/") && !text.contains(' '), "a reference inside a text: {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_the_merged_texts_every_view_uses_whole_references() {
+        let _serial = crate::tests::serial();
+        let _ = take_clicks();
+        let s = snapshot();
+        let mut context = Context { team_name: "Mods FC".into(), ..Default::default() };
+        context.rosters.insert("mods fc".into(), (1..=5).map(|a| (a, Some(Role::ALL[a as usize - 1]))).collect());
+        context.team_labels.insert("mods fc".into(), "Mods FC".into());
+        let mut ui = management();
+        ui.text_prefix = Some("#asset/base/text/ui?patch_meta.".into());
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        ui.click(&format!("{NAV}.button"));
+        for n in 2..8 {
+            frame(&mut page, &mut ui, n, &s, &context, "Main/Home");
+        }
+        ui.click(&format!("{LIST}.r0"));
+        frame(&mut page, &mut ui, 9, &s, &context, "Main/Home");
+        for tab in ["pairs", "players", "model"] {
+            ui.click(&format!("{BODY}.tabs.{tab}"));
+            frame(&mut page, &mut ui, 10, &s, &context, "Main/Home");
+        }
+        assert!(ui.spawned.iter().any(|(_, src)| src.contains("#asset/base/text/ui?patch_meta.this_patch")));
+        assert_whole_references(&ui);
     }
 
     #[test]
@@ -1289,6 +1368,10 @@ mod tests {
         frame(&mut page, &mut ui, 12, &s, &context, "Main/Home");
         assert_eq!(page.view, View::Champion(c));
         assert!(ui.exists(&format!("{BODY}.detail.head.face")));
+        assert!(ui.icons.contains_key(&format!("{BODY}.detail.head.face.icon")), "the champion's portrait");
+        assert!(ui.exists(&format!("{BODY}.detail.back.text")), "the back button's text is a label");
+        let source = &ui.spawned.iter().rev().find(|(p, _)| p == SCREEN).unwrap().1;
+        assert!(!source.contains("text: { font"), "no text in the button's own text block");
         assert!(ui.exists(&format!("{BODY}.detail.lanes.l4.wr")));
         if let Some((path, other)) = page.links.iter().next().map(|(p, c)| (p.clone(), *c)) {
             ui.click(&path);
@@ -1310,6 +1393,8 @@ mod tests {
                 assert!(ui.icons.contains_key(&format!("{BODY}.mine.p0.c0.icon")));
             }
         }
+
+        assert_whole_references(&ui);
 
         // one of the game's menu entries (another tab) closes it and gives the content back
         assert!(!ui.handlers.iter().any(|h| h.starts_with(LEFT_MENU)), "nothing attached to the game's menu");
