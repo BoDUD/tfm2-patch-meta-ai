@@ -1,5 +1,5 @@
-//! `diag.log` (what the mod saw and did - send it when something looks wrong) and
-//! `meta_table.txt` (the model's current numbers), both in the mod folder.
+//! `diag.log` (what the mod saw and did - send it when something looks wrong),
+//! `meta_table.txt` and `meta_report.html` (the model's current numbers), all in the mod folder.
 //!
 //! Every function here swallows I/O errors: a read-only folder must never stop the mod.
 
@@ -13,6 +13,7 @@ use std::time::Instant;
 pub const LOG_FILE: &str = "diag.log";
 pub const PREV_LOG_FILE: &str = "diag.prev.log";
 pub const TABLE_FILE: &str = "meta_table.txt";
+pub const REPORT_FILE: &str = "meta_report.html";
 
 /// Lines written per game session; a stuck loop must not fill the disk.
 const MAX_LINES: usize = 20_000;
@@ -89,13 +90,18 @@ pub fn reset_once() {
 /// Replaces `meta_table.txt` (written to a temporary file first, so a reader never sees
 /// half a table).
 pub fn write_table(text: &str) {
+    write_file(TABLE_FILE, text);
+}
+
+/// Writes a file in the mod folder (probes, the report), replacing it atomically.
+pub fn write_file(name: &str, text: &str) {
     let dir = match lock().as_ref() {
         Some(diag) => diag.dir.clone(),
         None => return,
     };
-    let tmp = dir.join(format!("{TABLE_FILE}.tmp"));
-    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, dir.join(TABLE_FILE)).is_err() {
-        let _ = fs::write(dir.join(TABLE_FILE), text);
+    let tmp = dir.join(format!("{name}.tmp"));
+    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, dir.join(name)).is_err() {
+        let _ = fs::write(dir.join(name), text);
         let _ = fs::remove_file(&tmp);
     }
 }

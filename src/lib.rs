@@ -17,17 +17,25 @@
 //! AI + Champion Tiers" Workshop mod (no longer maintained); this is an independent
 //! implementation with its own model.
 
+pub mod advisor;
 mod client;
+pub mod compat;
 pub mod config;
 mod diag;
 pub mod draft;
+pub mod glm;
+pub mod history;
+pub mod meta;
 pub mod model;
 mod paths;
 pub mod patchnotes;
 pub mod records;
+pub mod report;
 pub mod scan;
 pub mod server;
 mod shared;
+pub mod ui;
+pub mod worker;
 
 use mod_api_stable::{declare_stable_mod, LogLevel, StableHost, StableMod};
 
@@ -49,6 +57,7 @@ fn init(host: &StableHost) -> StableMod {
     );
     diag::log(&header);
     host.log(LogLevel::Info, &header);
+    compat::load();
     config::load_now();
 
     let mut decl = StableMod::new(MOD_ID);
@@ -64,6 +73,7 @@ declare_stable_mod!(init);
 #[doc(hidden)]
 pub fn reset_for_tests() {
     diag::open(&paths::mod_dir());
+    compat::set(compat::Others::default());
     client::reset_for_tests();
     shared::clear();
     server::reset_for_tests();

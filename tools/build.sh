@@ -22,7 +22,10 @@ fi
 out=dist/patch_meta_ai
 rm -rf "$out"
 mkdir -p "$out"
-cp "target/$target/release/patch_meta_ai.dll" package/mod.mod_info package/thumbnail.png "$out/"
+cp "target/$target/release/patch_meta_ai.dll" package/mod.mod_info package/mod.override_info package/thumbnail.png "$out/"
+# the page's texts, merged into the game's ui text (mod.override_info)
+mkdir -p "$out/text"
+cp package/text/ui.i18n "$out/text/"
 
 if [ "${1:-}" = "--smoke" ]; then
     (cd tools/dll-smoke && cargo build --release --target "$target")
@@ -39,7 +42,9 @@ import os, sys, zipfile
 version = sys.argv[1]
 path = f"dist/patch_meta_ai-{version}.zip"
 with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-    for name in sorted(os.listdir("dist/patch_meta_ai")):
-        z.write(os.path.join("dist/patch_meta_ai", name), f"patch_meta_ai/{name}")
+    for root, _, files in sorted(os.walk("dist/patch_meta_ai")):
+        for name in sorted(files):
+            full = os.path.join(root, name)
+            z.write(full, os.path.join("patch_meta_ai", os.path.relpath(full, "dist/patch_meta_ai")))
 print(path)
 PY

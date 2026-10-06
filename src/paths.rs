@@ -7,6 +7,8 @@ use std::sync::OnceLock;
 
 /// Tests (and players who want the files elsewhere) can point the mod at another folder.
 pub const DIR_ENV: &str = "PATCH_META_AI_DIR";
+/// Tests point the mod at another `mods.json` (see `compat`).
+pub const MODS_JSON_ENV: &str = "PATCH_META_AI_MODS_JSON";
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 

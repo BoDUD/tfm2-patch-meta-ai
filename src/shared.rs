@@ -1,28 +1,36 @@
-//! The model's output as the draft hook reads it. The client extension publishes a new table
-//! after every rebuild; the draft hook (which runs wherever the game drafts: AI matches on the
-//! management server, the opponent in your own matches) only reads it.
+//! The model's output as the draft hook (and the draft screen) read it. The client publishes a
+//! new snapshot after every fit; the draft hook runs wherever the game drafts (AI matches on
+//! the management server, the opponent in your own matches) and only reads it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Tables {
-    /// Champion -> amount added to the AI's pick score.
-    pub pick: HashMap<String, f32>,
-    /// Champion -> amount added to the AI's ban score.
-    pub ban: HashMap<String, f32>,
+use crate::advisor::Damage;
+use crate::meta::Meta;
+
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    pub meta: Meta,
+    /// Physical / magic damage per champion id (from the champions' tags).
+    pub damage: HashMap<u16, Damage>,
 }
 
-static TABLES: RwLock<Option<Arc<Tables>>> = RwLock::new(None);
+impl Snapshot {
+    pub fn damage_of(&self, champ: u16) -> Option<Damage> {
+        self.damage.get(&champ).copied()
+    }
+}
 
-pub fn publish(tables: Tables) {
-    *TABLES.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(tables));
+static SNAPSHOT: RwLock<Option<Arc<Snapshot>>> = RwLock::new(None);
+
+pub fn publish(snapshot: Snapshot) {
+    *SNAPSHOT.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(snapshot));
 }
 
 pub fn clear() {
-    *TABLES.write().unwrap_or_else(PoisonError::into_inner) = None;
+    *SNAPSHOT.write().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
-pub fn get() -> Option<Arc<Tables>> {
-    TABLES.read().unwrap_or_else(PoisonError::into_inner).clone()
+pub fn get() -> Option<Arc<Snapshot>> {
+    SNAPSHOT.read().unwrap_or_else(PoisonError::into_inner).clone()
 }

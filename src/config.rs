@@ -11,26 +11,64 @@ use crate::{diag, paths};
 pub const FILE: &str = "settings.ini";
 const CHECK_EVERY: Duration = Duration::from_secs(3);
 
+/// A feature switch. `Auto` is on unless another enabled mod already does the job (`compat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Switch {
+    Auto,
+    On,
+    Off,
+}
+
+impl Switch {
+    fn parse(v: &str) -> Result<Switch, String> {
+        if v.eq_ignore_ascii_case("auto") {
+            return Ok(Switch::Auto);
+        }
+        flag(v).map(|on| if on { Switch::On } else { Switch::Off }).map_err(|_| format!("expected auto/on/off, got {v:?}"))
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Switch::Auto => "auto",
+            Switch::On => "on",
+            Switch::Off => "off",
+        }
+    }
+
+    /// On, given whether another mod already does the job.
+    pub fn resolve(self, taken: bool) -> bool {
+        match self {
+            Switch::Auto => !taken,
+            Switch::On => true,
+            Switch::Off => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     // [features]
-    pub ban_pick: bool,
-    pub tier_list: bool,
+    pub ban_pick: Switch,
+    pub tier_list: Switch,
     // [model]
-    /// Pseudo-games at a 50% win rate every champion starts from.
-    pub baseline_games: f32,
-    /// At most this many games of the previous patch carry over into the current one.
-    pub carry_games: f32,
-    /// Share of that carry-over kept for champions named in the current patch notes.
-    pub changed_carry: f32,
-    /// Win-rate shift of the starting point for buffed (+) and nerfed (-) champions.
+    /// Patches the model looks back over, the current one included.
+    pub patches: f32,
+    /// How far a champion's strength may move from one patch to the next (log-odds): untouched,
+    /// and buffed / nerfed in the patch notes.
+    pub drift: f32,
+    pub change: f32,
+    /// Win-rate step the patch notes' direction suggests for buffed (+) and nerfed (-) champions.
     pub patch_shift: f32,
     /// One solo-rank game counts as this many competition games.
     pub solo_weight: f32,
-    /// Games of evidence that give 50% certainty.
-    pub reliability_games: f32,
-    /// Champion ids reworked in the current patch: their previous patch is ignored.
+    /// Champion ids reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
+    /// Prior spreads (log-odds) of the lane, player, mastery and pair effects: how far the data
+    /// must push them away from "no effect".
+    pub roles: f32,
+    pub players: f32,
+    pub mastery: f32,
+    pub pairs: f32,
     // [draft]
     pub pick_strength: f32,
     pub ban_strength: f32,
@@ -45,22 +83,39 @@ pub struct Config {
     pub c_percent: f32,
     /// Champions with fewer than `min_games`: `false` = keep their tier (default), `true` = No Tier.
     pub clear_unranked: bool,
+    // [screen]
+    /// The ban/pick screen overlay: win chance and advice.
+    pub draft_overlay: bool,
+    /// ... the value of every champion on the grid.
+    pub grid_values: bool,
+    /// ... the likely lane of each enemy pick.
+    pub lane_tags: bool,
+    /// The Meta Analysis page in the left menu.
+    pub meta_page: bool,
+    // [report]
+    /// Write `meta_report.html` next to `meta_table.txt`.
+    pub report: bool,
     // [debug]
     pub verbose: bool,
+    /// Write the UI tree of every new screen to `ui_dump_*.txt` (F9 always does).
+    pub explore: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ban_pick: true,
-            tier_list: true,
-            baseline_games: 20.0,
-            carry_games: 40.0,
-            changed_carry: 0.5,
+            ban_pick: Switch::Auto,
+            tier_list: Switch::Auto,
+            patches: 12.0,
+            drift: 0.08,
+            change: 0.3,
             patch_shift: 0.02,
             solo_weight: 0.5,
-            reliability_games: 30.0,
             reworked: Vec::new(),
+            roles: 0.3,
+            players: 0.35,
+            mastery: 0.2,
+            pairs: 0.15,
             pick_strength: 1.0,
             ban_strength: 0.8,
             edge_scale: 0.5,
@@ -70,7 +125,13 @@ impl Default for Config {
             b_percent: 40.0,
             c_percent: 20.0,
             clear_unranked: false,
+            draft_overlay: true,
+            grid_values: true,
+            lane_tags: true,
+            meta_page: true,
+            report: true,
             verbose: false,
+            explore: false,
         }
     }
 }
@@ -78,6 +139,33 @@ impl Default for Config {
 impl Config {
     pub fn is_reworked(&self, champion: &str) -> bool {
         self.reworked.iter().any(|c| c == champion)
+    }
+
+    /// The model's settings.
+    pub fn model(&self) -> crate::meta::Settings {
+        crate::meta::Settings {
+            max_patches: self.patches as usize,
+            drift_sd: self.drift,
+            change_sd: self.change,
+            patch_shift: self.patch_shift,
+            reworked: self.reworked.clone(),
+            role_sd: self.roles,
+            athlete_sd: self.players,
+            mastery_sd: self.mastery,
+            pair_sd: self.pairs,
+            solo_weight: self.solo_weight,
+            ..crate::meta::Settings::default()
+        }
+    }
+
+    /// The AI's bans and picks are nudged (not left to another draft mod).
+    pub fn ban_pick_on(&self) -> bool {
+        self.ban_pick.resolve(crate::compat::get().draft_driver().is_some())
+    }
+
+    /// The tier list is written (not left to another tier mod).
+    pub fn tier_list_on(&self) -> bool {
+        self.tier_list.resolve(crate::compat::get().tier_writer().is_some())
     }
 }
 
@@ -128,15 +216,28 @@ fn number(v: &str) -> Result<f32, String> {
 
 fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
-        "ban_pick" => cfg.ban_pick = flag(value)?,
-        "tier_list" => cfg.tier_list = flag(value)?,
+        "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
+        "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
-        "baseline_games" => cfg.baseline_games = number(value)?,
-        "carry_games" => cfg.carry_games = number(value)?,
-        "changed_carry" => cfg.changed_carry = number(value)?,
+        "report" => cfg.report = flag(value)?,
+        "draft_overlay" => cfg.draft_overlay = flag(value)?,
+        "grid_values" => cfg.grid_values = flag(value)?,
+        "lane_tags" => cfg.lane_tags = flag(value)?,
+        "meta_page" => cfg.meta_page = flag(value)?,
+        "explore" => cfg.explore = flag(value)?,
+        "patches" => cfg.patches = number(value)?.round(),
+        "drift" => cfg.drift = number(value)?,
+        "change" => cfg.change = number(value)?,
         "patch_shift" => cfg.patch_shift = number(value)?,
         "solo_weight" => cfg.solo_weight = number(value)?,
-        "reliability_games" => cfg.reliability_games = number(value)?,
+        "roles" => cfg.roles = number(value)?,
+        "players" => cfg.players = number(value)?,
+        "mastery" => cfg.mastery = number(value)?,
+        "pairs" => cfg.pairs = number(value)?,
+        // 1.x settings of the old model: still accepted, no longer used
+        "baseline_games" | "carry_games" | "changed_carry" | "reliability_games" => {
+            number(value)?;
+        }
         "reworked" => {
             cfg.reworked = value
                 .split(|c: char| c == ',' || c.is_whitespace())
@@ -173,18 +274,12 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
             *value = fallback;
         }
     };
-    let v = cfg.baseline_games;
-    check("baseline_games", &mut cfg.baseline_games, v >= 1.0, d.baseline_games);
-    let v = cfg.carry_games;
-    check("carry_games", &mut cfg.carry_games, v >= 0.0, d.carry_games);
-    let v = cfg.changed_carry;
-    check("changed_carry", &mut cfg.changed_carry, (0.0..=1.0).contains(&v), d.changed_carry);
+    let v = cfg.patches;
+    check("patches", &mut cfg.patches, (1.0..=40.0).contains(&v), d.patches);
     let v = cfg.patch_shift;
     check("patch_shift", &mut cfg.patch_shift, (0.0..=0.2).contains(&v), d.patch_shift);
     let v = cfg.solo_weight;
     check("solo_weight", &mut cfg.solo_weight, v >= 0.0, d.solo_weight);
-    let v = cfg.reliability_games;
-    check("reliability_games", &mut cfg.reliability_games, v > 0.0, d.reliability_games);
     let v = cfg.pick_strength;
     check("pick_strength", &mut cfg.pick_strength, (0.0..=5.0).contains(&v), d.pick_strength);
     let v = cfg.ban_strength;
@@ -193,6 +288,19 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     check("edge_scale", &mut cfg.edge_scale, v > 0.01, d.edge_scale);
     let v = cfg.min_games;
     check("min_games", &mut cfg.min_games, v >= 0.0, d.min_games);
+    for (name, value, fallback) in [
+        ("drift", &mut cfg.drift, d.drift),
+        ("change", &mut cfg.change, d.change),
+        ("roles", &mut cfg.roles, d.roles),
+        ("players", &mut cfg.players, d.players),
+        ("mastery", &mut cfg.mastery, d.mastery),
+        ("pairs", &mut cfg.pairs, d.pairs),
+    ] {
+        if !(0.001..=3.0).contains(value) {
+            warnings.push(format!("{name}={value} is out of range, using {fallback}"));
+            *value = fallback;
+        }
+    }
     for (name, value, fallback) in [
         ("s", &mut cfg.s_percent, d.s_percent),
         ("a", &mut cfg.a_percent, d.a_percent),
@@ -298,18 +406,21 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} tier_list={} baseline_games={} carry_games={} changed_carry={} \
-         patch_shift={} solo_weight={} reliability_games={} reworked=[{}] pick_strength={} \
-         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={}",
-        on(c.ban_pick),
-        on(c.tier_list),
-        c.baseline_games,
-        c.carry_games,
-        c.changed_carry,
+        "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+         reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
+         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
+        c.ban_pick.as_str(),
+        c.tier_list.as_str(),
+        c.patches,
+        c.drift,
+        c.change,
         c.patch_shift,
         c.solo_weight,
-        c.reliability_games,
         c.reworked.join(","),
+        c.roles,
+        c.players,
+        c.mastery,
+        c.pairs,
         c.pick_strength,
         c.ban_strength,
         c.edge_scale,
@@ -318,16 +429,14 @@ pub fn summary(c: &Config) -> String {
         c.a_percent,
         c.b_percent,
         c.c_percent,
-        if c.clear_unranked { "clear" } else { "keep" }
+        if c.clear_unranked { "clear" } else { "keep" },
+        if c.report { "on" } else { "off" },
+        if c.draft_overlay { "on" } else { "off" },
+        if c.grid_values { "on" } else { "off" },
+        if c.lane_tags { "on" } else { "off" },
+        if c.meta_page { "on" } else { "off" },
+        if c.explore { "on" } else { "off" }
     )
-}
-
-fn on(b: bool) -> &'static str {
-    if b {
-        "on"
-    } else {
-        "off"
-    }
 }
 
 /// Written to `settings.ini` when the file does not exist.
@@ -342,46 +451,63 @@ pub const TEMPLATE: &str = r#"; ================================================
 ;             AI 的 ban/pick 参考当前版本的真实胜负数据
 ; tier_list : your team's champion tier list is kept up to date automatically
 ;             自动维护你队伍的英雄梯队
-ban_pick=on
-tier_list=on
+; auto = on, unless another enabled mod already does it (Drafter's Toolbox writes tiers,
+;        Terminator Draft AI drives the AI's draft); on / off = always / never
+; auto = 默认开启；若已启用其他做同样事情的 Mod（Drafter's Toolbox 写梯队、Terminator Draft AI
+;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关
+ban_pick=auto
+tier_list=auto
 
 [model]
-; Every champion's win rate is estimated per in-game patch:
-;   start  = baseline_games at 50%, plus up to carry_games of the previous patch at the rate
-;            they had, moved by patch_shift when the patch notes buffed or nerfed the champion
-;   update = this patch's competition games + solo-rank games * solo_weight
-; 每个英雄的胜率按游戏内版本单独估计：
-;   起点 = baseline_games 场 50% 的虚拟对局 + 上个版本最多 carry_games 场的实际战绩，
-;          补丁公告加强/削弱的英雄再上调/下调 patch_shift
-;   更新 = 本版本大会对局 + 单排对局 × solo_weight
-baseline_games=20
-carry_games=40
-; share of the carry-over kept for champions named in the patch notes / 被调整英雄保留的比例
-changed_carry=0.5
+; One model is fitted to every match of the last `patches` patches (competition, plus solo
+; rank counted as solo_weight of a match). It rates at the same time
+;   - each champion's strength in each patch: from one patch to the next it may move about
+;     `drift` (untouched) or `change` (buffed / nerfed in the patch notes, moved by patch_shift
+;     in that direction) - so games from before a balance change still count, just less;
+;   - each champion's strength in each lane (`roles`);
+;   - each player's own strength and their mastery of each champion (`players`, `mastery`):
+;     a champion is not rated up just because the best team plays it;
+;   - synergy between allies and matchups between opponents (`pairs`).
+; Larger values let the data move an effect further from "no effect" (log-odds).
+; 用最近 patches 个版本的全部比赛（大会 + 单排×solo_weight）拟合一个模型，同时估计：
+;   - 每个英雄在每个版本的强度：相邻版本间未改动的英雄最多变化约 drift，被加强/削弱的
+;     最多约 change（并按 patch_shift 朝改动方向预移）——改动前的比赛仍然计入，只是权重变小；
+;   - 英雄在每个位置的强度（roles）；
+;   - 选手本人的实力和对每个英雄的熟练度（players、mastery）：不会因为强队爱用就高估某英雄；
+;   - 队友配合与对位克制（pairs）。
+; 数值越大，数据越容易把该效应推离"无影响"（对数几率）。
+patches=12
+drift=0.08
+change=0.3
 patch_shift=0.02
 solo_weight=0.5
-; games of evidence for 50% certainty / 置信度达到一半所需的场次
-reliability_games=30
-; champion ids reworked this patch (previous patch ignored), comma separated
-; 本版本重做的英雄 id，忽略其上个版本数据，逗号分隔，例如 reworked=fighter, demon
+; champion ids reworked this patch (history barely counts), comma separated
+; 本版本重做的英雄 id（历史数据几乎不计），逗号分隔，例如 reworked=fighter, demon
 reworked=
+roles=0.3
+players=0.35
+mastery=0.2
+pairs=0.15
 
 [draft]
-; How hard the estimate pushes the AI's own draft scores.
-;   edge  = log-odds of the estimated win rate (0 at 50%)
-;   value = tanh(edge / edge_scale) * certainty
-;   pick  : + value * pick_strength
-;   ban   : + value * ban_strength, and strong champions that are played a lot get up to
-;           twice as much (rarely seen ones half) - bans go where they hurt the opponent
-; 估计值推动 AI 原有评分的力度。ban 时，强势且出场多的英雄权重最高翻倍，冷门英雄减半。
+; How hard the model pushes the AI's own draft scores. For each candidate the model works out
+; what it is worth in this draft: its strength in the best lane still open + synergy with the
+; picks already made + matchups against the enemy's picks - a cost for one-sided damage
+; (bans: its worth to the enemy, more for champions played or banned a lot).
+;   pick : + tanh(value / edge_scale) * pick_strength
+;   ban  : + tanh(value / edge_scale) * ban_strength
+; 模型对 AI 原有评分的影响力度。每个候选英雄按本局局面估值：剩余位置中的最佳强度 + 与已选
+; 队友的配合 + 对已选敌人的克制 - 伤害类型单一的惩罚（ban：对敌方的价值，热门英雄更高）。
 pick_strength=1.0
 ban_strength=0.8
 edge_scale=0.5
 
 [tiers]
-; Ranked champions (at least min_games of evidence) are sorted by a cautious estimate
-; (win rate minus one standard error) and split by share: s% S, a% A, b% B, c% C, the rest D.
-; 证据场次达到 min_games 的英雄按保守估计（胜率减一个标准误）排序，按比例分为 S/A/B/C/D。
+; Ranked champions (at least min_games recent games: this patch's, plus each earlier patch's
+; at half the weight of the one after it) are sorted by a cautious estimate (strength minus
+; one standard error) and split by share: s% S, a% A, b% B, c% C, the rest D.
+; 近期场次（本版本场次 + 往前每个版本减半计）达到 min_games 的英雄按保守估计（强度减一个
+; 标准误）排序，按比例分为 S/A/B/C/D。
 ; The list is written whenever it changes and shows from the next in-game day.
 ; 梯队变化时写入，游戏内第二天显示；手动修改会在数据变化时被覆盖。
 min_games=10
@@ -393,7 +519,29 @@ c=20
 ;            证据不足的英雄：keep = 保持原梯队，clear = 设为无梯队
 unranked=keep
 
+[screen]
+; On the ban/pick screen / 选人界面:
+; draft_overlay : win chance (bottom left) and the best picks and bans for you (bottom right)
+;                 左下角显示阵容胜率，右下角显示当前最佳选择与禁用
+; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
+;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
+; lane_tags     : on each enemy pick, its most likely lane / 敌方每个已选英雄最可能的位置
+; meta_page     : a "Meta Analysis" page in the left menu (champions, duos, players, model)
+;                 左侧菜单里的"版本分析"页面（英雄、组合、选手、模型）
+draft_overlay=on
+grid_values=on
+lane_tags=on
+meta_page=on
+
+[report]
+; meta_report.html in the mod folder: tiers, lane win rates, synergies, matchups, players
+; Mod 文件夹里的 meta_report.html：梯队、分位置胜率、配合、克制、选手熟练度（用浏览器打开）
+report=on
+
 [debug]
+; explore : write the UI tree of every new screen to ui_dump_*.txt (F9 writes one any time)
+;           把每个新界面的 UI 结构写入 ui_dump_*.txt（任何时候按 F9 也会写一份）
+explore=off
 ; more detail in diag.log / diag.log 写更多细节
 verbose=off
 "#;
@@ -413,16 +561,28 @@ mod tests {
     fn values_lists_and_bad_lines() {
         let text = "\u{feff}[features]\nban_pick = off ; comment\npatch_shift=0,03\n\
                     reworked=fighter, demon  ninja\nunranked=clear\ns=15%\nedge_scale=-1\n\
-                    bogus=1\nchanged_carry=2\njunk line\n";
+                    bogus=1\nchange=9\njunk line\ncarry_games=40\n";
         let (cfg, warnings) = parse(text);
-        assert!(!cfg.ban_pick && cfg.tier_list);
+        assert!(cfg.ban_pick == Switch::Off && cfg.tier_list == Switch::Auto);
         assert!((cfg.patch_shift - 0.03).abs() < 1e-6);
         assert_eq!(cfg.reworked, ["fighter", "demon", "ninja"]);
         assert!(cfg.clear_unranked && cfg.is_reworked("demon"));
         assert_eq!(cfg.s_percent, 15.0);
         assert_eq!(cfg.edge_scale, 0.5);
-        assert_eq!(cfg.changed_carry, 0.5);
+        assert_eq!(cfg.change, 0.3);
         assert_eq!(warnings.len(), 4, "{warnings:?}");
+    }
+
+    #[test]
+    fn auto_steps_aside_for_another_mod() {
+        assert!(Switch::Auto.resolve(false) && !Switch::Auto.resolve(true));
+        assert!(Switch::On.resolve(true) && !Switch::Off.resolve(false));
+        let (cfg, warnings) = parse("tier_list=AUTO
+ban_pick=yes
+");
+        assert!(warnings.is_empty());
+        assert_eq!((cfg.tier_list, cfg.ban_pick), (Switch::Auto, Switch::On));
+        assert_eq!(parse("tier_list=maybe").1.len(), 1);
     }
 
     #[test]

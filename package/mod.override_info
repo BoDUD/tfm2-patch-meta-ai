@@ -1,0 +1,6 @@
+{
+  "asset/base/text/ui": {
+    "remapping": "asset/patch_meta_ai/text/ui",
+    "type": "merge"
+  }
+}

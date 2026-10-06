@@ -1,16 +1,17 @@
-//! Ban/pick score hook. The game scores every candidate itself; this adds the model's
-//! adjustment, computed at the last rebuild (see `client`):
+//! Ban/pick score hook. The game scores every candidate itself (lanes, its players' champion
+//! pools); this adds what the meta model says about the candidate *in this draft* (`advisor`):
 //!
-//! - **pick**: `value * pick_strength`;
-//! - **ban**: `value * ban_strength`, times the presence factor for strong champions (strong and
-//!   played everywhere = up to twice, strong but rarely seen = half). Weak champions get a lower
-//!   ban score, so bans are not spent on them.
+//! - **pick**: its strength in the best lane still open, its synergy with the picks already on
+//!   the team, its matchups against the enemy's picks, and a cost for one-sided damage;
+//! - **ban**: what it would be worth to the enemy, weighted by how often it is played or banned.
 //!
-//! `value` is in [-1, 1]: tanh of the champion's log-odds edge, times how sure the estimate is.
+//! The value (log-odds) goes through `tanh(value / edge_scale)` so one extreme estimate cannot
+//! swamp the game's own reasoning, then `pick_strength` / `ban_strength` scale it.
 
 use mod_api_stable::{StableDraftContext, StableDraftDecision, StableDraftHook};
 
-use crate::{config, model, shared};
+use crate::shared::Snapshot;
+use crate::{advisor, config, shared};
 
 pub struct MetaDraftHook;
 
@@ -20,25 +21,44 @@ impl StableDraftHook for MetaDraftHook {
     }
 
     fn score_ban(&self, ctx: &StableDraftContext<'_>, candidate: usize, _base: f32) -> StableDraftDecision {
-        adjust(ctx, candidate, |t| &t.ban)
+        score(ctx, candidate, true)
     }
 
     fn score_pick(&self, ctx: &StableDraftContext<'_>, candidate: usize, _base: f32) -> StableDraftDecision {
-        adjust(ctx, candidate, |t| &t.pick)
+        score(ctx, candidate, false)
     }
 }
 
-fn adjust(
-    ctx: &StableDraftContext<'_>,
-    candidate: usize,
-    table: impl Fn(&shared::Tables) -> &std::collections::HashMap<String, f32>,
-) -> StableDraftDecision {
-    if !config::get().ban_pick {
+fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDraftDecision {
+    let cfg = config::get();
+    if !cfg.ban_pick_on() {
         return StableDraftDecision::Pass;
     }
-    let Some(name) = ctx.champion_name(candidate) else { return StableDraftDecision::Pass };
-    let Some(tables) = shared::get() else { return StableDraftDecision::Pass };
-    decision(table(&tables).get(name).copied().unwrap_or(0.0))
+    let Some(snapshot) = shared::get() else { return StableDraftDecision::Pass };
+    let ids = |list: &[usize]| -> Vec<u16> {
+        list.iter().filter_map(|id| ctx.champion_name(*id)).filter_map(|n| snapshot.meta.names.get(n)).collect()
+    };
+    let Some(cand) = ctx.champion_name(candidate).and_then(|n| snapshot.meta.names.get(n)) else {
+        return StableDraftDecision::Pass;
+    };
+    let value = value(&snapshot, cand, &ids(ctx.ally_picks()), &ids(ctx.enemy_picks()), ban);
+    let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
+    decision(amount(value, cfg.edge_scale, strength))
+}
+
+/// The model's value (log-odds) of picking or banning `cand` in this draft.
+pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool) -> f32 {
+    let damage = |c: u16| snapshot.damage_of(c);
+    if ban {
+        advisor::ban_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
+    } else {
+        advisor::pick_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
+    }
+}
+
+/// What is added to the game's score.
+pub fn amount(value: f32, edge_scale: f32, strength: f32) -> f32 {
+    (value / edge_scale).tanh() * strength
 }
 
 pub fn decision(v: f32) -> StableDraftDecision {
@@ -49,32 +69,15 @@ pub fn decision(v: f32) -> StableDraftDecision {
     }
 }
 
-/// The amounts published for one champion: (pick, ban).
-pub fn amounts(cfg: &config::Config, value: f32, presence: f32, typical_presence: f32) -> (f32, f32) {
-    let pick = value * cfg.pick_strength;
-    let ban = if value > 0.0 {
-        value * cfg.ban_strength * model::presence_factor(presence, typical_presence)
-    } else {
-        value * cfg.ban_strength
-    };
-    (pick, ban)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
-    fn pick_and_ban_amounts() {
-        let cfg = Config::default();
-        let (pick, ban) = amounts(&cfg, 0.5, 0.3, 0.15);
-        assert!((pick - 0.5).abs() < 1e-6);
-        assert!((ban - 0.5 * 0.8 * 2.0).abs() < 1e-6, "strong and everywhere: double");
-        let (_, rare) = amounts(&cfg, 0.5, 0.01, 0.15);
-        assert!((rare - 0.5 * 0.8 * 0.5).abs() < 1e-6, "strong but rarely seen: half");
-        let (pick, ban) = amounts(&cfg, -0.4, 0.3, 0.15);
-        assert!((pick + 0.4).abs() < 1e-6 && (ban + 0.32).abs() < 1e-6, "weak: lower, no presence");
+    fn amounts_are_bounded() {
+        assert!((amount(0.25, 0.5, 1.0) - 0.5f32.tanh()).abs() < 1e-6);
+        assert!(amount(10.0, 0.5, 0.8) <= 0.8 + 1e-6);
+        assert!(amount(-0.3, 0.5, 1.0) < 0.0);
     }
 
     #[test]
