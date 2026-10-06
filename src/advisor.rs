@@ -390,10 +390,10 @@ mod tests {
                 for side in &mut sides {
                     for r in Role::ALL {
                         let champ = (r.index() as f32 * 25.0 + rng.next() * 30.0) as u16 % 130;
-                        side.push(Slot { champ, role: Some(r), athlete: Some((rng.next() * 200.0) as u32) });
+                        side.push(Slot { champ, role: Some(r), athlete: Some((rng.next() * 200.0) as u32), lane_gold: None });
                     }
                 }
-                Game { record: id, solo: false, version: "1.1".into(), blue_win: rng.next() < 0.5, teams: [None, None], sides, bans: [vec![], vec![]], length: None }
+                Game { record: id, solo: false, version: "1.1".into(), blue_win: rng.next() < 0.5, teams: [None, None], sides, bans: [vec![], vec![]], length: None, tactics: Default::default() }
             })
             .collect();
         let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());

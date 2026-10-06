@@ -9,7 +9,12 @@
 //! - **players**: each athlete's own strength (so a champion is not rated up for being played by
 //!   the best team), and each athlete's mastery of each champion;
 //! - **pairs**: synergy between allies and the matchup between opponents;
-//! - **side**: the blue-side advantage.
+//! - **side**: the blue-side advantage;
+//! - **team strategy**: each strategy choice (early jungle, minion wave, closing out...), and how
+//!   much better or worse it works with each champion on the team (strongly shrunk).
+//!
+//! Besides the fit, the average gold lead at the end of the lane phase of every pair of direct
+//! lane opponents is counted.
 //!
 //! Every parameter has a Gaussian prior around 0, so anything seen in few games stays close to
 //! "average". A champion's displayed win rate is `sigmoid(strength)`: how often a team with it
@@ -43,6 +48,8 @@ pub struct Settings {
     pub pair_sd: f32,
     pub solo_weight: f32,
     pub side_sd: f32,
+    pub tactic_sd: f32,
+    pub tactic_champ_sd: f32,
 }
 
 impl Default for Settings {
@@ -60,6 +67,8 @@ impl Default for Settings {
             pair_sd: 0.15,
             solo_weight: 0.5,
             side_sd: 0.3,
+            tactic_sd: 0.15,
+            tactic_champ_sd: 0.08,
         }
     }
 }
@@ -75,6 +84,10 @@ pub enum Key {
     Synergy(u16, u16),
     /// Opponents, smaller id first; positive = the first one wins the matchup.
     Counter(u16, u16),
+    /// A team-strategy choice (`history::tactic_id`).
+    Tactic(u16),
+    /// A strategy choice with a champion on the team.
+    TacticChamp(u16, u16),
 }
 
 /// Ordered pair key and the sign for "a with/against b".
@@ -183,6 +196,12 @@ pub struct Meta {
     pub mastery: HashMap<(u32, u16), Effect>,
     pub synergy: HashMap<(u16, u16), Effect>,
     pub counter: HashMap<(u16, u16), Effect>,
+    /// Team-strategy choices and their pairing with champions.
+    pub tactics: HashMap<u16, Effect>,
+    pub tactic_champ: HashMap<(u16, u16), Effect>,
+    /// Gold lead at the end of the lane phase of the first champion over the second when they
+    /// faced each other in the same lane: (sum, games), smaller id first.
+    pub lane_gold: HashMap<(u16, u16), (f64, u32)>,
     /// Matches this patch (competition), and all kept matches.
     pub current_matches: u32,
     pub matches: u32,
@@ -219,6 +238,28 @@ impl Meta {
             e.tally.wins = e.tally.games - e.tally.wins;
         }
         e
+    }
+
+    /// Average lane-phase gold lead of `a` over `b` in their lane, and the games behind it.
+    pub fn lane_gold(&self, a: u16, b: u16) -> Option<(f32, u32)> {
+        let (key, sign) = pair(a, b);
+        let (sum, n) = *self.lane_gold.get(&key)?;
+        (n > 0).then(|| ((sum / n as f64) as f32 * sign, n))
+    }
+
+    /// A champion's average lane-phase gold lead over its lane opponents.
+    pub fn lane_gold_of(&self, a: u16) -> Option<(f32, u32)> {
+        let (mut sum, mut n) = (0.0f64, 0u32);
+        for ((x, y), (s, g)) in &self.lane_gold {
+            if *x == a {
+                sum += s;
+                n += g;
+            } else if *y == a {
+                sum -= s;
+                n += g;
+            }
+        }
+        (n > 0).then(|| ((sum / n as f64) as f32, n))
     }
 
     pub fn mastery(&self, athlete: u32, champ: u16) -> Effect {
@@ -296,6 +337,14 @@ fn game_terms(game: &Game, version: u16, out: &mut Vec<(Key, f32)>) {
             out.push((Key::Counter(x, y), s));
         }
     }
+    for (side, sign) in [(0usize, 1.0f32), (1, -1.0)] {
+        for t in &game.tactics[side] {
+            out.push((Key::Tactic(*t), sign));
+            for s in &game.sides[side] {
+                out.push((Key::TacticChamp(*t, s.champ), sign));
+            }
+        }
+    }
 }
 
 pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
@@ -328,6 +377,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     // rows
     let mut rows = Vec::new();
     let mut tallies: HashMap<Key, Tally> = HashMap::new();
+    let mut lane_gold: HashMap<(u16, u16), (f64, u32)> = HashMap::new();
     let mut per_version: Vec<HashMap<u16, Tally>> = vec![HashMap::new(); versions.len()];
     let mut picks: HashMap<u16, u32> = HashMap::new();
     let mut bans: HashMap<u16, u32> = HashMap::new();
@@ -380,6 +430,23 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
                 // the tally is from x's point of view
                 let x_won = if sign > 0.0 { game.blue_win } else { !game.blue_win };
                 tallies.entry(Key::Counter(x, y)).or_default().add(x_won);
+                // direct lane opponents: the gold lead at the end of the lane phase
+                if let (Some(rb), Some(rr), Some(gb), Some(gr)) = (b.role, r.role, b.lane_gold, r.lane_gold) {
+                    if rb == rr {
+                        let e = lane_gold.entry((x, y)).or_insert((0.0, 0));
+                        e.0 += (gb - gr) as f64 * sign as f64;
+                        e.1 += 1;
+                    }
+                }
+            }
+        }
+        for (side_i, tactics) in game.tactics.iter().enumerate() {
+            let won = game.won(side_i);
+            for t in tactics {
+                tallies.entry(Key::Tactic(*t)).or_default().add(won);
+                for s in &game.sides[side_i] {
+                    tallies.entry(Key::TacticChamp(*t, s.champ)).or_default().add(won);
+                }
             }
         }
         if vi == cur_index && !game.solo {
@@ -426,6 +493,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::Athlete(_) => set.athlete_sd,
             Key::Mastery(..) => set.mastery_sd,
             Key::Synergy(..) | Key::Counter(..) => set.pair_sd,
+            Key::Tactic(_) => set.tactic_sd,
+            Key::TacticChamp(..) => set.tactic_champ_sd,
         };
         problem.prior(i as u32, 0.0, sd);
     }
@@ -521,9 +590,16 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::Counter(a, b) => {
                 out.counter.insert((a, b), effect(*key));
             }
+            Key::Tactic(t) => {
+                out.tactics.insert(t, effect(*key));
+            }
+            Key::TacticChamp(t, c) => {
+                out.tactic_champ.insert((t, c), effect(*key));
+            }
             _ => {}
         }
     }
+    out.lane_gold = lane_gold;
     out.names = names;
     out.keys = reg.keys;
     out.beta = fit.beta;
@@ -631,7 +707,7 @@ pub(crate) mod tests {
                 part.iter()
                     .zip(who)
                     .enumerate()
-                    .map(|(i, (c, a))| Slot { champ: *c, role: Some(Role::ALL[i]), athlete: Some(*a) })
+                    .map(|(i, (c, a))| Slot { champ: *c, role: Some(Role::ALL[i]), athlete: Some(*a), lane_gold: None })
                     .collect()
             };
             let blue = side(&ids[..5], &athletes[..5]);
@@ -658,6 +734,7 @@ pub(crate) mod tests {
                 sides: [blue, red],
                 bans: [vec![ids[10]], vec![ids[11]]],
                 length: None,
+                tactics: Default::default(),
             });
         }
         (names, games)
@@ -750,6 +827,42 @@ pub(crate) mod tests {
         assert!(bt.accuracy > 0.55, "{bt:?}");
     }
 
+    #[test]
+    fn strategies_that_win_and_lane_gold() {
+        let (names, mut games) = simulate(2500, "1.1", |_| 0.0, 17);
+        let (good, bad) = (crate::history::tactic_id("early_jungle", "test_ganking"), crate::history::tactic_id("early_jungle", "test_farming"));
+        let mut rng = Lcg(5);
+        for g in &mut games {
+            // each side picks one of two options; "ganking" wins 60% when the sides differ
+            let blue_good = rng.next() < 0.5;
+            let red_good = rng.next() < 0.5;
+            g.tactics = [vec![if blue_good { good } else { bad }], vec![if red_good { good } else { bad }]];
+            if blue_good != red_good {
+                g.blue_win = rng.next() < if blue_good { 0.6 } else { 0.4 };
+            }
+            // lane gold: champion "a" always leads its lane opponent by 300
+            for side in 0..2 {
+                for s in &mut g.sides[side] {
+                    s.lane_gold = Some(if names.name(s.champ) == "a" { 3300 } else { 3000 });
+                }
+            }
+        }
+        let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        let meta = build(
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Settings::default(),
+        );
+        let (g, b) = (meta.tactics[&good].value, meta.tactics[&bad].value);
+        assert!(g - b > 0.15, "the winning option rates higher: {g} vs {b}");
+        let a = meta.names.get("a").unwrap();
+        let (lead, n) = meta.lane_gold_of(a).unwrap();
+        assert!((lead - 300.0).abs() < 1.0 && n > 100, "{lead} over {n}");
+        let other = meta.names.get("b").unwrap();
+        if let Some((vs, _)) = meta.lane_gold(other, a) {
+            assert!((vs + 300.0).abs() < 1.0);
+        }
+    }
+
     /// `cargo test --release -- --ignored --nocapture fit_time`: a save-sized fit.
     #[test]
     #[ignore]
@@ -770,7 +883,14 @@ pub(crate) mod tests {
                 for r in Role::ALL {
                     // each lane draws from its own 30 champions
                     let champ = (r.index() as f32 * 25.0 + rng.next() * 30.0) as u16 % 130;
-                    sides[side].push(Slot { champ, role: Some(r), athlete: Some(t * 5 + r.index() as u32) });
+                    sides[side].push(Slot { champ, role: Some(r), athlete: Some(t * 5 + r.index() as u32), lane_gold: None });
+                }
+            }
+            // 13 strategy settings per side, three options each
+            let mut tactics: [Vec<u16>; 2] = Default::default();
+            for side in &mut tactics {
+                for k in 0..13 {
+                    side.push(crate::history::tactic_id(&format!("s{k}"), &format!("o{}", (rng.next() * 3.0) as u32)));
                 }
             }
             games.push(Game {
@@ -782,6 +902,7 @@ pub(crate) mod tests {
                 sides,
                 bans: [vec![], vec![]],
                 length: None,
+                tactics,
             });
         }
         let started = std::time::Instant::now();
@@ -813,6 +934,7 @@ pub(crate) mod tests {
             sides: [vec![], vec![]],
             bans: [vec![], vec![]],
             length: None,
+            tactics: Default::default(),
         };
         let games = [g("1.9"), g("1.10"), g("1.8"), g("2.0")];
         assert_eq!(kept_versions(&games, "1.10", 2), ["1.9", "1.10"]);

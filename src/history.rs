@@ -3,6 +3,7 @@
 //! (`meta`) is fitted from this list; nothing else is kept per game.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
@@ -102,14 +103,34 @@ impl Names {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Slot {
     pub champ: u16,
     pub role: Option<Role>,
     pub athlete: Option<u32>,
+    /// Gold at the end of the lane phase.
+    pub lane_gold: Option<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Team-strategy choices ("setting=option") <-> small ids, shared by every save and thread.
+static TACTICS: Mutex<Option<Names>> = Mutex::new(None);
+
+/// The id of a strategy choice.
+pub fn tactic_id(setting: &str, option: &str) -> u16 {
+    TACTICS.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(Names::default).id(&format!("{setting}={option}"))
+}
+
+/// The setting and option of a strategy choice id.
+pub fn tactic(id: u16) -> (String, String) {
+    let guard = TACTICS.lock().unwrap_or_else(PoisonError::into_inner);
+    let text = guard.as_ref().map_or("?", |n| n.name(id)).to_string();
+    match text.split_once('=') {
+        Some((s, o)) => (s.to_string(), o.to_string()),
+        None => (text, String::new()),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Game {
     /// The record it came from.
     pub record: usize,
@@ -120,8 +141,10 @@ pub struct Game {
     pub teams: [Option<u32>; 2],
     pub sides: [Vec<Slot>; 2],
     pub bans: [Vec<u16>; 2],
-    /// Game length in seconds, when the record says.
+    /// Game length in ticks, when the record says.
     pub length: Option<f32>,
+    /// Each side's team strategy ([`tactic_id`]s).
+    pub tactics: [Vec<u16>; 2],
 }
 
 impl Game {

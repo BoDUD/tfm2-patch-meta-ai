@@ -252,6 +252,7 @@ impl Scanner {
                     champ: names.id(&p.champion),
                     role: p.position.as_deref().and_then(Role::parse),
                     athlete: p.athlete,
+                    lane_gold: p.lane_gold,
                 })
                 .collect()
         };
@@ -266,7 +267,11 @@ impl Scanner {
                 m.bans[0].iter().map(|b| names.id(b)).collect(),
                 m.bans[1].iter().map(|b| names.id(b)).collect(),
             ],
-            length: None,
+            length: m.length.map(|t| t as f32),
+            tactics: [
+                m.strategies[0].iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect(),
+                m.strategies[1].iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect(),
+            ],
         };
         self.games.insert(key, game);
         let stats = self.versions.entry(m.version.clone()).or_default();

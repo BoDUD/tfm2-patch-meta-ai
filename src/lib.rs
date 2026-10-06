@@ -30,6 +30,7 @@ pub mod model;
 mod paths;
 pub mod patchnotes;
 mod perf;
+pub mod plan;
 pub mod poslock;
 pub mod records;
 pub mod report;
