@@ -220,13 +220,6 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
-        // the position lock moved to its own mod (Smart Position Lock): still accepted, unused
-        "position_lock" => {
-            Switch::parse(value)?;
-        }
-        "lock_min_games" | "lock_share" => {
-            number(value)?;
-        }
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
