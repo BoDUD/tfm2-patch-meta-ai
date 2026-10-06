@@ -9,7 +9,9 @@
 //!   ways (each opens that champion), its strength over the kept patches and the players who
 //!   play it best;
 //! - **Duos & Matchups**, **Players** (the player's line-up and the next opponent's, with each
-//!   player's best champions now), **Model** (how well it predicts).
+//!   player's best champions now and what to practise), **Patch Changes** (who rose and fell
+//!   since the last patch, and what the patch notes' changes really did), **Model** (how well
+//!   it predicts).
 //!
 //! Everything sits under `main` (the screen root has no automatic layout, unlike the left
 //! menu, which stacks its children). Another screen or tab (any of the game's menu entries), Esc,
@@ -59,6 +61,7 @@ const DIM: u32 = 0xa3a9b6ff;
 const GOOD: u32 = 0x4cc38aff;
 const BAD: u32 = 0xef6471ff;
 const ACCENT: u32 = 0x37d5b3ff;
+const GOLD: u32 = 0xf2c14eff;
 const LIT: u32 = 0xecfbf8ff;
 const LIT_TEXT: u32 = 0x0f5b4dff;
 
@@ -223,6 +226,7 @@ pub enum View {
     Champion(u16),
     Pairs,
     Players,
+    Patch,
     Model,
 }
 
@@ -264,8 +268,13 @@ const SORT_IDS: [(Sort, &str); 8] = [
     (Sort::Presence, "presence"),
 ];
 
-const TABS: [(&str, &str, &str); 4] =
-    [("champions", "tab_champions", "Champions"), ("pairs", "tab_pairs", "Synergy & Matchups"), ("players", "tab_players", "Players"), ("model", "tab_model", "Model")];
+const TABS: [(&str, &str, &str); 5] = [
+    ("champions", "tab_champions", "Champions"),
+    ("pairs", "tab_pairs", "Synergy & Matchups"),
+    ("players", "tab_players", "Players"),
+    ("patch", "tab_patch", "Patch Changes"),
+    ("model", "tab_model", "Model"),
+];
 
 pub struct MetaPage {
     open: bool,
@@ -443,6 +452,7 @@ impl MetaPage {
             self.view = match tab {
                 "pairs" => View::Pairs,
                 "players" => View::Players,
+                "patch" => View::Patch,
                 "model" => View::Model,
                 _ => View::Champions,
             };
@@ -532,6 +542,7 @@ impl MetaPage {
             View::Champion(c) => champion_source(&mut t, meta, &tiers, c, context),
             View::Pairs => pairs_source(&mut t, meta),
             View::Players => players_source(&mut t, meta, context, opponent),
+            View::Patch => patch_source(&mut t, meta),
             View::Model => (model_source(&mut t, meta, context), Vec::new(), Vec::new()),
         };
         if !ui.spawn(SCREEN, &format!("body:empty {{ width: 100%; height: 100%; {tabs}{inner}}}")) {
@@ -718,6 +729,7 @@ fn tabs_source<U: Ui>(t: &mut Texts<'_, U>, view: View) -> String {
         View::Champions | View::Champion(_) => "champions",
         View::Pairs => "pairs",
         View::Players => "players",
+        View::Patch => "patch",
         View::Model => "model",
     };
     let mut tabs = String::new();
@@ -932,7 +944,7 @@ fn champ_list(
     y: i32,
     w: u32,
     title: &str,
-    items: &[(u16, f32, u32)],
+    items: &[(u16, f32, u32, Option<f32>)],
     meta: &Meta,
     icons: &mut Vec<Icon>,
     links: &mut Vec<(String, u16)>,
@@ -943,12 +955,17 @@ fn champ_list(
     if items.is_empty() {
         inner.push_str(&label("none", 20, 56, w - 40, 24, 14, DIM, "Left", empty));
     }
-    for (k, (c, v, g)) in items.iter().take(LIST_ROWS).enumerate() {
+    for (k, (c, v, g, gold)) in items.iter().take(LIST_ROWS).enumerate() {
         let y0 = 48 + k as i32 * 48;
+        // the lane-phase gold lead, in gold, when the two met in a lane
+        let gold = gold.map_or(String::new(), |d| {
+            label("gold", w as i32 - 250, 16, 80, 18, 13, GOLD, "Right", &format!("{}{d:.0}", if d >= 0.0 { "+" } else { "" }))
+        });
         let row = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             portrait("face", 20, 4, 40),
-            label("name", 70, 14, w - 230, 20, 16, TEXT, "Left", &name_ref(meta.names.name(*c))),
+            label("name", 70, 14, w - 330, 20, 16, TEXT, "Left", &name_ref(meta.names.name(*c))),
+            gold,
             label("v", w as i32 - 160, 14, 80, 20, 16, tone(*v), "Right", &signed(*v)),
             label("g", w as i32 - 70, 16, 50, 18, 13, DIM, "Right", &format!("{g}")),
         );
@@ -1028,21 +1045,21 @@ fn champion_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, tiers: &HashMap<Str
     }
     s.push_str(&rect("lanes", 0, 192, 1600, 156, PANEL, 12, &lanes));
     // team-mates and matchups
-    let mut with: Vec<(u16, f32, u32)> = meta
+    let mut with: Vec<(u16, f32, u32, Option<f32>)> = meta
         .synergy
         .iter()
         .filter(|((a, b), e)| (*a == champ || *b == champ) && e.tally.games >= 2)
-        .map(|((a, b), e)| (if *a == champ { *b } else { *a }, pts(e.value), e.tally.games))
+        .map(|((a, b), e)| (if *a == champ { *b } else { *a }, pts(e.value), e.tally.games, None))
         .collect();
     with.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut against: Vec<(u16, f32, u32)> = meta
+    let mut against: Vec<(u16, f32, u32, Option<f32>)> = meta
         .counter
         .keys()
         .filter(|(a, b)| *a == champ || *b == champ)
         .map(|(a, b)| {
             let other = if *a == champ { *b } else { *a };
             let e: Effect = meta.counter(champ, other);
-            (other, pts(e.value), e.tally.games)
+            (other, pts(e.value), e.tally.games, meta.lane_gold(champ, other).map(|(d, _)| d))
         })
         .filter(|x| x.2 >= 2)
         .collect();
@@ -1167,6 +1184,8 @@ fn players_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context, o
     ];
     let own_caption = t.get("own", "Own Strength");
     let no_roster = t.get("no_roster", "No line-up seen yet.");
+    let train_caption = t.get("train", "Practise");
+    let infos = super::athlete_infos();
     for (k, (id, title, team)) in teams.iter().enumerate() {
         let x = k as i32 * 810;
         let roster = team.as_ref().and_then(|tm| context.rosters.get(tm)).cloned().unwrap_or_default();
@@ -1192,16 +1211,68 @@ fn players_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context, o
             card.push_str(&bold("ownv", 680, 12, 60, 28, 20, tone(pts(skill.value)), "Right", &signed(pts(skill.value))));
             for (j, (c, v, g)) in best_for(meta, *a, *role, 5).iter().enumerate() {
                 let cx = 16 + j as i32 * 146;
-                card.push_str(&portrait(&format!("c{j}"), cx, 52, 56));
-                card.push_str(&bold(&format!("v{j}"), cx + 62, 56, 80, 24, 18, TEXT, "Left", &format!("{:.0}%", sigmoid(*v) * 100.0)));
-                card.push_str(&label(&format!("g{j}"), cx + 62, 82, 80, 20, 12, DIM, "Left", &format!("{g}g")));
-                icons.push((format!("{id}.p{p}.c{j}.icon"), meta.names.name(*c).to_string(), 52.0));
+                card.push_str(&portrait(&format!("c{j}"), cx, 46, 52));
+                card.push_str(&bold(&format!("v{j}"), cx + 58, 48, 80, 24, 18, TEXT, "Left", &format!("{:.0}%", sigmoid(*v) * 100.0)));
+                card.push_str(&label(&format!("g{j}"), cx + 58, 74, 80, 20, 12, DIM, "Left", &format!("{g}g")));
+                icons.push((format!("{id}.p{p}.c{j}.icon"), meta.names.name(*c).to_string(), 48.0));
+            }
+            // the own team: what each player gains most from practising
+            if *id == "mine" {
+                if let (Some(info), Some(r)) = (infos.get(a), role.or_else(|| infos.get(a).and_then(|i| i.main_position()))) {
+                    let plan = crate::plan::training_for(meta, info, r, 3);
+                    if !plan.is_empty() {
+                        card.push_str(&label("train", 16, 110, 120, 28, 14, ACCENT, "Left", &train_caption));
+                        for (j, (c, _, prof)) in plan.iter().enumerate() {
+                            let cx = 140 + j as i32 * 206;
+                            card.push_str(&label(&format!("t{j}"), cx, 110, 130, 28, 14, TEXT, "Left", &name_ref(meta.names.name(*c))));
+                            card.push_str(&label(&format!("tp{j}"), cx + 130, 110, 66, 28, 12, DIM, "Left", &format!("{prof}")));
+                        }
+                    }
+                }
             }
             inner.push_str(&rect(&format!("p{p}"), 16, y0, 758, 148, SLOT, 10, &card));
         }
         s.push_str(&rect(id, x, 52, 790, 916, PANEL, 12, &inner));
     }
     (s, icons, Vec::new())
+}
+
+/// Patch Changes: who rose and fell since the last patch, and what the patch notes' changes did.
+fn patch_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta) -> Extras {
+    let mut icons = Vec::new();
+    let mut links = Vec::new();
+    // change in win-rate points since the last patch, for champions played this patch
+    let mut moves: Vec<(u16, f32, u32, Option<f32>)> = meta
+        .champions
+        .iter()
+        .filter(|c| c.current.games >= 3)
+        .filter_map(|c| Some((c.id, (c.win_rate() - sigmoid(c.previous?)) * 100.0, c.current.games, None)))
+        .collect();
+    moves.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let risers: Vec<_> = moves.iter().filter(|m| m.1 >= MIN_EFFECT).take(LIST_ROWS).copied().collect();
+    let fallers: Vec<_> = moves.iter().rev().filter(|m| m.1 <= -MIN_EFFECT).take(LIST_ROWS).copied().collect();
+    let mut changed: Vec<(u16, f32, u32, Option<f32>)> = meta
+        .champions
+        .iter()
+        .filter(|c| c.last_change.as_ref().is_some_and(|(v, _)| *v == meta.current))
+        .map(|c| (c.id, c.previous.map_or(0.0, |p| (c.win_rate() - sigmoid(p)) * 100.0), c.current.games, None))
+        .collect();
+    changed.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    let empty = if meta.versions.len() < 2 {
+        t.get("one_patch", "Only one patch so far: nothing to compare with yet.")
+    } else {
+        t.get("no_pairs", "Not enough games together yet.")
+    };
+    let mut s = String::new();
+    s.push_str(&champ_list("rise", 0, 52, 520, &t.get("risers", "Rising"), &risers, meta, &mut icons, &mut links, "", &empty));
+    s.push_str(&champ_list("fall", 540, 52, 520, &t.get("fallers", "Falling"), &fallers, meta, &mut icons, &mut links, "", &empty));
+    s.push_str(&champ_list("changed", 1080, 52, 520, &t.get("changed", "Changed This Patch"), &changed, meta, &mut icons, &mut links, "", &empty));
+    let note = t.get("note_patch", "Change in power win rate since the last patch (points); this patch's games on the right.");
+    s.push_str(&label("note", 4, 52 + LIST_H as i32 + 16, 1592, 24, 13, DIM, "Left", &note));
+    // champ_list addresses its rows from the body (base ""): strip the leading dot
+    let icons = icons.into_iter().map(|(p, c, z)| (p.trim_start_matches('.').to_string(), c, z)).collect();
+    let links = links.into_iter().map(|(p, c)| (p.trim_start_matches('.').to_string(), c)).collect();
+    (s, icons, links)
 }
 
 fn model_source<U: Ui>(t: &mut Texts<'_, U>, meta: &Meta, context: &Context) -> String {
@@ -1301,7 +1372,7 @@ mod tests {
         }
         ui.click(&format!("{LIST}.r0"));
         frame(&mut page, &mut ui, 9, &s, &context, "Main/Home");
-        for tab in ["pairs", "players", "model"] {
+        for tab in ["pairs", "players", "patch", "model"] {
             ui.click(&format!("{BODY}.tabs.{tab}"));
             frame(&mut page, &mut ui, 10, &s, &context, "Main/Home");
         }
@@ -1383,7 +1454,7 @@ mod tests {
         assert_eq!(page.view, View::Champions);
 
         // the other tabs
-        for (tab, view) in [("pairs", View::Pairs), ("players", View::Players), ("model", View::Model)] {
+        for (tab, view) in [("pairs", View::Pairs), ("players", View::Players), ("patch", View::Patch), ("model", View::Model)] {
             ui.click(&format!("{BODY}.tabs.{tab}"));
             frame(&mut page, &mut ui, 15, &s, &context, "Main/Home");
             assert_eq!(page.view, view);

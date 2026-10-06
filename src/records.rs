@@ -232,7 +232,7 @@ fn from_fields(f: &Fields<'_>, solo: bool, searched: bool) -> Result<Parsed, &'s
 
 /// A team strategy as (setting, chosen option): a plain option, or the variant name of an
 /// option that carries data (`{"Split131": {...}}`).
-fn strategy(v: &Value) -> Vec<(String, String)> {
+pub fn strategy(v: &Value) -> Vec<(String, String)> {
     let Value::Object(map) = v else { return Vec::new() };
     let mut out: Vec<(String, String)> = map
         .iter()

@@ -8,6 +8,11 @@
 //! when the team's players are known - the mastery of the player who would play it. A ban's
 //! value is what the candidate would be worth to the enemy (their player's mastery included),
 //! weighted by how likely they are to take it.
+//!
+//! Draft order matters too ([`with_exposure`]): an early pick can still be countered by every
+//! pick the other team has left, a last pick by none. So a pick loses what its worst likely
+//! counters on offer would take from it, in proportion to the picks the other team has left -
+//! early picks lean to safe champions, late picks to counters.
 
 use crate::history::Role;
 use crate::meta::Meta;
@@ -178,6 +183,8 @@ pub struct PickValue {
     pub balance: f32,
     /// The mastery of the player who would play it.
     pub mastery: f32,
+    /// What the other team's remaining picks could take from it by countering it.
+    pub exposure: f32,
     pub total: f32,
 }
 
@@ -232,8 +239,50 @@ pub fn pick_value_in(
         counter,
         balance,
         mastery,
+        exposure: 0.0,
         total: strength + synergy + counter - balance + mastery,
     }
+}
+
+/// How much of the counter threat the other team's remaining picks pose counts.
+const EXPOSURE_WEIGHT: f32 = 0.5;
+/// The worst counters averaged into the threat.
+const THREATS: usize = 3;
+
+/// What the other team could take from `cand` by countering it: the average of its worst
+/// matchups among the champions still on offer (weighted by how often each is played), times
+/// the share of picks the other team has left. 0 once they have no picks left.
+pub fn exposure(meta: &Meta, cand: u16, their_picks_left: usize, offer: &[u16]) -> f32 {
+    if their_picks_left == 0 || offer.is_empty() {
+        return 0.0;
+    }
+    let mut threats: Vec<f32> = offer
+        .iter()
+        .filter(|e| **e != cand)
+        .filter_map(|e| {
+            let edge = meta.counter(cand, *e).value;
+            if edge >= 0.0 {
+                return None;
+            }
+            let presence = meta.by_id(*e).map_or(0.0, |c| c.presence());
+            let likely = crate::model::presence_factor(presence, meta.typical_presence);
+            Some(-edge * likely)
+        })
+        .collect();
+    threats.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    threats.truncate(THREATS);
+    if threats.is_empty() {
+        return 0.0;
+    }
+    let threat = threats.iter().sum::<f32>() / threats.len() as f32;
+    threat * EXPOSURE_WEIGHT * (their_picks_left.min(5) as f32 / 5.0)
+}
+
+/// `v` with its counter exposure counted in.
+pub fn with_exposure(meta: &Meta, mut v: PickValue, their_picks_left: usize, offer: &[u16]) -> PickValue {
+    v.exposure = exposure(meta, v.champ, their_picks_left, offer);
+    v.total -= v.exposure;
+    v
 }
 
 /// The cost of a team's damage becoming one-sided with `cand` added.
@@ -358,6 +407,24 @@ mod tests {
         assert_eq!(l.roles.len(), 3);
         assert!(l.confidence < 0.2, "{}", l.confidence);
         assert_eq!(lanes(&m, &[]).roles, Vec::<Role>::new());
+    }
+
+    #[test]
+    fn early_picks_pay_for_being_counterable() {
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..12).collect();
+        // the champion with the worst matchup on offer
+        let (exposed, _) = (0..12u16)
+            .map(|c| (c, offer.iter().filter(|e| **e != c).map(|e| m.counter(c, *e).value).fold(0.0f32, f32::min)))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap();
+        let first = with_exposure(&m, pick_value(&m, exposed, &[], &[], &[], &none), 5, &offer);
+        let last = with_exposure(&m, pick_value(&m, exposed, &[], &[], &[], &none), 0, &offer);
+        assert!(first.exposure > 0.0 && last.exposure == 0.0, "{first:?}");
+        assert!(first.total < last.total);
+        let half = exposure(&m, exposed, 2, &offer);
+        assert!(half < first.exposure && half > 0.0, "fewer picks left, less exposure");
     }
 
     #[test]

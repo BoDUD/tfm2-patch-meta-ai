@@ -49,13 +49,14 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
         return StableDraftDecision::Pass;
     };
     let ally = ids(ctx.ally_picks());
-    if lock && !lock_allows(&snapshot, &cfg.lock_rules(), cand, &ally, &ids(ctx.available_champions())) {
+    let offer = ids(ctx.available_champions());
+    if lock && !lock_allows(&snapshot, &cfg.lock_rules(), cand, &ally, &offer) {
         return StableDraftDecision::Replace(LOCKED_SCORE);
     }
     if !cfg.ban_pick_on() {
         return StableDraftDecision::Pass;
     }
-    let value = value(&snapshot, cand, &ally, &ids(ctx.enemy_picks()), ban);
+    let value = value(&snapshot, cand, &ally, &ids(ctx.enemy_picks()), ban, &offer);
     let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
     decision(amount(value, cfg.edge_scale, strength))
 }
@@ -102,15 +103,19 @@ fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<crate::history::Role> {
     })
 }
 
-/// The model's value (log-odds) of picking or banning `cand` in this draft.
-pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool) -> f32 {
+/// The model's value (log-odds) of picking or banning `cand` in this draft. `offer` is what is
+/// still on offer (for how counterable a pick is while the other side has picks left).
+pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool, offer: &[u16]) -> f32 {
     let damage = |c: u16| snapshot.damage_of(c);
+    let meta = &snapshot.meta;
     if ban {
         let open = open_lanes(snapshot, enemy);
-        advisor::ban_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
+        let v = advisor::ban_value_in(meta, cand, ally, enemy, &[], &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(ally.len()), offer).total
     } else {
         let open = open_lanes(snapshot, ally);
-        advisor::pick_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
+        let v = advisor::pick_value_in(meta, cand, ally, enemy, &[], &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(enemy.len()), offer).total
     }
 }
 

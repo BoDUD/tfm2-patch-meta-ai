@@ -197,6 +197,9 @@ struct State {
     labels: Labels,
     damage: HashMap<u16, Damage>,
     champions: Vec<String>,
+    /// Athletes whose records are to be read (a couple per frame), and the ones already tried.
+    athlete_queue: std::collections::VecDeque<u32>,
+    athletes_tried: std::collections::HashSet<u32>,
     /// Team names by id (asked once each).
     team_names: HashMap<u32, String>,
     probes_written: bool,
@@ -236,6 +239,8 @@ impl State {
             labels: Labels::default(),
             damage: HashMap::new(),
             champions: Vec::new(),
+            athlete_queue: std::collections::VecDeque::new(),
+            athletes_tried: std::collections::HashSet::new(),
             team_names: HashMap::new(),
             probes_written: false,
             records_probed: false,
@@ -289,6 +294,11 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
     if scene != st.scene {
         diag::log(&format!("screen: {scene:?}{}", if idle_scene(scene) { " (mod paused)" } else { "" }));
         st.scene = scene;
+    }
+    // athletes' records, a couple per frame: on the management and line-up screens (the line-up
+    // screen asks for the squad it shows), never around the match itself
+    if matches!(scene, None | Some(ClientSceneKindV1::Main) | Some(ClientSceneKindV1::Lineup)) && st.save.is_some() {
+        read_athletes(st, game);
     }
     if idle_scene(scene) {
         return;
@@ -475,6 +485,34 @@ fn current_version(
             notes.iter().filter_map(|n| n.versions.first()).take(5).collect::<Vec<_>>(),
             played.keys().take(5).collect::<Vec<_>>()
         ))
+    }
+}
+
+/// Athletes per frame whose records are read (stat, proficiency: a few hundred numbers each).
+const ATHLETES_PER_FRAME: usize = 2;
+
+/// Reads the records of athletes the screens asked for, a couple per frame.
+fn read_athletes(st: &mut State, game: &mut impl Game) {
+    for id in crate::ui::take_wanted() {
+        if st.athletes_tried.insert(id) {
+            st.athlete_queue.push_back(id);
+        }
+    }
+    for _ in 0..ATHLETES_PER_FRAME {
+        let Some(id) = st.athlete_queue.pop_front() else { return };
+        let read = |path: &str, game: &mut dyn FnMut(&str) -> Option<String>| -> Value {
+            game(path).and_then(|j| serde_json::from_str(&j).ok()).unwrap_or(Value::Null)
+        };
+        let mut get = |path: &str| game.record_json(RecordKindV1::Athlete, id as usize, path);
+        let stat = read("stat", &mut get);
+        let proficiency = read("champion_proficiency", &mut get);
+        if stat.is_null() && proficiency.is_null() {
+            diag::log_once("athlete-unreadable", &format!("[probe] athlete #{id}: no stat / champion_proficiency in its record"));
+            continue;
+        }
+        let name = game.athlete_name(id).unwrap_or_else(|| format!("#{id}"));
+        st.labels.athletes.entry(id).or_insert_with(|| name.clone());
+        crate::ui::learn_athlete(id, crate::plan::AthleteInfo::from_record(name, &stat, &proficiency));
     }
 }
 
@@ -692,6 +730,27 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
     }
     st.labels.date = game.game_date();
     let teams = teams(st, game, team);
+    // the squad: every athlete of the player's team in the kept matches, and the last starting
+    // five; their records are read in the background
+    let mut squad: Vec<u32> = Vec::new();
+    for g in st.comp.games.values() {
+        for (side, t) in g.teams.iter().enumerate() {
+            if *t == Some(team as u32) {
+                squad.extend(g.sides[side].iter().filter_map(|s| s.athlete));
+            }
+        }
+    }
+    if let Some(Value::Array(last)) = game.record_json(RecordKindV1::Team, team, "last_starting").and_then(|j| serde_json::from_str(&j).ok()) {
+        squad.extend(last.iter().filter_map(|v| v.as_u64()).map(|v| v as u32));
+    }
+    squad.sort_unstable();
+    squad.dedup();
+    crate::ui::want_athletes(&squad);
+    let current_strategy = game
+        .record_json(RecordKindV1::Team, team, "strategy")
+        .and_then(|j| serde_json::from_str::<Value>(&j).ok())
+        .map(|v| crate::records::strategy(&v))
+        .unwrap_or_default();
     crate::ui::set_context(crate::ui::Context {
         team_name: st.labels.team_name.clone(),
         champions: st.champions.clone(),
@@ -702,6 +761,8 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         athletes: st.labels.athletes.clone(),
         last_opponent: teams.last_opponent,
         backtest: st.backtest,
+        squad,
+        current_strategy,
     });
     if !st.records_probed {
         st.records_probed = true;
@@ -993,6 +1054,8 @@ mod tests {
         read_delay: Duration,
         scene: Option<ClientSceneKindV1>,
         reads: u32,
+        /// Fit on a worker thread, as in the game (the frame-timing test).
+        threaded: bool,
     }
 
     impl Source for FakeGame {
@@ -1065,6 +1128,9 @@ mod tests {
         fn client_scene(&mut self) -> Option<ClientSceneKindV1> {
             self.scene
         }
+        fn threaded(&self) -> bool {
+            self.threaded
+        }
     }
 
     const NAMES: [&str; 10] = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
@@ -1132,8 +1198,8 @@ mod tests {
         let wr = |n: &str| snapshot.meta.champion(n).unwrap().win_rate();
         assert!(wr("a") > 0.6 && wr("j") < 0.4, "a {} j {}", wr("a"), wr("j"));
         let a = snapshot.meta.names.get("a").unwrap();
-        assert!(crate::draft::value(&snapshot, a, &[], &[], false) > 0.3);
-        assert!(crate::draft::value(&snapshot, a, &[], &[], true) > 0.0);
+        assert!(crate::draft::value(&snapshot, a, &[], &[], false, &[]) > 0.3);
+        assert!(crate::draft::value(&snapshot, a, &[], &[], true, &[]) > 0.0);
         // tiers were sent once, accepted, and merged into the existing list ("z" kept)
         assert_eq!(g.sent.len(), 1, "{:?}", g.sent);
         assert_eq!(g.tiers["a"], "S");
@@ -1215,6 +1281,7 @@ mod tests {
         with_temp_dir();
         let mut g = save();
         g.read_delay = Duration::from_millis(20); // a heavy replay
+        g.threaded = true; // the fit runs off the frame, as in the game
         let started = Instant::now();
         let mut now = Instant::now();
         let mut worst = Duration::ZERO;
