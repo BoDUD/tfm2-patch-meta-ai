@@ -7,10 +7,10 @@
       "version": ">=0.6.0"
     }
   ],
-  "description": "One model of your save's meta - champion strength per patch, lanes, players' own strength and mastery, synergies and matchups - fitted in the background. On the ban/pick screen: your line-up's win chance, the best picks and bans now with reasons, each champion's value to you, and each enemy pick's likely lane. F8 anywhere: tier list, scouting of your next opponent, your players' pools, the model's accuracy. Also nudges the AI's bans and picks and keeps your tier list up to date (both step aside automatically for Drafter's Toolbox / Terminator Draft AI). Settings: settings.ini in the mod folder; meta_report.html there shows everything.\n\n用一个模型分析存档里的版本环境（英雄每个版本的强度、分位置、选手实力与熟练度、配合与克制）。选人界面：阵容胜率、当前最佳选择与禁用（附理由）、每个英雄对你的价值、敌方英雄的位置推断。任何界面按 F8：梯队榜、对手侦察、我的选手英雄池、模型准确度。同时改进 AI 的 ban/pick 并自动维护梯队（检测到 Drafter's Toolbox / Terminator Draft AI 时自动让出）。设置文件 settings.ini 和完整报告 meta_report.html 都在 Mod 文件夹里。",
+  "description": "One model of your save's meta - champion strength per patch, lanes, players' own strength and mastery, synergies and matchups - fitted in the background. Ban/pick screen: your line-up's win chance, the best picks and bans now with reasons (draft-order aware), each champion's value to you, each enemy pick's likely lane, the best seating in the swap phase, and a position lock with nothing to set up. Tactics screen: the options worth changing. Line-up screen: suggested starters. Meta Analysis page in the left menu: champions, pairs, players and training, patch changes, the model. F8 anywhere: tier list, scouting, your players' pools. Also nudges the AI's bans and picks and keeps your tier list up to date. Old matches the game prunes are kept in the mod folder. Settings: settings.ini in the mod folder.\n\n用一个模型分析存档里的版本环境（英雄每个版本的强度、分位置、选手实力与熟练度、配合与克制）。选人界面：阵容胜率、当前最佳选择与禁用（附理由，考虑选人顺序）、每个英雄对你的价值、敌方英雄的位置推断、换位阶段的最佳分配，以及免设置的位置锁定。战术界面：值得改的战术。首发界面：推荐首发。左侧菜单的版本分析页：英雄、组合、选手与训练建议、补丁变化、模型。任何界面按 F8：梯队榜、对手侦察、选手英雄池。同时改进 AI 的 ban/pick 并自动维护梯队。游戏删掉的旧比赛会保存在 Mod 文件夹里。设置文件 settings.ini 在 Mod 文件夹里。",
   "last_updated": "2026-10-06",
   "mod_id": "patch_meta_ai",
   "mod_type": "native",
   "name": "Patch Meta AI: Draft Advisor + Smarter Ban/Pick + Auto Tier List",
-  "version": "2.0.1"
+  "version": "2.1.0"
 }

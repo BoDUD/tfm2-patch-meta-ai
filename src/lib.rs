@@ -18,6 +18,7 @@
 //! implementation with its own model.
 
 pub mod advisor;
+pub mod cache;
 mod client;
 pub mod compat;
 pub mod config;

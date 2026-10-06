@@ -4,14 +4,17 @@
 
 按你存档里的真实胜负数据工作的原生 Mod（稳定版 Mod API，游戏 0.6 及以上）。2.0 起，它用**一个统一的统计模型**同时估计英雄强度、分位置强度、选手实力与熟练度、队友配合和对位克制，然后：
 
-1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。
-2. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度。
-3. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。
-4. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
-5. **位置锁定（免设置）**：双方只会选还能放进剩余空位的英雄。英雄能打的位置自动判断：选人卡片上游戏标注的两个主位置，加上本存档里它实际打过足够多的位置。你自己选人时，不合适的英雄会变暗、点不了；没有合法选择时自动全部放开，不会卡住；禁用不受限制。
-6. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
+1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。选人顺序也算在内：对方后面还有几手、有没有强力克制，都会压低先手暴露的英雄的价值。Fearless 模式下显示本系列已锁定的英雄数。换位阶段，右下角改为显示把五个英雄分给五名选手的最佳方式。
+2. **战术界面**：选完人后，模型按你的阵容和本存档里各战术的实际胜负，在值得改的战术选项上标出 ★ 和收益。
+3. **首发界面**：按选手实力、位置评分和英雄池（熟练度）推荐五名首发，名单行上标 ★ 和位置；名单下方有空间时列出他们最好的英雄。
+4. **版本分析页**（左侧菜单）：英雄 / 组合 / 选手 / 补丁变化 / 模型 五个标签。英雄表可按位置筛选、按任意列排序，显示对线期经济差；选手页给出训练建议（值得练的英雄）；补丁变化页列出本版本上升、下降和被改动的英雄。
+5. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度。
+6. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。
+7. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
+8. **位置锁定（免设置）**：双方只会选还能放进剩余空位的英雄。英雄能打的位置自动判断：选人卡片上游戏标注的两个主位置，加上本存档里它实际打过足够多的位置。你自己选人时，不合适的英雄会变暗、点不了；没有合法选择时自动全部放开，不会卡住；禁用不受限制。
+9. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
 
-数据全部来自你的存档：大会比赛、单排、球队新闻里的补丁公告。
+数据全部来自你的存档：大会比赛、单排、球队新闻里的补丁公告。游戏会删掉很旧的比赛记录，所以 Mod 把每个存档的比赛另存在 Mod 文件夹的 `history/` 里（不改存档），下次读档时补回来；只有存档里最近的比赛确实出现在这个文件里时才会合并，同一支队伍的不同存档不会混在一起。
 
 ## 和其他 Mod 一起用
 
@@ -64,9 +67,10 @@
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
 | `[position_lock]` | `position_lock` | auto | 位置锁定：`auto` = 开，除非已启用 "Champion Position Lock" Mod |
 | | `lock_min_games` / `lock_share` | 8 / 0.15 | 英雄至少打过这么多场、某位置占比至少这么多，才把该位置算作它能打的位置 |
-| `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议 |
+| `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
 | | `lane_tags` | on | 敌方已选英雄的位置推断 |
+| | `meta_page` | on | 左侧菜单的"版本分析"页 |
 | `[report]` | `report` | on | 写 `meta_report.html` |
 | `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 F9 随时写一份） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
@@ -82,6 +86,7 @@
 
 - `diag.log`：Mod 读到了什么、做了什么（每个存档第一次读到的数据格式写在 `[probe]` 行，选人界面读到了什么写在 `[ui]` 行）。每次启动游戏重写，上一次的保留为 `diag.prev.log`。反馈问题时请附上它。
 - `meta_table.txt` / `meta_report.html`：模型当前的全部数字。
+- `history/`：各存档的比赛备份（删掉只会丢失游戏已删除的旧比赛）；`positions.json`：学到的英雄主位置。
 - `probe_competition.json`、`probe_records.txt`：存档数据格式样本（游戏更新后数据格式变了时用来适配）。
 
 ## 从源码构建
@@ -100,11 +105,16 @@
 
 Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). Version 2 fits one regularised logistic regression over your save's matches - champion strength per patch (a random walk across patches, wider where the patch notes changed a champion), lane offsets, each player's own strength and champion mastery, ally synergy and opponent matchups - on a background thread, and uses it for:
 
-1. **the ban/pick screen**: your line-up's win chance, the best picks and bans now with reasons, each champion card's value to you, and each enemy pick's likely lane (from lane history, any language);
-2. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
-3. **the AI's bans and picks**, valued in the actual draft;
-4. **your team's tier list**;
-5. **`meta_report.html`** and `meta_table.txt` in the mod folder.
+1. **the ban/pick screen**: your line-up's win chance, the best picks and bans now with reasons (aware of the draft order: a champion picked early can still be countered), each champion card's value to you, each enemy pick's likely lane, the Fearless count, and the best seating in the swap phase;
+2. **the tactics screen**: a star on each tactic option worth changing for your line-up, with its gain;
+3. **the line-up screen**: the five suggested starters (strength, position rating, champion pool);
+4. **a Meta Analysis page** in the left menu: champions (lane filter, lane-phase gold), pairs, players with training suggestions, patch changes, the model;
+5. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
+6. **the AI's bans and picks**, valued in the actual draft, with a position lock that needs no setup;
+7. **your team's tier list**;
+8. **`meta_report.html`** and `meta_table.txt` in the mod folder.
+
+The game prunes old match records; each save's matches are also kept in `history/` in the mod folder (never in the save) and merged back once the save's recent matches confirm the file is its own.
 
 - `ban_pick` / `tier_list` default to `auto`: they step aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
 - Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.

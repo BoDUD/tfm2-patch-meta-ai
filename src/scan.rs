@@ -75,6 +75,8 @@ pub struct Scanner {
     pub first_problem: Option<String>,
     /// The first usable record as the game gave it (written to `probe_*.json` once).
     pub first_raw: Option<String>,
+    /// The keys of the first matches read (newest first), to recognise this save's history file.
+    pub first_keys: Vec<u64>,
 }
 
 pub enum Step {
@@ -102,6 +104,7 @@ impl Scanner {
             first_match: None,
             first_problem: None,
             first_raw: None,
+            first_keys: Vec::new(),
         }
     }
 
@@ -241,6 +244,9 @@ impl Scanner {
 
     fn add(&mut self, id: usize, m: &MatchSummary, names: &mut Names) {
         let key = match_key(id, m);
+        if self.first_keys.len() < crate::cache::CONFIRM_MATCHES {
+            self.first_keys.push(key);
+        }
         if self.games.contains_key(&key) {
             // the same match under a new record id: it is already counted
             return;
@@ -288,6 +294,28 @@ impl Scanner {
         };
         count(&m.blue, m.blue_win);
         count(&m.red, !m.blue_win);
+    }
+
+    /// Takes a match kept from an earlier session (`cache`), unless it is known already.
+    pub fn adopt(&mut self, key: u64, game: Game, names: &Names) -> bool {
+        if self.games.contains_key(&key) {
+            return false;
+        }
+        let stats = self.versions.entry(game.version.clone()).or_default();
+        stats.matches += 1;
+        for (side, slots) in game.sides.iter().enumerate() {
+            let won = game.won(side);
+            for s in slots {
+                let c = stats.champs.entry(names.name(s.champ).to_string()).or_default();
+                c.m += 1;
+                c.w += won as u32;
+                if let Some(role) = s.role {
+                    *c.lanes.entry(role.name().to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        self.games.insert(key, game);
+        true
     }
 
     /// Versions with games, newest first.

@@ -197,6 +197,12 @@ struct State {
     labels: Labels,
     damage: HashMap<u16, Damage>,
     champions: Vec<String>,
+    /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
+    /// the file is this save's; whether that was settled; when the file was last written and
+    /// with how many matches.
+    cache_pending: Option<Vec<(u64, Match)>>,
+    cache_checked: bool,
+    cache_written: Option<(Instant, usize)>,
     /// Athletes whose records are to be read (a couple per frame), and the ones already tried.
     athlete_queue: std::collections::VecDeque<u32>,
     athletes_tried: std::collections::HashSet<u32>,
@@ -239,6 +245,9 @@ impl State {
             labels: Labels::default(),
             damage: HashMap::new(),
             champions: Vec::new(),
+            cache_pending: None,
+            cache_checked: false,
+            cache_written: None,
             athlete_queue: std::collections::VecDeque::new(),
             athletes_tried: std::collections::HashSet::new(),
             team_names: HashMap::new(),
@@ -318,6 +327,14 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
             shared::clear();
             diag::reset_once();
             diag::log(&format!("save open: team #{} {:?}", identity.0, identity.1));
+            // this save's matches from earlier sessions, if any (checked against the save later)
+            if let Ok(text) = std::fs::read_to_string(crate::cache::path(identity.0, &identity.1)) {
+                let games = crate::cache::decode(&text, &mut st.names);
+                if !games.is_empty() {
+                    diag::log(&format!("[cache] {} matches from earlier sessions, to be checked against this save", games.len()));
+                    st.cache_pending = Some(games);
+                }
+            }
             st.save = Some(identity);
         }
     }
@@ -346,6 +363,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
     }
 
     read_records(st, game, cfg);
+    settle_cache(st);
     st.comp.cap_backlog(BACKLOG_COMPETITION);
     st.solo.cap_backlog(BACKLOG_SOLO);
     report_probes(st);
@@ -359,6 +377,8 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         rebuild(st, game, cfg, team, now, caught_up);
     }
     collect(st, cfg, team);
+    save_cache(st, team, now, caught_up);
+
     // the files are built and written on a thread of their own: a big report is a few
     // milliseconds of formatting the frame need not wait for
     if st.files.is_some() && due(st.files_written_at.map(|t| t + FILES_EVERY), now) {
@@ -485,6 +505,68 @@ fn current_version(
             notes.iter().filter_map(|n| n.versions.first()).take(5).collect::<Vec<_>>(),
             played.keys().take(5).collect::<Vec<_>>()
         ))
+    }
+}
+
+/// Merges the matches of earlier sessions once the save's first matches confirm the file.
+fn settle_cache(st: &mut State) {
+    if st.cache_checked {
+        return;
+    }
+    let keys: Vec<u64> = st.comp.first_keys.iter().chain(&st.solo.first_keys).copied().collect();
+    let caught_up = st.comp.listed > 0 && st.comp.pending() == 0 && st.solo.pending() == 0;
+    if keys.len() < crate::cache::CONFIRM_MATCHES && !caught_up {
+        return;
+    }
+    st.cache_checked = true;
+    let Some(pending) = st.cache_pending.take() else { return };
+    let file_keys: std::collections::HashSet<u64> = pending.iter().map(|(k, _)| *k).collect();
+    if !crate::cache::confirms(&file_keys, &keys) {
+        diag::log("[cache] the history file is not this save's (or the save has too few matches yet): not used");
+        return;
+    }
+    let mut merged = 0;
+    for (key, game) in pending {
+        let scanner = if game.solo { &mut st.solo } else { &mut st.comp };
+        merged += scanner.adopt(key, game, &st.names) as usize;
+    }
+    diag::log(&format!("[cache] {merged} matches from earlier sessions added (the save no longer lists them)"));
+    if merged > 0 {
+        st.dirty = true;
+    }
+}
+
+/// The history file is rewritten at most this often.
+const CACHE_EVERY: Duration = Duration::from_secs(120);
+
+/// Writes this save's matches to its history file (on a thread of its own), once everything is
+/// read and the old file was checked - never a half-read save over a full history.
+fn save_cache(st: &mut State, team: usize, now: Instant, caught_up: bool) {
+    if !st.cache_checked || !caught_up {
+        return;
+    }
+    let count = st.comp.games.len() + st.solo.games.len();
+    if count == 0 || st.cache_written.is_some_and(|(at, n)| n == count || now < at + CACHE_EVERY) {
+        return;
+    }
+    st.cache_written = Some((now, count));
+    let path = crate::cache::path(team, st.save.as_ref().map_or("", |s| s.1.as_str()));
+    let mut games: Vec<(u64, Match)> = st.comp.games.iter().chain(&st.solo.games).map(|(k, g)| (*k, g.clone())).collect();
+    // oldest first, so the file keeps the newest when it is trimmed
+    games.sort_by_key(|(_, g)| g.record);
+    let names = st.names.clone();
+    let write = move || {
+        let text = crate::cache::encode(games.iter().map(|(k, g)| (k, g)), &names);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    };
+    if std::thread::Builder::new().name(format!("{}-history", crate::MOD_ID)).spawn(write).is_err() {
+        diag::log_once("cache-thread", "could not start the thread that writes the history file");
     }
 }
 
@@ -1214,6 +1296,40 @@ mod tests {
         frames(&mut g, 5, now);
         assert_eq!(g.sent.len(), 2);
         assert_eq!(g.tiers["a"], "S");
+    }
+
+    #[test]
+    fn matches_from_earlier_sessions_come_back_for_the_same_save() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        // session 1: 300 matches read and written to the history file
+        let mut g = save();
+        let mut now = frames(&mut g, 400, Instant::now());
+        now += Duration::from_secs(1);
+        frames(&mut g, 5, now);
+        let file = crate::cache::path(g.team, &g.team_name);
+        for _ in 0..200 {
+            if file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(file.exists(), "history written");
+        // session 2: the game pruned the 200 oldest records
+        crate::reset_for_tests();
+        tick(&mut g, false, now);
+        g.replays.retain(|id, _| *id > 200);
+        let now = frames(&mut g, 400, now + Duration::from_secs(10));
+        let _ = now;
+        let snapshot = shared::get().unwrap();
+        assert_eq!(snapshot.meta.matches, 300, "the pruned matches came back from the file");
+        // another save with the same team: the file is not used
+        crate::reset_for_tests();
+        let mut other = save();
+        other.replays = other.replays.into_iter().map(|(id, r)| (id, r.replace("\"1.3\"", "\"1.4\""))).collect();
+        frames(&mut other, 400, Instant::now());
+        assert_eq!(shared::get().unwrap().meta.matches, 300, "only its own 300");
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]
