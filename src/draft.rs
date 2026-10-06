@@ -46,13 +46,35 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
     decision(amount(value, cfg.edge_scale, strength))
 }
 
+thread_local! {
+    /// The open lanes of the last team asked about: the game scores every candidate of one
+    /// decision in a row, with the same picks (hooks may run on several threads).
+    static OPEN: std::cell::RefCell<Option<(Vec<u16>, Vec<crate::history::Role>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<crate::history::Role> {
+    OPEN.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((key, open)) = cache.as_ref() {
+            if key == picks {
+                return open.clone();
+            }
+        }
+        let open = advisor::open_lanes(&snapshot.meta, picks);
+        *cache = Some((picks.to_vec(), open.clone()));
+        open
+    })
+}
+
 /// The model's value (log-odds) of picking or banning `cand` in this draft.
 pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool) -> f32 {
     let damage = |c: u16| snapshot.damage_of(c);
     if ban {
-        advisor::ban_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
+        let open = open_lanes(snapshot, enemy);
+        advisor::ban_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
     } else {
-        advisor::pick_value(&snapshot.meta, cand, ally, enemy, &[], &damage).total
+        let open = open_lanes(snapshot, ally);
+        advisor::pick_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
     }
 }
 

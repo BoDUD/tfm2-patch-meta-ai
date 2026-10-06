@@ -16,6 +16,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn new(meta: Meta, damage: HashMap<u16, Damage>) -> Self {
+        Self { meta, damage }
+    }
+
     pub fn damage_of(&self, champ: u16) -> Option<Damage> {
         self.damage.get(&champ).copied()
     }

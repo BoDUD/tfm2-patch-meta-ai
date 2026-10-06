@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::history::Role;
+use crate::perf::{time, Part};
 
 use mod_api_stable::{ClientSceneKindV1, InputEventKindV1, StableClient, UiEventKindV1};
 
@@ -144,6 +145,8 @@ pub struct Frame<'a> {
     pub screen: &'a str,
     /// This frame's clicks (see [`take_clicks`]).
     pub clicks: &'a [String],
+    /// Keys pressed this frame.
+    pub keys: &'a [String],
 }
 
 /// What the screens need from the save (set by the client when a save is read).
@@ -207,7 +210,9 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     let st = guard.get_or_insert_with(State::default);
     st.frame += 1;
     let frame = st.frame;
-    st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"));
+    let keys = ui.keys_pressed();
+    let snapshot = crate::shared::get();
+    time(Part::Explore, || st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"), &keys));
     if cfg.draft_overlay {
         let view = draft_screen::View {
             team_name: &st.context.team_name,
@@ -215,10 +220,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             grid_values: cfg.grid_values,
             lane_tags: cfg.lane_tags,
         };
-        let snapshot = crate::shared::get();
-        st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view);
+        time(Part::Draft, || st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view));
     }
-    let snapshot = crate::shared::get();
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
     let clicks = take_clicks();
@@ -229,10 +232,11 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         opponent: opponent.as_deref(),
         screen: &screen,
         clicks: &clicks,
+        keys: &keys,
     };
-    st.panel.tick(ui, &f);
+    time(Part::Panel, || st.panel.tick(ui, &f));
     if cfg.meta_page {
-        st.page.tick(ui, &f);
+        time(Part::Page, || st.page.tick(ui, &f));
     }
 }
 
@@ -284,6 +288,8 @@ pub(crate) mod tests {
         pub handlers: Vec<String>,
         pub icons: BTreeMap<String, String>,
         pub texts: Vec<String>,
+        /// Every reference under this prefix exists (a merged text document).
+        pub text_prefix: Option<String>,
     }
 
     impl FakeUi {
@@ -443,8 +449,8 @@ pub(crate) mod tests {
             self.handlers.push(path.to_string());
             true
         }
-        fn set_champion_icon(&mut self, path: &str, champion: &str, _size: f32) -> bool {
-            if !self.nodes.contains_key(path) {
+        fn set_champion_icon(&mut self, path: &str, champion: &str, size: f32) -> bool {
+            if !self.nodes.contains_key(path) || size <= 0.0 {
                 return false;
             }
             self.icons.insert(path.to_string(), champion.to_string());
@@ -452,6 +458,7 @@ pub(crate) mod tests {
         }
         fn has_text(&self, reference: &str) -> bool {
             self.texts.iter().any(|t| t == reference)
+                || self.text_prefix.as_ref().is_some_and(|p| reference.starts_with(p.as_str()))
         }
     }
 

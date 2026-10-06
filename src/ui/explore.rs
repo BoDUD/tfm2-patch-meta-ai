@@ -49,8 +49,8 @@ fn clip(text: &str, max: usize) -> String {
 
 impl Explorer {
     /// One frame. `auto` = dump screens not seen before; `scene` labels the dump.
-    pub fn tick(&mut self, ui: &impl Ui, frame: u64, auto: bool, scene: &str) {
-        let manual = ui.keys_pressed().iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
+    pub fn tick(&mut self, ui: &impl Ui, frame: u64, auto: bool, scene: &str, keys: &[String]) {
+        let manual = keys.iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
         if self.running.is_none() && (manual || (auto && frame >= self.next_look)) {
             self.next_look = frame + LOOK_EVERY;
             let sig = signature(ui);
@@ -135,20 +135,20 @@ mod tests {
         ui.add("main.champions.contents.0.name", "label").text = Some("Ahri".into());
         let mut ex = Explorer::default();
         for frame in 0..10 {
-            ex.tick(&ui, frame, true, "Match");
+            ex.tick(&ui, frame, true, "Match", &ui.keys.clone());
         }
         let dump = std::fs::read_to_string(dir.join("ui_dump_01.txt")).unwrap();
         assert!(dump.contains("main.champions.contents.0 [banpick_champion_slot]"), "{dump}");
         assert!(dump.contains("state={\"champion\":\"ahri\"}") && dump.contains("text=\"Ahri\""), "{dump}");
         // the same screen again: no new dump; F9: one
         for frame in 10..100 {
-            ex.tick(&ui, frame, true, "Match");
+            ex.tick(&ui, frame, true, "Match", &ui.keys.clone());
         }
         assert!(!dir.join("ui_dump_02.txt").exists());
         ui.keys = vec!["F9".into()];
-        ex.tick(&ui, 100, true, "Match");
+        ex.tick(&ui, 100, true, "Match", &ui.keys.clone());
         ui.keys.clear();
-        ex.tick(&ui, 101, true, "Match");
+        ex.tick(&ui, 101, true, "Match", &ui.keys.clone());
         assert!(dir.join("ui_dump_02.txt").exists());
     }
 }
