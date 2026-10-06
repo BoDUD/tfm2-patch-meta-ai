@@ -27,8 +27,8 @@ const TIER_WRITERS: [(&str, &str); 2] = [
 ];
 
 /// tfm2mods' Champion Position Lock (and flover's rework, same id): keeps champions to the
-/// positions the player listed them for, in every draft. It decides the AI's picks itself where
-/// its rules require, which wins over this mod's score nudges - nothing to step aside from.
+/// positions the player listed them for. `position_lock=auto` leaves the lock to it - two locks
+/// at once would stack.
 const POSITION_LOCK: &str = "tfm2_champ_pos_lock";
 
 /// Mods that drive the AI's bans and picks. Matched as a substring: the Terminator's mod id
@@ -118,7 +118,7 @@ pub fn load() {
         diag::log(&format!("\"{name}\" also drives the AI's bans and picks: ban_pick=auto leaves it to that mod"));
     }
     if others.position_lock() {
-        diag::log("Champion Position Lock is enabled: its locks decide the picks; advice skips champions the ban/pick screen marks as not pickable");
+        diag::log("\"Champion Position Lock\" also locks positions: position_lock=auto leaves it to that mod");
     }
     *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(others);
 }

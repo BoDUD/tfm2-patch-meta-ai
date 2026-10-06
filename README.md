@@ -8,7 +8,8 @@
 2. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度。
 3. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。
 4. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
-5. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
+5. **位置锁定（免设置）**：双方只会选还能放进剩余空位的英雄。英雄能打的位置自动判断：选人卡片上游戏标注的两个主位置，加上本存档里它实际打过足够多的位置。你自己选人时，不合适的英雄会变暗、点不了；没有合法选择时自动全部放开，不会卡住；禁用不受限制。
+6. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
 
 数据全部来自你的存档：大会比赛、单排、球队新闻里的补丁公告。
 
@@ -16,6 +17,7 @@
 
 - **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片左上角和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
 - **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
+- **Champion Position Lock**（tfm2mods / flover）：`position_lock=auto` 检测到它时把位置锁定让给它。两者不要同时用来锁位置。
 - **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
 
 启用了哪些 Mod 是从游戏的 `config/game/mods.json` 读的。另外，如果梯队在游戏内换日后连续被别的东西改回去，本 Mod 也会自动停止写入并在 `diag.log` 里说明。
@@ -60,6 +62,8 @@
 | `[tiers]` | `min_games` | 10 | 近期场次（本版本 + 往前每个版本减半）少于此值的英雄不分级 |
 | | `s` `a` `b` `c` | 10/20/40/20 | 各梯队所占百分比，其余为 D |
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
+| `[position_lock]` | `position_lock` | auto | 位置锁定：`auto` = 开，除非已启用 "Champion Position Lock" Mod |
+| | `lock_min_games` / `lock_share` | 8 / 0.15 | 英雄至少打过这么多场、某位置占比至少这么多，才把该位置算作它能打的位置 |
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议 |
 | | `grid_values` | on | 英雄卡片上的价值 |
 | | `lane_tags` | on | 敌方已选英雄的位置推断 |

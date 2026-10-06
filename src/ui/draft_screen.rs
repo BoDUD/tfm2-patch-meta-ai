@@ -8,7 +8,10 @@
 //!   arrow and what picking it is worth to the player now, in win-rate points, with a stripe in
 //!   its colour;
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
-//!   of how sure that is - from the champions' lane history, so it works in every language.
+//!   of how sure that is - from the champions' lane history, so it works in every language;
+//! - **position lock** (`poslock`): in the pick phase, a card the player's team may not pick is
+//!   covered by a dimmed layer with a lock that takes the click; advice and values skip it. The
+//!   cards' main positions (`pos_tooltip.row1/row2`) are learned for the lock on the way.
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
@@ -51,6 +54,10 @@ const DIM: u32 = 0xa3a9b6ff;
 const TEXT: u32 = 0xe8e8e8ff;
 const PANEL: u32 = 0x161721f0;
 
+/// The layer over a card the position lock rules out.
+const LOCK: &str = "pma_lock";
+const HEADER_STEP: &str = "main.header.step";
+
 /// What the overlay shows besides the model.
 pub struct View<'a> {
     pub team_name: &'a str,
@@ -58,6 +65,8 @@ pub struct View<'a> {
     pub rosters: &'a HashMap<String, Vec<(u32, Option<Role>)>>,
     pub grid_values: bool,
     pub lane_tags: bool,
+    /// The position lock's rules, when it is on.
+    pub lock: Option<crate::poslock::Rules>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -79,6 +88,14 @@ impl Card {
     }
 }
 
+/// Which side the player is, and whether the position lock applies now (the pick phase, with
+/// the player's side known).
+#[derive(Clone, Copy)]
+struct Turn {
+    side: usize,
+    locking: bool,
+}
+
 #[derive(Default)]
 pub struct DraftScreen {
     /// The other team on the last ban/pick screen ([`team_key`]), for scouting.
@@ -88,6 +105,8 @@ pub struct DraftScreen {
     /// The draft and model the overlay was last drawn for.
     drawn: Option<u64>,
     tagged: HashMap<String, bool>,
+    /// Cards covered by the lock layer, as last written.
+    locked: HashMap<String, bool>,
     reported: bool,
 }
 
@@ -209,6 +228,39 @@ fn chip_source() -> String {
     )
 }
 
+/// The lock layer: the card dimmed, a lock in the middle; a button, so it takes the click.
+fn lock_source() -> String {
+    format!(
+        "{LOCK}:color_icon_button {{ width: 100%; height: 100%; btn: {{ color: #07080bb8; }} \
+         hover: {{ btn: {{ color: #07080bb8; }} }} \
+         #icon:image {{ width: 24px; height: 24px; anchor_x: 0.5; anchor_y: 0.5; pivot_x: 0.5; pivot_y: 0.38; \
+         source: \"asset/base/ui/icons/lock\"; color: #c2c6ceff; ignore_event: true; }} }}"
+    )
+}
+
+/// The main positions on the cards (`pos_tooltip.row1/row2`, the game's position text
+/// references), learned once per champion for the position lock.
+fn learn_positions(ui: &impl Ui, cards: &[Card]) {
+    let mut learned = false;
+    for c in cards {
+        let Some(champ) = c.champ.as_deref() else { continue };
+        if crate::poslock::knows(champ) {
+            continue;
+        }
+        let mut lanes = [false; 5];
+        for row in ["row1", "row2"] {
+            let text = ui.text(&format!("{}.pos_tooltip.{row}.text", c.path)).unwrap_or_default();
+            if let Some(r) = text.strip_prefix("#asset/base/text/ui?position.").and_then(Role::parse) {
+                lanes[r.index()] = true;
+            }
+        }
+        learned |= crate::poslock::learn(champ, lanes);
+    }
+    if learned {
+        crate::poslock::save();
+    }
+}
+
 /// Steps of the lane read's confidence bar.
 const LANE_STEPS: usize = 5;
 
@@ -270,6 +322,8 @@ impl DraftScreen {
                 self.on = false;
                 self.drawn = None;
                 self.tagged.clear();
+                self.locked.clear();
+                crate::poslock::save();
             }
             return;
         }
@@ -307,6 +361,10 @@ impl DraftScreen {
         let meta = &snapshot.meta;
         let known = |c: &str| meta.names.get(c).is_some();
         let cards = read_grid(ui, &known, names);
+        if view.lock.is_some() {
+            learn_positions(ui, &cards);
+        }
+        let pick_phase = ui.text(HEADER_STEP).is_some_and(|t| t.contains("pick_phase"));
         if !self.reported {
             self.reported = true;
             let named = cards.iter().filter(|c| c.champ.is_some()).count();
@@ -320,6 +378,8 @@ impl DraftScreen {
                 }
             ));
         }
+        // the lock needs to know which team is the player's: without it, lock nothing
+        let lock_ok = side.is_some();
         let side = side.unwrap_or(0);
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
@@ -327,7 +387,7 @@ impl DraftScreen {
         for c in &cards {
             (&c.champ, c.blue, c.red, c.banned, c.locked).hash(&mut h);
         }
-        (side, Arc::as_ptr(snapshot) as usize).hash(&mut h);
+        (side, Arc::as_ptr(snapshot) as usize, pick_phase, view.lock.is_some()).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -348,7 +408,8 @@ impl DraftScreen {
             ui.text(path).and_then(|t| view.rosters.get(&team_key(&t)).cloned()).unwrap_or_default()
         };
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
-        self.draw(ui, snapshot, &cards, side, &rosters, view);
+        let turn = Turn { side, locking: pick_phase && lock_ok };
+        self.draw(ui, snapshot, &cards, turn, &rosters, view);
     }
 
     fn draw(
@@ -356,10 +417,11 @@ impl DraftScreen {
         ui: &mut impl Ui,
         snapshot: &Snapshot,
         cards: &[Card],
-        side: usize,
+        turn: Turn,
         rosters: &[Vec<(u32, Option<Role>)>; 2],
         view: &View<'_>,
     ) {
+        let (side, pick_phase) = (turn.side, turn.locking);
         let (players, enemy_players) = (&rosters[side], &rosters[1 - side]);
         let meta = &snapshot.meta;
         let id = |c: &Card| c.champ.as_deref().and_then(|n| meta.names.get(n));
@@ -376,6 +438,12 @@ impl DraftScreen {
         let damage = |c: u16| snapshot.damage_of(c);
         let open: Vec<u16> =
             cards.iter().filter(|c| c.open()).filter_map(&id).collect();
+        // the champions the player's team may pick (all open ones without the lock, outside the
+        // pick phase, or when it is not known which team is the player's)
+        let pickable: Vec<u16> = match &view.lock {
+            Some(rules) if pick_phase => crate::poslock::pickable(meta, rules, &ally, &open),
+            _ => open.clone(),
+        };
 
         // win chance
         let p = advisor::win_probability(meta, &ally, &enemy);
@@ -392,7 +460,7 @@ impl DraftScreen {
 
         // advice: the two best picks and the best ban
         let (ally_open, enemy_open) = (advisor::open_lanes(meta, &ally), advisor::open_lanes(meta, &enemy));
-        let mut pick_values: Vec<PickValue> = open
+        let mut pick_values: Vec<PickValue> = pickable
             .iter()
             .map(|c| advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open))
             .collect();
@@ -450,6 +518,24 @@ impl DraftScreen {
                     ui.set_properties(&format!("{tag}.text"), &format!("color: {};", color(c)));
                     ui.set_properties(&format!("{tag}.stripe"), &format!("color: {};", color(c)));
                 }
+            }
+        }
+
+        // the position lock: a dimmed layer that takes the click, on open cards the team may not
+        // pick, in the pick phase only (bans are free)
+        for c in cards.iter().filter(|c| c.champ.is_some()) {
+            // (pick_phase is false here unless the player's side is known)
+            let ruled_out = view.lock.is_some() && pick_phase && c.open() && id(c).is_some_and(|x| !pickable.contains(&x));
+            let layer = format!("{}.{LOCK}", c.path);
+            if ruled_out && !ui.exists(&layer) {
+                if !ui.spawn(&c.path, &lock_source()) {
+                    continue;
+                }
+                self.locked.insert(layer.clone(), true);
+            }
+            if self.locked.get(&layer) != Some(&ruled_out) && ui.exists(&layer) {
+                ui.set_visible(&layer, ruled_out);
+                self.locked.insert(layer, ruled_out);
             }
         }
 
@@ -514,6 +600,10 @@ mod tests {
                 ui.add(&format!("{path}.{badge}.text"), "label");
             }
             ui.add(&format!("{path}.fearless_x"), "image").visible = false;
+            // main positions: "a".."e" top, the rest support
+            let lane = if "abcde".contains(n) { "top" } else { "support" };
+            ui.add(&format!("{path}.pos_tooltip.row1.text"), "label").text = Some(format!("#asset/base/text/ui?position.{lane}"));
+            ui.add(&format!("{path}.pos_tooltip.row2.text"), "label").text = Some(format!("#asset/base/text/ui?position.{lane}"));
         }
         ui
     }
@@ -550,7 +640,7 @@ mod tests {
         ui.add(&format!("{GRID}.g.fearless_x"), "image").visible = true;
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: None };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
@@ -597,10 +687,46 @@ mod tests {
     }
 
     #[test]
+    fn the_position_lock_greys_out_what_the_team_cannot_seat() {
+        let _serial = crate::tests::serial();
+        crate::poslock::clear();
+        let snapshot = snapshot(2000);
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        // main positions only (history plays everyone everywhere in the simulation)
+        let rules = crate::poslock::Rules { min_games: 1_000_000, share: 0.5 };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: Some(rules) };
+        let mut ui = screen();
+        ui.add(HEADER_STEP, "label").text = Some("#asset/base/text/ui?banpick.pick_phase".into());
+        pick(&mut ui, "a", "blue", 1); // we took a top-only champion
+        let mut screen = DraftScreen::default();
+        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
+        assert!(crate::poslock::knows("c"), "main positions learned from the cards");
+        // the other top-only champions are locked; support ones are not
+        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(true));
+        assert!(!ui.exists(&format!("{GRID}.h.{LOCK}")) || ui.visible(&format!("{GRID}.h.{LOCK}")) == Some(false));
+        assert!(!ui.exists(&format!("{GRID}.a.{LOCK}")), "picked cards are not covered");
+        // ...and never advised
+        for row in 0..2 {
+            assert_ne!(ui.text(&format!("main.pma.advice.c{row}")).unwrap_or_default(), name_ref("c"));
+        }
+        // the ban phase: nothing locked
+        ui.nodes.get_mut(HEADER_STEP).unwrap().text = Some("#asset/base/text/ui?banpick.ban_phase".into());
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(false));
+        // the player's team unknown (names do not match): nothing locked either
+        ui.nodes.get_mut(HEADER_STEP).unwrap().text = Some("#asset/base/text/ui?banpick.pick_phase".into());
+        let stranger = View { team_name: "Somebody Else", ..view };
+        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &stranger);
+        assert_eq!(ui.visible(&format!("{GRID}.c.{LOCK}")), Some(false));
+        crate::poslock::clear();
+    }
+
+    #[test]
     fn says_so_when_there_is_too_little_data() {
         let book = NameBook::default();
         let rosters = HashMap::new();
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true, lock: None };
         for snapshot in [None, Some(snapshot(5))] {
             let mut ui = screen();
             let mut screen = DraftScreen::default();

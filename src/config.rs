@@ -83,6 +83,11 @@ pub struct Config {
     pub c_percent: f32,
     /// Champions with fewer than `min_games`: `false` = keep their tier (default), `true` = No Tier.
     pub clear_unranked: bool,
+    // [position_lock]
+    /// Teams only pick champions that can take one of their open positions.
+    pub position_lock: Switch,
+    pub lock_min_games: f32,
+    pub lock_share: f32,
     // [screen]
     /// The ban/pick screen overlay: win chance and advice.
     pub draft_overlay: bool,
@@ -125,6 +130,9 @@ impl Default for Config {
             b_percent: 40.0,
             c_percent: 20.0,
             clear_unranked: false,
+            position_lock: Switch::Auto,
+            lock_min_games: 8.0,
+            lock_share: 0.15,
             draft_overlay: true,
             grid_values: true,
             lane_tags: true,
@@ -161,6 +169,15 @@ impl Config {
     /// The AI's bans and picks are nudged (not left to another draft mod).
     pub fn ban_pick_on(&self) -> bool {
         self.ban_pick.resolve(crate::compat::get().draft_driver().is_some())
+    }
+
+    /// Positions are locked (not left to another position-lock mod).
+    pub fn position_lock_on(&self) -> bool {
+        self.position_lock.resolve(crate::compat::get().position_lock())
+    }
+
+    pub fn lock_rules(&self) -> crate::poslock::Rules {
+        crate::poslock::Rules { min_games: self.lock_min_games as u32, share: self.lock_share }
     }
 
     /// The tier list is written (not left to another tier mod).
@@ -220,6 +237,9 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
+        "position_lock" => cfg.position_lock = Switch::parse(value)?,
+        "lock_min_games" => cfg.lock_min_games = number(value)?.round(),
+        "lock_share" => cfg.lock_share = number(value)?,
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
@@ -276,6 +296,10 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     };
     let v = cfg.patches;
     check("patches", &mut cfg.patches, (1.0..=40.0).contains(&v), d.patches);
+    let v = cfg.lock_min_games;
+    check("lock_min_games", &mut cfg.lock_min_games, (0.0..=1000.0).contains(&v), d.lock_min_games);
+    let v = cfg.lock_share;
+    check("lock_share", &mut cfg.lock_share, (0.0..=1.0).contains(&v), d.lock_share);
     let v = cfg.patch_shift;
     check("patch_shift", &mut cfg.patch_shift, (0.0..=0.2).contains(&v), d.patch_shift);
     let v = cfg.solo_weight;
@@ -408,7 +432,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
+         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} position_lock={} lock_min_games={} lock_share={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         c.tier_list.as_str(),
         c.patches,
@@ -431,6 +455,9 @@ pub fn summary(c: &Config) -> String {
         c.c_percent,
         if c.clear_unranked { "clear" } else { "keep" },
         if c.report { "on" } else { "off" },
+        c.position_lock.as_str(),
+        c.lock_min_games,
+        c.lock_share,
         if c.draft_overlay { "on" } else { "off" },
         if c.grid_values { "on" } else { "off" },
         if c.lane_tags { "on" } else { "off" },
@@ -518,6 +545,23 @@ c=20
 ; unranked : champions below min_games - keep = leave their tier alone, clear = No Tier
 ;            证据不足的英雄：keep = 保持原梯队，clear = 设为无梯队
 unranked=keep
+
+[position_lock]
+; Teams (yours and the AI's) only pick champions that can still take one of their open
+; positions - no setting up: a champion's positions are its two main positions as the game
+; shows them on its ban/pick card, plus every position it has really played in this save
+; (at least lock_min_games games, and lock_share of them in that position). Two champions that
+; need the same position are not picked together. When nothing legal is left, everything is.
+; In your own pick turns the other champions are greyed out. Bans are never restricted.
+; auto = on, unless "Champion Position Lock" is enabled (it does the same job)
+; 位置锁定（免设置）：双方只会选还能放进剩余空位的英雄。英雄能打的位置 = 选人卡片上游戏标注的
+; 两个主位置 + 本存档里它实际打过足够多（至少 lock_min_games 场、占比至少 lock_share）的位置。
+; 两个都只能打同一位置的英雄不会被同时选上；没有合法选择时自动全部放开，不会卡住。
+; 你自己选人时，不合适的英雄会变暗不能点。禁用不受限制。
+; auto = 开启；若已启用 "Champion Position Lock" Mod 则让给它
+position_lock=auto
+lock_min_games=8
+lock_share=0.15
 
 [screen]
 ; On the ban/pick screen / 选人界面:
