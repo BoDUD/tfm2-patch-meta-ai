@@ -26,6 +26,13 @@ const TIER_WRITERS: [(&str, &str); 2] = [
     ("draft_winrate_penalty", "Win-Rate Ban/Pick AI + Champion Tiers"),
 ];
 
+/// Mods that lock champions to positions: Smart Position Lock (its locked cards carry a layer
+/// the ban/pick overlay reads, see `ui::draft_screen`) and tfm2mods' Champion Position Lock (and
+/// flover's rework, same id). They decide the AI's picks where their rules require, which wins
+/// over this mod's score nudges - nothing to step aside from.
+const POSITION_LOCKS: [(&str, &str); 2] =
+    [("smart_position_lock", "Smart Position Lock"), ("tfm2_champ_pos_lock", "Champion Position Lock")];
+
 /// Mods that drive the AI's bans and picks. Matched as a substring: the Terminator's mod id
 /// is not published.
 const DRAFT_DRIVERS: [(&str, &str); 2] = [
@@ -74,6 +81,11 @@ impl Others {
         self.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == "drafters_toolkit"))
     }
 
+    /// An enabled mod that locks champions to positions.
+    pub fn position_lock(&self) -> Option<&'static str> {
+        self.find(&POSITION_LOCKS, false)
+    }
+
     pub fn describe(&self) -> String {
         match &self.enabled {
             None => "enabled mods: unknown (mods.json not readable)".to_string(),
@@ -107,6 +119,9 @@ pub fn load() {
     if let Some(name) = others.draft_driver() {
         diag::log(&format!("\"{name}\" also drives the AI's bans and picks: ban_pick=auto leaves it to that mod"));
     }
+    if let Some(name) = others.position_lock() {
+        diag::log(&format!("\"{name}\" locks positions: its locks hold the AI's picks, and the advice skips cards it locked"));
+    }
     *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(others);
 }
 
@@ -136,6 +151,12 @@ mod tests {
         let o = Others::from_mods_json(r#"{"enabled_mods":["bows_terminator_draft"]}"#);
         assert_eq!(o.draft_driver(), Some("Bows' Terminator Draft AI"));
         assert_eq!(o.tier_writer(), None);
+
+        let o = Others::from_mods_json(r#"{"enabled_mods":["patch_meta_ai","tfm2_champ_pos_lock"]}"#);
+        assert_eq!(o.position_lock(), Some("Champion Position Lock"));
+        assert!(o.tier_writer().is_none() && o.draft_driver().is_none());
+        let o = Others::from_mods_json(r#"{"enabled_mods":["smart_position_lock"]}"#);
+        assert_eq!(o.position_lock(), Some("Smart Position Lock"));
 
         let o = Others::from_mods_json(r#"{"enabled_mods":["draft_winrate_penalty"]}"#);
         assert!(o.tier_writer().is_some() && o.draft_driver().is_some());

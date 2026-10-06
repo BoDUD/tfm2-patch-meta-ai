@@ -8,12 +8,18 @@
 //!   arrow and what picking it is worth to the player now, in win-rate points, with a stripe in
 //!   its colour;
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
-//!   of how sure that is - from the champions' lane history, so it works in every language.
+//!   of how sure that is - from the champions' lane history, so it works in every language;
+//! - **swap phase**: the best way to seat the team's five champions on its players
+//!   (`plan::best_seating`) in place of the advice, with what it is worth over the usual lanes;
+//! - **Fearless**: how many champions the series has locked, next to the win chance;
+//! - **position locks** are another mod's job (Smart Position Lock): a card it covered with its
+//!   lock layer (`spl_lock`) is not advised as a pick and gets no value.
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
-//! badge is visible once that side picked it, with the pick number in `<badge>.text`, and its
-//! `ban` icon once it is banned. Team names sit in `main.bottom.<side>_side.name` with the
+//! badge is visible once that side picked it, with the pick number in `<badge>.text`, its
+//! `ban` icon once it is banned, and its `fearless_x` once Fearless rules lock it (used in an
+//! earlier game of the series) - such a card is not offered as advice and gets no value. Team names sit in `main.bottom.<side>_side.name` with the
 //! league rank appended ("Samsung Galaxy #1"). Labels read back the raw text they were given,
 //! so champion names are written as the game's own name reference and the game shows them in
 //! its language. Both bottom corners of the screen are empty in the game's layout.
@@ -28,6 +34,7 @@ use crate::advisor::{self, PickValue};
 use crate::diag;
 use crate::glm::sigmoid;
 use crate::history::Role;
+use crate::plan;
 use crate::shared::Snapshot;
 
 pub const GRID: &str = "main.champions.contents";
@@ -50,6 +57,11 @@ const DIM: u32 = 0xa3a9b6ff;
 const TEXT: u32 = 0xe8e8e8ff;
 const PANEL: u32 = 0x161721f0;
 
+/// The layer Smart Position Lock puts over a card the player's team may not pick.
+const POSITION_LOCK: &str = "spl_lock";
+const SWAP: &str = "main.swap";
+const SWAP_TABLES: [&str; 2] = ["main.swap.blue_table", "main.swap.red_table"];
+
 /// What the overlay shows besides the model.
 pub struct View<'a> {
     pub team_name: &'a str,
@@ -67,12 +79,33 @@ pub struct Card {
     pub blue: Option<u32>,
     pub red: Option<u32>,
     pub banned: bool,
+    /// Not pickable now (Fearless).
+    pub locked: bool,
+    /// Another mod's position lock covers it: the player's team may not pick it now.
+    pub held: bool,
+}
+
+impl Card {
+    /// Still on offer: not picked, banned or locked.
+    pub fn open(&self) -> bool {
+        self.blue.is_none() && self.red.is_none() && !self.banned && !self.locked
+    }
+}
+
+/// Which side the player is, and whether it is the swap phase (with the player's side known).
+#[derive(Clone, Copy)]
+struct Turn {
+    side: usize,
+    swapping: bool,
 }
 
 #[derive(Default)]
 pub struct DraftScreen {
     /// The other team on the last ban/pick screen ([`team_key`]), for scouting.
     pub enemy_team: Option<String>,
+    /// The champions both teams picked on the last ban/pick screen (player's team first), for
+    /// the tactics screen after it.
+    pub last_picks: Option<(Vec<u16>, Vec<u16>)>,
     on: bool,
     next_read: u64,
     /// The draft and model the overlay was last drawn for.
@@ -118,6 +151,8 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
                 blue: badge("blue"),
                 red: badge("red"),
                 banned: visible(ui, &format!("{path}.ban")),
+                locked: visible(ui, &format!("{path}.fearless_x")),
+                held: visible(ui, &format!("{path}.{POSITION_LOCK}")),
                 path,
             }
         })
@@ -171,7 +206,18 @@ fn overlay_source() -> String {
         color(RED),
         color(BLUE)
     );
-    let mut advice = String::new();
+    // the swap phase's seating, in the advice panel's place
+    let mut seating = label("title", 12, 4, 436, 22, 13, 0xe8e8e8ff, "Left");
+    for k in 0..5u32 {
+        let (x, y) = (12 + (k % 3) as i32 * 148, 30 + (k / 3) as i32 * 26);
+        seating.push_str(&format!(
+            "#s{k}:empty {{ x: {x}px; y: {y}px; width: 146px; height: 24px; ignore_event: true; \
+             #icon:image {{ x: 0px; y: 3px; width: 18px; height: 18px; color: #c2c6ceff; ignore_event: true; \
+             source: \"asset/base/ui/icons/top\"; }} {}}} ",
+            label("name", 22, 0, 122, 24, 13, TEXT, "Left")
+        ));
+    }
+    let mut advice = format!("#seating:empty {{ width: 100%; height: 100%; visible: false; ignore_event: true; {seating}}} ");
     for r in 0..ADVICE_ROWS {
         let y = 4 + r as u32 * 26;
         advice.push_str(&label(&format!("k{r}"), 12, y, 40, 24, 13, DIM, "Left"));
@@ -245,6 +291,9 @@ fn why(v: &PickValue) -> String {
     if v.mastery.abs() >= 0.02 {
         parts.push(format!("player {}", signed(points(v.mastery))));
     }
+    if v.exposure >= 0.02 {
+        parts.push(format!("counterable {}", signed(-points(v.exposure))));
+    }
     if v.balance > 0.0 {
         parts.push("one-sided".to_string());
     }
@@ -296,6 +345,7 @@ impl DraftScreen {
         let meta = &snapshot.meta;
         let known = |c: &str| meta.names.get(c).is_some();
         let cards = read_grid(ui, &known, names);
+        let swap_phase = ui.visible(SWAP) == Some(true);
         if !self.reported {
             self.reported = true;
             let named = cards.iter().filter(|c| c.champ.is_some()).count();
@@ -309,14 +359,16 @@ impl DraftScreen {
                 }
             ));
         }
+        // the seating needs to know which team is the player's
+        let side_known = side.is_some();
         let side = side.unwrap_or(0);
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for c in &cards {
-            (&c.champ, c.blue, c.red, c.banned).hash(&mut h);
+            (&c.champ, c.blue, c.red, c.banned, c.locked, c.held).hash(&mut h);
         }
-        (side, Arc::as_ptr(snapshot) as usize).hash(&mut h);
+        (side, Arc::as_ptr(snapshot) as usize, swap_phase).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -337,7 +389,42 @@ impl DraftScreen {
             ui.text(path).and_then(|t| view.rosters.get(&team_key(&t)).cloned()).unwrap_or_default()
         };
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
-        self.draw(ui, snapshot, &cards, side, &rosters, view);
+        let turn = Turn { side, swapping: swap_phase && side_known };
+        self.draw(ui, snapshot, &cards, turn, &rosters, view);
+    }
+
+    /// The best seating of the team's champions in the swap phase, written into the advice
+    /// panel. The seats are the team's swap slots in order (their position from the slot's
+    /// position label), each with the team's player for that position.
+    fn seating(
+        &self,
+        ui: &mut impl Ui,
+        snapshot: &Snapshot,
+        ally: &[u16],
+        side: usize,
+        players: &[(u32, Option<Role>)],
+    ) -> Option<()> {
+        if ally.len() != 5 {
+            return None;
+        }
+        let table = SWAP_TABLES[side];
+        let seats: Vec<plan::Seat> = (0..5)
+            .map(|i| {
+                let label = ui.text(&format!("{table}.swap_slot_{i}.data.position_name")).unwrap_or_default();
+                let role = label.strip_prefix("#asset/base/text/ui?position.").and_then(Role::parse).unwrap_or(Role::ALL[i]);
+                (role, players.iter().find(|(_, r)| *r == Some(role)).map(|(a, _)| *a))
+            })
+            .collect();
+        let infos = super::athlete_infos();
+        let (perm, gain) = plan::best_seating(&snapshot.meta, ally, &seats, &infos)?;
+        let pts = points(gain);
+        ui.set_text(&format!("{OVERLAY}.advice.seating.title"), &format!("Best seating 最佳换位  +{pts:.1}"));
+        for (k, (champ, (role, _))) in perm.iter().zip(&seats).enumerate() {
+            let cell = format!("{OVERLAY}.advice.seating.s{k}");
+            ui.set_properties(&format!("{cell}.icon"), &format!("source: \"{}\";", lane_icon(*role)));
+            ui.set_text(&format!("{cell}.name"), &name_ref(snapshot.meta.names.name(*champ)));
+        }
+        Some(())
     }
 
     fn draw(
@@ -345,10 +432,11 @@ impl DraftScreen {
         ui: &mut impl Ui,
         snapshot: &Snapshot,
         cards: &[Card],
-        side: usize,
+        turn: Turn,
         rosters: &[Vec<(u32, Option<Role>)>; 2],
         view: &View<'_>,
     ) {
+        let side = turn.side;
         let (players, enemy_players) = (&rosters[side], &rosters[1 - side]);
         let meta = &snapshot.meta;
         let id = |c: &Card| c.champ.as_deref().and_then(|n| meta.names.get(n));
@@ -362,9 +450,12 @@ impl DraftScreen {
         };
         let (blue, red) = (picks(true), picks(false));
         let (ally, enemy) = if side == 0 { (blue, red) } else { (red, blue) };
+        self.last_picks = Some((ally.clone(), enemy.clone()));
         let damage = |c: u16| snapshot.damage_of(c);
         let open: Vec<u16> =
-            cards.iter().filter(|c| c.blue.is_none() && c.red.is_none() && !c.banned).filter_map(&id).collect();
+            cards.iter().filter(|c| c.open()).filter_map(&id).collect();
+        // the champions the player's team may pick: open, and not held by a position lock
+        let pickable: Vec<u16> = cards.iter().filter(|c| c.open() && !c.held).filter_map(&id).collect();
 
         // win chance
         let p = advisor::win_probability(meta, &ally, &enemy);
@@ -372,7 +463,13 @@ impl DraftScreen {
         ui.set_text(&format!("{OVERLAY}.win.title"), &format!("Win chance 胜率 · {} vs {}", ally.len(), enemy.len()));
         ui.set_text(&format!("{OVERLAY}.win.value"), &format!("{:.0}%", p * 100.0));
         ui.set_properties(&format!("{OVERLAY}.win.value"), &format!("color: {};", color(mine)));
-        ui.set_text(&format!("{OVERLAY}.win.detail"), &format!("patch {} · {} matches", meta.current, meta.current_matches));
+        let fearless = cards.iter().filter(|c| c.locked).count();
+        let detail = if fearless > 0 {
+            format!("patch {} · Fearless {fearless} locked", meta.current)
+        } else {
+            format!("patch {} · {} matches", meta.current, meta.current_matches)
+        };
+        ui.set_text(&format!("{OVERLAY}.win.detail"), &detail);
         ui.set_properties(&format!("{OVERLAY}.win.back"), &format!("color: {};", color(theirs)));
         ui.set_properties(
             &format!("{OVERLAY}.win.back.fill"),
@@ -381,18 +478,26 @@ impl DraftScreen {
 
         // advice: the two best picks and the best ban
         let (ally_open, enemy_open) = (advisor::open_lanes(meta, &ally), advisor::open_lanes(meta, &enemy));
-        let mut pick_values: Vec<PickValue> = open
+        let (their_left, our_left) = (5usize.saturating_sub(enemy.len()), 5usize.saturating_sub(ally.len()));
+        let mut pick_values: Vec<PickValue> = pickable
             .iter()
-            .map(|c| advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open))
+            .map(|c| advisor::with_exposure(meta, advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open), their_left, &open))
             .collect();
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         let mut ban_values: Vec<PickValue> = open
             .iter()
-            .map(|c| advisor::ban_value_in(meta, *c, &ally, &enemy, enemy_players, &damage, &enemy_open))
+            .map(|c| advisor::with_exposure(meta, advisor::ban_value_in(meta, *c, &ally, &enemy, enemy_players, &damage, &enemy_open), our_left, &open))
             .collect();
         ban_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        let rows: [(&str, Option<&PickValue>); ADVICE_ROWS] =
-            [("Pick 选", pick_values.first()), ("Alt 备", pick_values.get(1)), ("Ban 禁", ban_values.first())];
+        // the swap phase: the best seating instead of picks and bans
+        let seating = if turn.swapping { self.seating(ui, snapshot, &ally, side, players) } else { None };
+        ui.set_visible(&format!("{OVERLAY}.advice.seating"), seating.is_some());
+        let rows: [(&str, Option<&PickValue>); ADVICE_ROWS] = if seating.is_some() {
+            [("", None), ("", None), ("", None)]
+        } else {
+            [("Pick 选", pick_values.first()), ("Alt 备", pick_values.get(1)), ("Ban 禁", ban_values.first())]
+        };
+
         for (r, (what, v)) in rows.iter().enumerate() {
             let row = |part: &str| format!("{OVERLAY}.advice.{part}{r}");
             ui.set_text(&row("k"), what);
@@ -502,6 +607,7 @@ mod tests {
                 ui.add(&format!("{path}.{badge}"), "color").visible = false;
                 ui.add(&format!("{path}.{badge}.text"), "label");
             }
+            ui.add(&format!("{path}.fearless_x"), "image").visible = false;
         }
         ui
     }
@@ -534,6 +640,10 @@ mod tests {
         pick(&mut ui, "a", "red", 1); // the enemy took "a"
         pick(&mut ui, "b", "blue", 1); // we took "b"
         ui.nodes.get_mut(&format!("{GRID}.e.ban")).unwrap().visible = true;
+        // Fearless: "g" was played earlier in the series
+        ui.add(&format!("{GRID}.g.fearless_x"), "image").visible = true;
+        // Smart Position Lock holds "c" (the strongest) for the player's team
+        ui.add(&format!("{GRID}.c.{POSITION_LOCK}"), "color_icon_button");
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
         let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
@@ -546,6 +656,8 @@ mod tests {
         let card = |n: &str| cards.iter().find(|c| c.champ.as_deref() == Some(n)).unwrap();
         assert_eq!(card("a").red, Some(1));
         assert!(card("e").banned && !card("d").banned);
+        assert!(card("g").locked && !card("g").open() && card("d").open());
+        assert!(card("c").held && card("c").open() && !card("d").held);
         assert_eq!(player_side(&ui, "mods fc"), Some(0), "the rank after the name is ignored");
         assert_eq!(screen.enemy_team.as_deref(), Some("rivals"));
 
@@ -554,12 +666,24 @@ mod tests {
         // champion names are the game's name references, shown in its language
         assert!(text("main.pma.advice.c0").starts_with("#asset/base/text/champion?description."));
         let advised = [text("main.pma.advice.c0"), text("main.pma.advice.c1")];
-        assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
+        assert!(!advised.contains(&name_ref("c")), "held by the position lock: {advised:?}");
         assert_eq!(text("main.pma.advice.k2"), "Ban 禁");
         // grid values on open cards only
         assert_eq!(ui.visible(&format!("{GRID}.a.{TAG}")), Some(false), "picked");
         assert_eq!(ui.visible(&format!("{GRID}.e.{TAG}")), Some(false), "banned");
-        assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(true));
+        assert_eq!(ui.visible(&format!("{GRID}.g.{TAG}")), Some(false), "locked by Fearless");
+        for row in 0..3 {
+            assert_ne!(text(&format!("main.pma.advice.c{row}")), name_ref("g"), "a locked champion is never advised");
+        }
+        assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(false), "held by the position lock");
+        assert_eq!(ui.visible(&format!("{GRID}.d.{TAG}")), Some(true));
+
+        // the lock lets go of "c": it is the best pick again
+        ui.remove(&format!("{GRID}.c.{POSITION_LOCK}"));
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        let text = |p: &str| ui.text(p).unwrap_or_default();
+        let advised = [text("main.pma.advice.c0"), text("main.pma.advice.c1")];
+        assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
         assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('▲'), "c is worth picking");
         assert!(ui.nodes[&format!("{GRID}.c.{TAG}.stripe")].props.iter().any(|p| p.contains(&color(GOOD))));
         // a lane read on the enemy's first pick slot: an icon and a confidence bar
@@ -570,11 +694,45 @@ mod tests {
 
         // nothing changed: nothing redrawn; the game rebuilt the screen: drawn again
         let spawned = ui.spawned.len();
-        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
         assert_eq!(ui.spawned.len(), spawned);
         ui.remove("main.pma");
-        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
+        screen.tick(&mut ui, 3 * READ_EVERY, Some(&snapshot), &book, &view);
         assert!(ui.exists("main.pma.win.value"));
+    }
+
+    #[test]
+    fn the_swap_phase_shows_the_best_seating() {
+        let snapshot = snapshot(1500);
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let mut ui = screen();
+        for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            pick(&mut ui, n, "blue", i as u32 + 1);
+        }
+        for (i, n) in ["f", "g", "h", "i", "j"].iter().enumerate() {
+            pick(&mut ui, n, "red", i as u32 + 1);
+        }
+        ui.add(SWAP, "empty");
+        for (i, r) in Role::ALL.iter().enumerate() {
+            ui.add(&format!("{}.swap_slot_{i}.data.position_name", SWAP_TABLES[0]), "label").text =
+                Some(format!("#asset/base/text/ui?position.{}", r.name().to_lowercase()));
+        }
+        let mut screen = DraftScreen::default();
+        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
+        assert_eq!(ui.visible("main.pma.advice.seating"), Some(true));
+        assert!(ui.text("main.pma.advice.seating.title").unwrap().starts_with("Best seating"));
+        let seated: Vec<String> = (0..5).map(|k| ui.text(&format!("main.pma.advice.seating.s{k}.name")).unwrap()).collect();
+        for n in ["a", "b", "c", "d", "e"] {
+            assert!(seated.contains(&name_ref(n)), "{n} seated: {seated:?}");
+        }
+        assert_eq!(ui.text("main.pma.advice.c0").unwrap_or_default(), "", "no pick advice in the swap phase");
+        assert_eq!(screen.last_picks.as_ref().map(|p| p.0.len()), Some(5), "the picks are kept for the tactics screen");
+        // the swap ends: back to advice
+        ui.nodes.get_mut(SWAP).unwrap().visible = false;
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        assert_eq!(ui.visible("main.pma.advice.seating"), Some(false));
     }
 
     #[test]

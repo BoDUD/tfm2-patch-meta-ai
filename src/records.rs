@@ -12,6 +12,12 @@
 //! the game hands the record a new id), `blue_team_id` / `red_team_id`, `blue_ban` / `red_ban`,
 //! and each player's athlete id (`athlete` or `athlete_id`, a number or an object with `id`).
 //!
+//! Also from competition records: each side's team strategy (`blue_strategy`: `early_jungle`,
+//! `minion_wave`, `game_finish`... -> the chosen option, or the variant name of an option that
+//! carries data, e.g. `{"Split131": {...}}` -> `Split131`), each player's gold at the end of the
+//! lane phase (`blue_performance.gold_line_phase`, in team-list order) and the game's length in
+//! ticks (`game_tick`).
+//!
 //! Solo-rank records name no lanes. Each player's `stat` holds their rating in every position
 //! (`top`, `jungle`, `mid`, `bottom`, `support`), so a side without lanes gets the one-to-one
 //! assignment of its players to lanes with the highest total rating.
@@ -24,6 +30,8 @@ pub struct Player {
     pub champion: String,
     pub position: Option<String>,
     pub athlete: Option<u32>,
+    /// Gold at the end of the lane phase.
+    pub lane_gold: Option<i32>,
 }
 
 const LANES: [&str; 5] = ["Top", "Jungle", "Mid", "Bottom", "Support"];
@@ -82,6 +90,10 @@ pub struct MatchSummary {
     /// Blue, red.
     pub teams: [Option<u32>; 2],
     pub bans: [Vec<String>; 2],
+    /// Each side's team strategy: (setting, chosen option).
+    pub strategies: [Vec<(String, String)>; 2],
+    /// Game length in ticks.
+    pub length: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -115,6 +127,16 @@ struct Layout {
     blue_ban: Option<Value>,
     #[serde(default)]
     red_ban: Option<Value>,
+    #[serde(default)]
+    blue_strategy: Option<Value>,
+    #[serde(default)]
+    red_strategy: Option<Value>,
+    #[serde(default)]
+    blue_performance: Option<Value>,
+    #[serde(default)]
+    red_performance: Option<Value>,
+    #[serde(default)]
+    game_tick: Option<Value>,
 }
 
 struct Fields<'a> {
@@ -126,6 +148,9 @@ struct Fields<'a> {
     seed: Option<&'a Value>,
     teams: [Option<&'a Value>; 2],
     bans: [Option<&'a Value>; 2],
+    strategies: [Option<&'a Value>; 2],
+    performance: [Option<&'a Value>; 2],
+    length: Option<&'a Value>,
 }
 
 /// Parses one record. `solo` records must say they were played (`"played": true`); unplayed
@@ -141,6 +166,9 @@ pub fn parse_record(json: &str, solo: bool) -> Parsed {
             seed: layout.seed.as_ref(),
             teams: [layout.blue_team_id.as_ref(), layout.red_team_id.as_ref()],
             bans: [layout.blue_ban.as_ref(), layout.red_ban.as_ref()],
+            strategies: [layout.blue_strategy.as_ref(), layout.red_strategy.as_ref()],
+            performance: [layout.blue_performance.as_ref(), layout.red_performance.as_ref()],
+            length: layout.game_tick.as_ref(),
         };
         if let Ok(parsed) = from_fields(&fields, solo, false) {
             return parsed;
@@ -160,6 +188,9 @@ pub fn parse_record(json: &str, solo: bool) -> Parsed {
         seed: find_key(&doc, "seed"),
         teams: [find_key(&doc, "blue_team_id"), find_key(&doc, "red_team_id")],
         bans: [find_key(&doc, "blue_ban"), find_key(&doc, "red_ban")],
+        strategies: [find_key(&doc, "blue_strategy"), find_key(&doc, "red_strategy")],
+        performance: [find_key(&doc, "blue_performance"), find_key(&doc, "red_performance")],
+        length: find_key(&doc, "game_tick"),
     };
     match from_fields(&fields, solo, true) {
         Ok(parsed) => parsed,
@@ -177,8 +208,10 @@ fn from_fields(f: &Fields<'_>, solo: bool, searched: bool) -> Result<Parsed, &'s
         }
     }
     let version = f.version.and_then(version_string).ok_or("version")?;
-    let blue = players(f.blue.ok_or("blue_team")?);
-    let red = players(f.red.ok_or("red_team")?);
+    let mut blue = players(f.blue.ok_or("blue_team")?);
+    let mut red = players(f.red.ok_or("red_team")?);
+    lane_gold(&mut blue, f.performance[0]);
+    lane_gold(&mut red, f.performance[1]);
     let blue_win = f.blue_win.and_then(as_bool).ok_or("blue_team_win")?;
     if blue.is_empty() && red.is_empty() {
         return Ok(Parsed::Invalid("no champions in blue_team / red_team".to_string()));
@@ -192,7 +225,40 @@ fn from_fields(f: &Fields<'_>, solo: bool, searched: bool) -> Result<Parsed, &'s
         seed: f.seed.and_then(as_u64),
         teams: [f.teams[0].and_then(id), f.teams[1].and_then(id)],
         bans: [f.bans[0].map(names).unwrap_or_default(), f.bans[1].map(names).unwrap_or_default()],
+        strategies: [f.strategies[0].map(strategy).unwrap_or_default(), f.strategies[1].map(strategy).unwrap_or_default()],
+        length: f.length.and_then(as_u64).and_then(|n| u32::try_from(n).ok()),
     }))
+}
+
+/// A team strategy as (setting, chosen option): a plain option, or the variant name of an
+/// option that carries data (`{"Split131": {...}}`).
+pub fn strategy(v: &Value) -> Vec<(String, String)> {
+    let Value::Object(map) = v else { return Vec::new() };
+    let mut out: Vec<(String, String)> = map
+        .iter()
+        .filter_map(|(k, v)| {
+            let option = match v {
+                Value::String(s) if !s.is_empty() => s.clone(),
+                Value::Object(inner) if inner.len() == 1 => inner.keys().next()?.clone(),
+                _ => return None,
+            };
+            Some((k.clone(), option))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Each player's gold at the end of the lane phase: `gold_line_phase`, one number per player in
+/// the order of the team's list (only when the counts agree).
+fn lane_gold(players: &mut [Player], performance: Option<&Value>) {
+    let Some(list) = performance.and_then(|p| p.get("gold_line_phase")).and_then(Value::as_array) else { return };
+    if list.len() != players.len() {
+        return;
+    }
+    for (p, g) in players.iter_mut().zip(list) {
+        p.lane_gold = g.as_i64().and_then(|g| i32::try_from(g).ok());
+    }
 }
 
 fn as_u64(v: &Value) -> Option<u64> {
@@ -347,7 +413,7 @@ fn player(map: &Map<String, Value>) -> Option<Player> {
         .find_map(|k| map.get(*k))
         .and_then(label);
     let athlete = ["athlete", "athlete_id"].iter().find_map(|k| map.get(*k)).and_then(id);
-    Some(Player { champion, position, athlete })
+    Some(Player { champion, position, athlete, lane_gold: None })
 }
 
 /// Lane labels: `"Top"`, or a unit enum written as `{"Top": null}`, or an index.
@@ -451,6 +517,10 @@ mod tests {
         "version": "1.3", "seed": 99, "blue_team_win": true,
         "blue_team_id": 7, "red_team_id": {"id": 12},
         "blue_ban": ["monk", null, {"champion": "ninja"}], "red_ban": [{"name": "sniper"}],
+        "game_tick": 50848,
+        "blue_strategy": {"early_jungle": "CounterJungle", "morgard_use": {"Split131": {"position1": "Top"}}, "odd": 3},
+        "red_strategy": {"early_jungle": "GrowthAndCover"},
+        "blue_performance": {"gold_line_phase": [3101, 2104, 2301, 2502, 1326], "kills": [1, 2, 3, 4, 5]},
         "blue_team": [
             {"athlete": 1, "champion": "fighter", "position": "Top", "items": [{"champion": "x"}]},
             {"athlete": 2, "champion": "ninja", "position": "Jungle"},
@@ -475,8 +545,16 @@ mod tests {
         assert_eq!(m.red.len(), 5);
         assert_eq!(
             m.blue[0],
-            Player { champion: "fighter".into(), position: Some("Top".into()), athlete: Some(1) }
+            Player { champion: "fighter".into(), position: Some("Top".into()), athlete: Some(1), lane_gold: Some(3101) }
         );
+        assert_eq!(m.blue[4].lane_gold, Some(1326));
+        assert_eq!(m.red[0].lane_gold, None, "no performance for red");
+        assert_eq!(m.length, Some(50848));
+        assert_eq!(
+            m.strategies[0],
+            [("early_jungle".to_string(), "CounterJungle".to_string()), ("morgard_use".to_string(), "Split131".to_string())]
+        );
+        assert_eq!(m.strategies[1], [("early_jungle".to_string(), "GrowthAndCover".to_string())]);
         assert_eq!(m.red[4].champion, "shaman");
         assert_eq!(m.red[4].athlete, None);
         assert_eq!(m.seed, Some(99));
@@ -493,8 +571,8 @@ mod tests {
         let Parsed::Match(m) = parse_record(json, false) else { panic!() };
         assert_eq!(m.version, "2.10");
         assert!(!m.blue_win && m.searched);
-        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()), athlete: None }]);
-        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()), athlete: None }]);
+        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()), athlete: None, lane_gold: None }]);
+        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()), athlete: None, lane_gold: None }]);
         assert_eq!(m.bans, [Vec::<String>::new(), Vec::new()], "bans inside a team are not read");
     }
 

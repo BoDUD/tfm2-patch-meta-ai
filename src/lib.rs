@@ -18,6 +18,7 @@
 //! implementation with its own model.
 
 pub mod advisor;
+pub mod cache;
 mod client;
 pub mod compat;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod model;
 mod paths;
 pub mod patchnotes;
 mod perf;
+pub mod plan;
 pub mod records;
 pub mod report;
 pub mod scan;

@@ -8,10 +8,12 @@
 //! is gone, and nothing assumes a node exists without asking.
 
 pub mod draft_screen;
+pub mod lineup_screen;
 pub mod explore;
 pub mod names;
 pub mod page;
 pub mod panel;
+pub mod tactics_screen;
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -166,6 +168,41 @@ pub struct Context {
     /// The player's opponent in their newest competition match (lower case).
     pub last_opponent: Option<String>,
     pub backtest: Option<crate::meta::Backtest>,
+    /// The player's athletes (recent line-ups and last starting five).
+    pub squad: Vec<u32>,
+    /// The team's strategy as set now: (setting, option).
+    pub current_strategy: Vec<(String, String)>,
+}
+
+/// Athletes the screens want to know more about (their records are read by the client, a few
+/// per frame), and what is known.
+static WANTED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static INFOS: Mutex<Option<HashMap<u32, crate::plan::AthleteInfo>>> = Mutex::new(None);
+
+/// Asks for these athletes' records.
+pub fn want_athletes(ids: &[u32]) {
+    let known = INFOS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut wanted = WANTED.lock().unwrap_or_else(PoisonError::into_inner);
+    for id in ids {
+        if known.as_ref().is_none_or(|k| !k.contains_key(id)) && !wanted.contains(id) {
+            wanted.push(*id);
+        }
+    }
+}
+
+/// The athletes asked for since the last call.
+pub fn take_wanted() -> Vec<u32> {
+    std::mem::take(&mut *WANTED.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// An athlete's record was read.
+pub fn learn_athlete(id: u32, info: crate::plan::AthleteInfo) {
+    INFOS.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(id, info);
+}
+
+/// What is known about athletes.
+pub fn athlete_infos() -> HashMap<u32, crate::plan::AthleteInfo> {
+    INFOS.lock().unwrap_or_else(PoisonError::into_inner).clone().unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -176,6 +213,8 @@ struct State {
     draft: draft_screen::DraftScreen,
     panel: panel::Panel,
     page: page::MetaPage,
+    tactics: tactics_screen::TacticsScreen,
+    lineup: lineup_screen::LineupScreen,
     context: Context,
 }
 
@@ -202,6 +241,8 @@ pub fn set_context(context: Context) {
 /// The save was closed.
 pub fn reset() {
     *lock() = None;
+    *INFOS.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    WANTED.lock().unwrap_or_else(PoisonError::into_inner).clear();
 }
 
 /// One frame of everything on screen (a save is open).
@@ -235,6 +276,11 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         keys: &keys,
     };
     time(Part::Panel, || st.panel.tick(ui, &f));
+    if cfg.draft_overlay {
+        let team = st.draft.last_picks.as_ref().map(|(ally, _)| ally.as_slice());
+        time(Part::Draft, || st.tactics.tick(ui, frame, snapshot.as_deref(), team));
+        time(Part::Draft, || st.lineup.tick(ui, frame, snapshot.as_deref()));
+    }
     if cfg.meta_page {
         time(Part::Page, || st.page.tick(ui, &f));
     }

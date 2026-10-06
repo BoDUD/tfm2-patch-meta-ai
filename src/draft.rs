@@ -7,6 +7,9 @@
 //!
 //! The value (log-odds) goes through `tanh(value / edge_scale)` so one extreme estimate cannot
 //! swamp the game's own reasoning, then `pick_strength` / `ban_strength` scale it.
+//!
+//! Position locks are another mod's job (Smart Position Lock): its "out of reach" score replaces
+//! the game's, which no nudge here can undo.
 
 use mod_api_stable::{StableDraftContext, StableDraftDecision, StableDraftHook};
 
@@ -41,7 +44,9 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
     let Some(cand) = ctx.champion_name(candidate).and_then(|n| snapshot.meta.names.get(n)) else {
         return StableDraftDecision::Pass;
     };
-    let value = value(&snapshot, cand, &ids(ctx.ally_picks()), &ids(ctx.enemy_picks()), ban);
+    let ally = ids(ctx.ally_picks());
+    let offer = ids(ctx.available_champions());
+    let value = value(&snapshot, cand, &ally, &ids(ctx.enemy_picks()), ban, &offer);
     let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
     decision(amount(value, cfg.edge_scale, strength))
 }
@@ -66,15 +71,19 @@ fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<crate::history::Role> {
     })
 }
 
-/// The model's value (log-odds) of picking or banning `cand` in this draft.
-pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool) -> f32 {
+/// The model's value (log-odds) of picking or banning `cand` in this draft. `offer` is what is
+/// still on offer (for how counterable a pick is while the other side has picks left).
+pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool, offer: &[u16]) -> f32 {
     let damage = |c: u16| snapshot.damage_of(c);
+    let meta = &snapshot.meta;
     if ban {
         let open = open_lanes(snapshot, enemy);
-        advisor::ban_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
+        let v = advisor::ban_value_in(meta, cand, ally, enemy, &[], &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(ally.len()), offer).total
     } else {
         let open = open_lanes(snapshot, ally);
-        advisor::pick_value_in(&snapshot.meta, cand, ally, enemy, &[], &damage, &open).total
+        let v = advisor::pick_value_in(meta, cand, ally, enemy, &[], &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(enemy.len()), offer).total
     }
 }
 
