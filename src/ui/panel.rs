@@ -142,7 +142,7 @@ impl Panel {
     /// One frame. `opponent` = the team to scout (lower-case name).
     pub fn tick(&mut self, ui: &mut impl Ui, f: &Frame<'_>) {
         let (frame, snapshot, context, opponent, screen, clicks) = (f.frame, f.snapshot, f.context, f.opponent, f.screen, f.clicks);
-        let keys = ui.keys_pressed();
+        let keys = f.keys;
         let pressed = keys.iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
         let clicked = clicks.iter().any(|c| c.ends_with(&format!("{NODE}.box.close")));
         let close = clicked || keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
@@ -440,7 +440,7 @@ mod tests {
         let mut panel = Panel::default();
         let press = |ui: &mut FakeUi, panel: &mut Panel, frame: u64| {
             ui.keys = vec!["F8".into()];
-            panel.tick(ui, &Frame { frame, snapshot: Some(&snapshot), context: &context, opponent: Some("rivals"), screen: "Main/Home", clicks: &[] });
+            panel.tick(ui, &Frame { frame, snapshot: Some(&snapshot), context: &context, opponent: Some("rivals"), screen: "Main/Home", clicks: &[], keys: &ui.keys.clone() });
             ui.keys.clear();
         };
         press(&mut ui, &mut panel, 1);
@@ -452,7 +452,8 @@ mod tests {
         assert!(ui.spawned.last().unwrap().1.contains("Model"));
         // rebuilt by the game: back after a moment
         ui.remove("main.pma_panel");
-        panel.tick(&mut ui, &Frame { frame: 1000, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &[] });
+        let k = ui.keys.clone();
+        panel.tick(&mut ui, &Frame { frame: 1000, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &[], keys: &k });
         assert!(ui.exists("main.pma_panel"));
         let source = ui.spawned.last().unwrap().1.clone();
         press(&mut ui, &mut panel, 1001);
@@ -465,12 +466,14 @@ mod tests {
         press(&mut ui, &mut panel, 1100);
         assert!(panel.is_open());
         ui.keys = vec!["Escape".into()];
-        panel.tick(&mut ui, &Frame { frame: 1101, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &[] });
+        let k = ui.keys.clone();
+        panel.tick(&mut ui, &Frame { frame: 1101, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &[], keys: &k });
         ui.keys.clear();
         assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
         press(&mut ui, &mut panel, 1200);
         assert!(panel.is_open());
-        panel.tick(&mut ui, &Frame { frame: 1201, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Squad", clicks: &[] });
+        let k = ui.keys.clone();
+        panel.tick(&mut ui, &Frame { frame: 1201, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Squad", clicks: &[], keys: &k });
         assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
 
         // the close button
@@ -478,7 +481,8 @@ mod tests {
         assert!(ui.exists("main.pma_panel.box.close"));
         ui.click("main.pma_panel.box.close");
         let clicks = crate::ui::take_clicks();
-        panel.tick(&mut ui, &Frame { frame: 1301, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &clicks });
+        let k = ui.keys.clone();
+        panel.tick(&mut ui, &Frame { frame: 1301, snapshot: Some(&snapshot), context: &context, opponent: None, screen: "Main/Home", clicks: &clicks, keys: &k });
         assert!(!panel.is_open() && !ui.exists("main.pma_panel"));
         press(&mut ui, &mut panel, 1400);
         assert!(panel.is_open(), "opens again after a click closed it");

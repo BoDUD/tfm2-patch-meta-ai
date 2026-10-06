@@ -132,10 +132,11 @@ pub struct ClientExt;
 impl StableExtension for ClientExt {
     fn post_update(&self, ctx: &mut StableClient<'_>, _dt_micros: u64) {
         let in_game = ctx.is_in_game();
-        tick(&mut ClientGame { ctx }, in_game, Instant::now());
+        crate::perf::time(crate::perf::Part::Client, || tick(&mut ClientGame { ctx }, in_game, Instant::now()));
         if in_game {
             let scene = ctx.client_scene_kind();
             crate::ui::tick(ctx, scene, &config::get());
+            crate::perf::end_frame(&format!("{scene:?}"));
         } else {
             crate::ui::reset();
         }
@@ -147,12 +148,12 @@ const LIST_EVERY: Duration = Duration::from_secs(10);
 /// Unplayed solo-rank matches looked at again once per in-game day, oldest first.
 const RECHECK_UNPLAYED: usize = 200;
 const REBUILD_EVERY: Duration = Duration::from_secs(5);
-const REPORT_EVERY: Duration = Duration::from_secs(30);
+/// meta_table.txt and meta_report.html are rewritten at most this often.
+const FILES_EVERY: Duration = Duration::from_secs(30);
 const NEWS_EVERY: Duration = Duration::from_secs(300);
 /// Records read per save at most (newest first); older ones add little to the current patch.
 const BACKLOG_COMPETITION: u32 = 3000;
 const BACKLOG_SOLO: u32 = 2000;
-const TABLE_EVERY: Duration = Duration::from_secs(10);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Average reading time per frame. A record that takes longer is paid back over the next
 /// frames (no reading until then), so a heavy replay costs one short hitch, not a slow game.
@@ -178,10 +179,9 @@ struct State {
     news_read_at: Option<Instant>,
     /// The newest played version when the news was last read.
     news_version: Option<String>,
-    table_written_at: Option<Instant>,
-    table: Option<String>,
-    report_written_at: Option<Instant>,
-    report: Option<String>,
+    /// The newest fit's files (table, report) are waiting to be written.
+    files: Option<Files>,
+    files_written_at: Option<Instant>,
     last_summary: String,
     /// The tier plan was built after every listed record had been read.
     plan_complete: bool,
@@ -222,10 +222,8 @@ impl State {
             notes: Vec::new(),
             news_read_at: None,
             news_version: None,
-            table_written_at: None,
-            table: None,
-            report_written_at: None,
-            report: None,
+            files: None,
+            files_written_at: None,
             last_summary: String::new(),
             plan_complete: false,
             tiers: TierSync::default(),
@@ -351,16 +349,15 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         rebuild(st, game, cfg, team, now, caught_up);
     }
     collect(st, cfg, team);
-    if st.table.is_some() && due(st.table_written_at.map(|t| t + TABLE_EVERY), now) {
-        st.table_written_at = Some(now);
-        if let Some(text) = st.table.take() {
-            diag::write_table(&text);
-        }
-    }
-    if st.report.is_some() && due(st.report_written_at.map(|t| t + REPORT_EVERY), now) {
-        st.report_written_at = Some(now);
-        if let Some(text) = st.report.take() {
-            diag::write_file(diag::REPORT_FILE, &text);
+    // the files are built and written on a thread of their own: a big report is a few
+    // milliseconds of formatting the frame need not wait for
+    if st.files.is_some() && due(st.files_written_at.map(|t| t + FILES_EVERY), now) {
+        st.files_written_at = Some(now);
+        if let (Some(files), Some(snapshot)) = (st.files.take(), shared::get()) {
+            let write = move || files.write(&snapshot);
+            if std::thread::Builder::new().name(format!("{}-files", crate::MOD_ID)).spawn(write).is_err() {
+                diag::log_once("files-thread", "could not start the thread that writes meta_table.txt / meta_report.html");
+            }
         }
     }
 
@@ -798,12 +795,33 @@ fn collect(st: &mut State, cfg: &Config, team: usize) {
         }
         st.last_summary = summary;
     }
-    let tier_map: HashMap<String, Tier> = tiers.into_iter().collect();
-    st.table = Some(report::table(&meta, &tier_map, &st.labels, &st.last_summary, st.backtest.as_ref()));
-    if cfg.report {
-        st.report = Some(report::html(&meta, &tier_map, &st.labels, st.backtest.as_ref()));
+    st.files = Some(Files {
+        tiers: tiers.into_iter().collect(),
+        labels: st.labels.clone(),
+        summary: st.last_summary.clone(),
+        backtest: st.backtest,
+        html: cfg.report,
+    });
+    shared::publish(shared::Snapshot::new(meta, st.damage.clone()));
+}
+
+/// What the report files are built from, besides the published model.
+struct Files {
+    tiers: HashMap<String, Tier>,
+    labels: Labels,
+    summary: String,
+    backtest: Option<Backtest>,
+    html: bool,
+}
+
+impl Files {
+    fn write(&self, snapshot: &shared::Snapshot) {
+        let meta = &snapshot.meta;
+        diag::write_table(&report::table(meta, &self.tiers, &self.labels, &self.summary, self.backtest.as_ref()));
+        if self.html {
+            diag::write_file(diag::REPORT_FILE, &report::html(meta, &self.tiers, &self.labels, self.backtest.as_ref()));
+        }
     }
-    shared::publish(shared::Snapshot { meta, damage: st.damage.clone() });
 }
 
 fn tier_counts(tiers: &BTreeMap<String, Tier>) -> String {

@@ -191,8 +191,27 @@ pub fn pick_value(
     players: &Roster,
     damage: &dyn Fn(u16) -> Option<Damage>,
 ) -> PickValue {
-    let taken = lanes(meta, ally);
-    let open: Vec<Role> = Role::ALL.into_iter().filter(|r| !taken.roles.contains(r)).collect();
+    pick_value_in(meta, cand, ally, enemy, players, damage, &open_lanes(meta, ally))
+}
+
+/// The lanes a team that picked `picks` still has to fill (worked out once per draft state,
+/// not once per candidate).
+pub fn open_lanes(meta: &Meta, picks: &[u16]) -> Vec<Role> {
+    let taken = lanes(meta, picks);
+    Role::ALL.into_iter().filter(|r| !taken.roles.contains(r)).collect()
+}
+
+/// [`pick_value`] with the team's open lanes already known.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_value_in(
+    meta: &Meta,
+    cand: u16,
+    ally: &[u16],
+    enemy: &[u16],
+    players: &Roster,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    open: &[Role],
+) -> PickValue {
     // the open lane it plays most often (not the one whose estimate happens to be highest:
     // that would favour lucky noise); strength only breaks ties
     let (role, strength) = open
@@ -246,14 +265,23 @@ pub fn ban_value(
     enemy_players: &Roster,
     damage: &dyn Fn(u16) -> Option<Damage>,
 ) -> PickValue {
-    let mut v = pick_value(meta, cand, enemy, ally, enemy_players, damage);
-    let typical = if meta.champions.is_empty() {
-        0.0
-    } else {
-        meta.champions.iter().map(|c| c.presence()).sum::<f32>() / meta.champions.len() as f32
-    };
+    ban_value_in(meta, cand, ally, enemy, enemy_players, damage, &open_lanes(meta, enemy))
+}
+
+/// [`ban_value`] with the enemy's open lanes already known.
+#[allow(clippy::too_many_arguments)]
+pub fn ban_value_in(
+    meta: &Meta,
+    cand: u16,
+    ally: &[u16],
+    enemy: &[u16],
+    enemy_players: &Roster,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    enemy_open: &[Role],
+) -> PickValue {
+    let mut v = pick_value_in(meta, cand, enemy, ally, enemy_players, damage, enemy_open);
     let presence = meta.by_id(cand).map_or(0.0, |c| c.presence());
-    let factor = crate::model::presence_factor(presence, typical);
+    let factor = crate::model::presence_factor(presence, meta.typical_presence);
     // a weak champion is not worth a ban however popular it is
     v.total = if v.total > 0.0 { v.total * factor } else { v.total };
     v
@@ -341,6 +369,52 @@ mod tests {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4);
         }
         assert!(lane_probabilities(&m, &[]).is_empty());
+    }
+
+    /// `cargo test --release -- --ignored --nocapture advice_time`: one draft state, 120
+    /// candidates valued for pick and ban, the way the overlay does it - per candidate (as
+    /// before) and with the per-state work done once.
+    #[test]
+    #[ignore]
+    fn advice_time() {
+        use crate::history::{Game, Names, Slot};
+        let mut names = Names::default();
+        let champions: Vec<String> = (0..130).map(|i| format!("c{i}")).collect();
+        for c in &champions {
+            names.id(c);
+        }
+        let mut rng = crate::glm::tests::Lcg(4);
+        let games: Vec<Game> = (0..3000)
+            .map(|id| {
+                let mut sides: [Vec<Slot>; 2] = [Vec::new(), Vec::new()];
+                for side in &mut sides {
+                    for r in Role::ALL {
+                        let champ = (r.index() as f32 * 25.0 + rng.next() * 30.0) as u16 % 130;
+                        side.push(Slot { champ, role: Some(r), athlete: Some((rng.next() * 200.0) as u32) });
+                    }
+                }
+                Game { record: id, solo: false, version: "1.1".into(), blue_win: rng.next() < 0.5, teams: [None, None], sides, bans: [vec![], vec![]], length: None }
+            })
+            .collect();
+        let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());
+        let (ally, enemy) = ([3u16, 40, 77], [10u16, 55]);
+        let none = |_: u16| None;
+        let started = std::time::Instant::now();
+        for c in 0..120u16 {
+            pick_value(&m, c, &ally, &enemy, &[], &none);
+            // as before: the average presence over every champion, per candidate
+            let typical = m.champions.iter().map(|c| c.presence()).sum::<f32>() / m.champions.len() as f32;
+            std::hint::black_box(typical);
+            ban_value(&m, c, &ally, &enemy, &[], &none);
+        }
+        let before = started.elapsed();
+        let started = std::time::Instant::now();
+        let (a, e) = (open_lanes(&m, &ally), open_lanes(&m, &enemy));
+        for c in 0..120u16 {
+            pick_value_in(&m, c, &ally, &enemy, &[], &none, &a);
+            ban_value_in(&m, c, &ally, &enemy, &[], &none, &e);
+        }
+        eprintln!("one draft state, 120 candidates: per candidate {before:?}, shared {:?}", started.elapsed());
     }
 
     #[test]

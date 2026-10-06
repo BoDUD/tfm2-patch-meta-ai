@@ -187,6 +187,8 @@ pub struct Meta {
     pub current_matches: u32,
     pub matches: u32,
     pub solo_matches: u32,
+    /// The average champion's presence this patch (picks + bans per match), for ban weights.
+    pub typical_presence: f32,
     /// Fitted parameters, for a warm start next time.
     pub keys: Vec<Key>,
     pub beta: Vec<f32>,
@@ -488,7 +490,13 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         });
     }
 
+    let typical_presence = if champions.is_empty() {
+        0.0
+    } else {
+        champions.iter().map(|c| c.presence()).sum::<f32>() / champions.len() as f32
+    };
     let mut out = Meta {
+        typical_presence,
         current: inp.current.to_string(),
         versions,
         champions,

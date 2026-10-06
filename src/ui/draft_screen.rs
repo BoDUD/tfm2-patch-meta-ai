@@ -37,7 +37,8 @@ const LANE_TAG: &str = "pma_lane";
 const BLUE_NAME: &str = "main.bottom.blue_side.name";
 const RED_NAME: &str = "main.bottom.red_side.name";
 const PICK_COLUMNS: [&str; 2] = ["main.blue_picks", "main.red_picks"];
-const READ_EVERY: u64 = 6;
+/// Frames between two reads of the grid (131 cards, three node reads each).
+const READ_EVERY: u64 = 10;
 /// Matches the model needs before its advice is shown.
 const MIN_MATCHES: u32 = 10;
 
@@ -317,8 +318,12 @@ impl DraftScreen {
         }
         (side, Arc::as_ptr(snapshot) as usize).hash(&mut h);
         let key = h.finish() | 1 << 63;
+        // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
+        // grid loses all of them; asking every card each time would be 131 more calls)
+        let tagged: Vec<&Card> = cards.iter().filter(|c| c.champ.is_some()).collect();
         let healthy = ui.exists(OVERLAY)
-            && cards.iter().all(|c| !view.grid_values || c.champ.is_none() || ui.exists(&format!("{}.{TAG}", c.path)));
+            && (!view.grid_values
+                || [tagged.first(), tagged.last()].into_iter().flatten().all(|c| ui.exists(&format!("{}.{TAG}", c.path))));
         if self.drawn == Some(key) && healthy {
             return;
         }
@@ -375,11 +380,16 @@ impl DraftScreen {
         );
 
         // advice: the two best picks and the best ban
-        let mut pick_values: Vec<PickValue> =
-            open.iter().map(|c| advisor::pick_value(meta, *c, &ally, &enemy, players, &damage)).collect();
+        let (ally_open, enemy_open) = (advisor::open_lanes(meta, &ally), advisor::open_lanes(meta, &enemy));
+        let mut pick_values: Vec<PickValue> = open
+            .iter()
+            .map(|c| advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open))
+            .collect();
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        let mut ban_values: Vec<PickValue> =
-            open.iter().map(|c| advisor::ban_value(meta, *c, &ally, &enemy, enemy_players, &damage)).collect();
+        let mut ban_values: Vec<PickValue> = open
+            .iter()
+            .map(|c| advisor::ban_value_in(meta, *c, &ally, &enemy, enemy_players, &damage, &enemy_open))
+            .collect();
         ban_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         let rows: [(&str, Option<&PickValue>); ADVICE_ROWS] =
             [("Pick 选", pick_values.first()), ("Alt 备", pick_values.get(1)), ("Ban 禁", ban_values.first())];

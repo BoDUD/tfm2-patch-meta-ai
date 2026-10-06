@@ -284,6 +284,8 @@ pub struct MetaPage {
     screen: String,
     next_heal: u64,
     nav_seen: bool,
+    /// The entry's look as last written.
+    nav_lit: Option<bool>,
     registered: HashSet<String>,
 }
 
@@ -303,6 +305,7 @@ impl Default for MetaPage {
             screen: String::new(),
             next_heal: 0,
             nav_seen: false,
+            nav_lit: None,
             registered: HashSet::new(),
         }
     }
@@ -349,6 +352,7 @@ impl MetaPage {
                 return;
             }
             self.nav_seen = true;
+            self.nav_lit = Some(false);
             // only our own button: nothing is attached to the game's menu entries (their runner
             // is touchy); picking one of them changes the screen, which closes the page
             self.register(ui, &format!("{NAV}.button"));
@@ -358,8 +362,7 @@ impl MetaPage {
             }
         }
 
-        let keys = ui.keys_pressed();
-        let escape = keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
+        let escape = f.keys.iter().any(|k| CLOSE_KEYS.iter().any(|c| k.eq_ignore_ascii_case(c)));
         let was_open = self.open;
         for click in clicks {
             self.on_click(ui, click);
@@ -387,7 +390,10 @@ impl MetaPage {
             if ui.visible(RIGHT) != Some(false) {
                 ui.set_visible(RIGHT, false);
             }
-            ui.set_properties(&format!("{NAV}.button"), &nav_style(true));
+            if self.nav_lit != Some(true) {
+                self.nav_lit = Some(true);
+                ui.set_properties(&format!("{NAV}.button"), &nav_style(true));
+            }
         }
         let Some(snapshot) = snapshot.filter(|s| s.meta.matches + s.meta.solo_matches > 0) else {
             if self.drawn != Some(0) {
@@ -486,6 +492,7 @@ impl MetaPage {
         ui.remove(PAGE);
         ui.set_visible(RIGHT, true);
         ui.set_properties(&format!("{NAV}.button"), &nav_style(false));
+        self.nav_lit = Some(false);
         self.open = false;
         self.drawn = None;
         self.spawned = 0;
@@ -556,10 +563,14 @@ impl MetaPage {
 
     /// The table: rows in the current order, spawned a batch per frame, filled in place.
     fn grow_rows(&mut self, ui: &mut impl Ui, snapshot: &Snapshot) {
+        let want = self.drawn.unwrap_or(0) ^ (self.sort as u64) << 8 ^ (self.descending as u64) << 16 ^ self.lane.map_or(7, |r| r as u64) << 20;
+        // filled for this model, sort and lane, every row spawned: nothing to do this frame
+        if self.filled == Some(want) && self.spawned >= self.order.len() {
+            return;
+        }
         let meta = &snapshot.meta;
         let tiers: HashMap<String, Tier> = crate::meta::tiers(meta, 10.0, [10.0, 20.0, 40.0, 20.0]).into_iter().collect();
         let rows = self.rows(meta, &tiers);
-        let want = self.drawn.unwrap_or(0) ^ (self.sort as u64) << 8 ^ (self.descending as u64) << 16 ^ self.lane.map_or(7, |r| r as u64) << 20;
         let order: Vec<u16> = rows.iter().map(|r| r.c.id).collect();
         let refill = self.filled != Some(want) || order != self.order;
         self.order = order;
@@ -1215,7 +1226,8 @@ mod tests {
 
     fn frame(page: &mut MetaPage, ui: &mut FakeUi, n: u64, snapshot: &Snapshot, context: &Context, screen: &str) {
         let clicks = take_clicks();
-        page.tick(ui, &Frame { frame: n, snapshot: Some(snapshot), context, opponent: Some("rivals"), screen, clicks: &clicks });
+        let keys = ui.keys.clone();
+        page.tick(ui, &Frame { frame: n, snapshot: Some(snapshot), context, opponent: Some("rivals"), screen, clicks: &clicks, keys: &keys });
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod meta;
 pub mod model;
 mod paths;
 pub mod patchnotes;
+mod perf;
 pub mod records;
 pub mod report;
 pub mod scan;
