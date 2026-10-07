@@ -275,7 +275,8 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
         }
     };
     let v = cfg.patches;
-    check("patches", &mut cfg.patches, (1.0..=40.0).contains(&v), d.patches);
+    // the scanners keep the newest scan::KEPT_PATCHES patches: more cannot be used
+    check("patches", &mut cfg.patches, (1.0..=crate::scan::KEPT_PATCHES as f32).contains(&v), d.patches);
     let v = cfg.patch_shift;
     check("patch_shift", &mut cfg.patch_shift, (0.0..=0.2).contains(&v), d.patch_shift);
     let v = cfg.solo_weight;

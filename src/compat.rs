@@ -94,7 +94,7 @@ impl Others {
     }
 }
 
-static OTHERS: RwLock<Option<Others>> = RwLock::new(None);
+static OTHERS: RwLock<Option<std::sync::Arc<Others>>> = RwLock::new(None);
 
 /// `<game>/config/game/mods.json`, found from the game executable.
 fn mods_json() -> Option<PathBuf> {
@@ -122,17 +122,18 @@ pub fn load() {
     if let Some(name) = others.position_lock() {
         diag::log(&format!("\"{name}\" locks positions: its locks hold the AI's picks, and the advice skips cards it locked"));
     }
-    *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(others);
+    *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(others));
 }
 
-pub fn get() -> Others {
+/// The other mods (shared: the draft hook asks for every candidate).
+pub fn get() -> std::sync::Arc<Others> {
     OTHERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap_or_default()
 }
 
 /// Test support.
 #[doc(hidden)]
 pub fn set(others: Others) {
-    *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(others);
+    *OTHERS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(others));
 }
 
 #[cfg(test)]

@@ -333,6 +333,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
             st.out_of_game = false;
             st.next_identity = Some(now + IDENTITY_EVERY);
             shared::clear();
+            crate::ui::forget_save();
             diag::reset_once();
             diag::log(&format!("save open: team #{} {:?}", identity.0, identity.1));
             // this save's matches from earlier sessions, if any (checked against the save later)
@@ -568,12 +569,13 @@ fn save_cache(st: &mut State, team: usize, now: Instant, caught_up: bool) {
     }
     st.cache_written = Some((now, count));
     let path = crate::cache::path(team, st.save.as_ref().map_or("", |s| s.1.as_str()));
-    let mut games: Vec<(u64, Match)> = st.comp.games.iter().chain(&st.solo.games).map(|(k, g)| (*k, g.clone())).collect();
+    let mut games: Vec<(u64, Arc<Match>)> = st.comp.games.iter().chain(&st.solo.games).map(|(k, g)| (*k, g.clone())).collect();
     // oldest first, so the file keeps the newest when it is trimmed
-    games.sort_by_key(|(_, g)| g.record);
+    // matches kept from earlier sessions have no record id (0): their patch orders them
+    games.sort_by(|(_, a), (_, b)| a.record.cmp(&b.record).then_with(|| crate::records::compare_versions(&a.version, &b.version)));
     let names = st.names.clone();
     let write = move || {
-        let text = crate::cache::encode(games.iter().map(|(k, g)| (k, g)), &names);
+        let text = crate::cache::encode(games.iter().map(|(k, g)| (k, &**g)), &names);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -868,7 +870,8 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         probe_records(game, team);
     }
 
-    let mut games: Vec<Match> = st.comp.games.values().cloned().collect();
+    // pointers only: the worker copies them (a copy of every game here took milliseconds)
+    let mut games: Vec<Arc<Match>> = st.comp.games.values().cloned().collect();
     if cfg.solo_weight > 0.0 {
         games.extend(st.solo.games.values().cloned());
     }

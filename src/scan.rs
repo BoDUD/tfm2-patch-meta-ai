@@ -66,7 +66,8 @@ pub struct Scanner {
     capped: bool,
     pub versions: BTreeMap<String, VersionStats>,
     /// Every usable match, by [`match_key`].
-    pub games: BTreeMap<u64, Game>,
+    /// Shared, so a rebuild hands the worker pointers, not copies (13k games take ~7 ms to copy).
+    pub games: BTreeMap<u64, std::sync::Arc<Game>>,
     pub counts: Counts,
     /// Every record id the game listed at the last refresh.
     pub listed: usize,
@@ -279,7 +280,7 @@ impl Scanner {
                 m.strategies[1].iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect(),
             ],
         };
-        self.games.insert(key, game);
+        self.games.insert(key, std::sync::Arc::new(game));
         let stats = self.versions.entry(m.version.clone()).or_default();
         stats.matches += 1;
         let mut count = |players: &[Player], won: bool| {
@@ -314,7 +315,7 @@ impl Scanner {
                 }
             }
         }
-        self.games.insert(key, game);
+        self.games.insert(key, std::sync::Arc::new(game));
         true
     }
 
@@ -335,16 +336,24 @@ impl Scanner {
 }
 
 /// Identifies a match across record ids: its seed, patch, champions and result (several
-/// matches could share a seed). Without a seed, the record id.
+/// matches could share a seed). Without a seed, the record id with the same contents (a pruned
+/// id the game hands to a new match is a new match).
 fn match_key(id: usize, m: &MatchSummary) -> u64 {
     use std::hash::{Hash, Hasher};
-    let Some(seed) = m.seed else { return id as u64 | 1 << 63 };
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    (seed, &m.version, m.blue_win).hash(&mut h);
+    match m.seed {
+        // exactly as before: the history files (`cache`) are recognised by these keys
+        Some(seed) => (seed, &m.version, m.blue_win).hash(&mut h),
+        None => (id, &m.version, m.blue_win).hash(&mut h),
+    }
     for p in m.blue.iter().chain(&m.red) {
         p.champion.hash(&mut h);
     }
-    h.finish() & !(1 << 63)
+    if m.seed.is_some() {
+        h.finish() & !(1 << 63)
+    } else {
+        h.finish() | 1 << 63
+    }
 }
 
 fn describe(id: usize, m: &MatchSummary, bytes: usize) -> String {
@@ -377,6 +386,34 @@ pub(crate) mod tests {
     pub struct FakeSave {
         pub records: Map<usize, String>,
         pub reads: u32,
+    }
+
+    #[test]
+    fn match_keys_stay_as_the_history_files_know_them() {
+        use std::hash::{Hash, Hasher};
+        let player = |c: &str| Player { champion: c.into(), position: None, athlete: None, lane_gold: None };
+        let m = MatchSummary {
+            version: "1.3".into(),
+            blue_win: true,
+            blue: vec![player("a"), player("b")],
+            red: vec![player("c")],
+            seed: Some(42),
+            ..Default::default()
+        };
+        // the key as 2.1 wrote it into history files: (seed, version, result), then the champions
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (42u64, &m.version, m.blue_win).hash(&mut h);
+        for c in ["a", "b", "c"] {
+            c.to_string().hash(&mut h);
+        }
+        assert_eq!(match_key(7, &m), h.finish() & !(1 << 63));
+        assert_eq!(match_key(7, &m), match_key(8, &m), "the same match under another record id");
+        // without a seed: the record id and the contents
+        let unseeded = MatchSummary { seed: None, ..m.clone() };
+        assert_ne!(match_key(7, &unseeded), match_key(8, &unseeded));
+        let other = MatchSummary { blue_win: false, ..unseeded.clone() };
+        assert_ne!(match_key(7, &unseeded), match_key(7, &other), "a reused record id is a new match");
+        assert!(match_key(7, &unseeded) & 1 << 63 != 0 && match_key(7, &m) & 1 << 63 == 0);
     }
 
     impl Source for FakeSave {
