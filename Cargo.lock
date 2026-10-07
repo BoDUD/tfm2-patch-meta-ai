@@ -20,7 +20,7 @@ version = "0.1.0"
 
 [[package]]
 name = "patch_meta_ai"
-version = "2.1.2"
+version = "2.1.3"
 dependencies = [
  "mod-api-stable",
  "serde",
