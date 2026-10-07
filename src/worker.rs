@@ -14,7 +14,8 @@ use crate::patchnotes::PatchNote;
 pub struct Job {
     /// Which rebuild this is (results of older ones are dropped).
     pub serial: u64,
-    pub games: Vec<Game>,
+    /// Shared with the client's scanners; copied on the worker thread.
+    pub games: Vec<std::sync::Arc<Game>>,
     pub names: Names,
     pub champions: Vec<String>,
     pub notes: Vec<PatchNote>,
@@ -38,8 +39,9 @@ fn holdout(games: usize) -> usize {
 
 fn run(job: Job, warm: Option<&Meta>) -> Done {
     let started = std::time::Instant::now();
+    let games: Vec<Game> = job.games.iter().map(|g| Game::clone(g)).collect();
     let inputs = Inputs {
-        games: &job.games,
+        games: &games,
         names: &job.names,
         champions: &job.champions,
         notes: &job.notes,
@@ -125,7 +127,7 @@ mod tests {
         let (names, games) = simulate(400, "1.1", |n| if n == "c" { 0.5 } else { 0.0 }, 3);
         Job {
             serial,
-            games,
+            games: games.into_iter().map(std::sync::Arc::new).collect(),
             names,
             champions: NAMES.iter().map(|s| s.to_string()).collect(),
             notes: Vec::new(),

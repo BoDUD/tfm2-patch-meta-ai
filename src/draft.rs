@@ -13,6 +13,8 @@
 
 use mod_api_stable::{StableDraftContext, StableDraftDecision, StableDraftHook};
 
+use std::sync::Arc;
+
 use crate::shared::Snapshot;
 use crate::{advisor, config, shared};
 
@@ -45,10 +47,34 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
         return StableDraftDecision::Pass;
     };
     let ally = ids(ctx.ally_picks());
-    let offer = ids(ctx.available_champions());
+    let offer = offer_ids(&snapshot, ctx.available_champions(), &ids);
     let value = value(&snapshot, cand, &ally, &ids(ctx.enemy_picks()), ban, &offer);
     let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
     decision(amount(value, cfg.edge_scale, strength))
+}
+
+/// The model it was for, the game's ids, and the model's ids.
+type Offer = (usize, Vec<usize>, Vec<u16>);
+
+thread_local! {
+    /// The offer of the decision in progress, as the model's ids: the game asks about every
+    /// candidate of one decision in a row, with the same offer.
+    static OFFER: std::cell::RefCell<Option<Offer>> = const { std::cell::RefCell::new(None) };
+}
+
+fn offer_ids(snapshot: &Arc<Snapshot>, available: &[usize], ids: &dyn Fn(&[usize]) -> Vec<u16>) -> Vec<u16> {
+    OFFER.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let model = Arc::as_ptr(snapshot) as usize;
+        if let Some((m, raw, out)) = cache.as_ref() {
+            if *m == model && raw.as_slice() == available {
+                return out.clone();
+            }
+        }
+        let out = ids(available);
+        *cache = Some((model, available.to_vec(), out.clone()));
+        out
+    })
 }
 
 thread_local! {

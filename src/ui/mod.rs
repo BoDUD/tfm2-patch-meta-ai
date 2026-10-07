@@ -238,6 +238,18 @@ pub fn set_context(context: Context) {
     st.context = context;
 }
 
+/// Another save was opened in the game: what the screens learned about the old one (its
+/// athletes, the last draft) is forgotten; the context comes again with the next rebuild.
+pub fn forget_save() {
+    if let Some(st) = lock().as_mut() {
+        st.draft.last_picks = None;
+        st.draft.enemy_team = None;
+        st.context = Context::default();
+    }
+    *INFOS.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    WANTED.lock().unwrap_or_else(PoisonError::into_inner).clear();
+}
+
 /// The save was closed.
 pub fn reset() {
     *lock() = None;

@@ -123,6 +123,8 @@ mod tests {
     #[test]
     fn dumps_new_screens_once_and_on_the_hotkey() {
         let dir = std::env::temp_dir().join(format!("patch_meta_ai_explore_{}", std::process::id()));
+        // an earlier run with the same process id (Windows reuses them) may have left dumps here
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         let _serial = crate::tests::serial();
         std::env::set_var(crate::paths::DIR_ENV, &dir);
