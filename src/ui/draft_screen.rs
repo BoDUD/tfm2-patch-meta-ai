@@ -4,7 +4,7 @@
 //!   player's line-up beats the enemy's as picked so far, with a bar;
 //! - **advice** (bottom right): the best picks and the best ban for the player right now, each
 //!   with what it is worth and why (lane, synergy, matchups, the player's mastery);
-//! - **grid values**: on every champion card, a value chip at the foot of the portrait - an
+//! - **grid values**: on every champion card, a value chip in the portrait's top-left corner - an
 //!   arrow and what picking it is worth to the player now, in win-rate points, with a stripe in
 //!   its colour;
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
@@ -232,10 +232,12 @@ fn overlay_source() -> String {
     )
 }
 
-/// The value chip at the foot of a card's portrait: a coloured stripe and an arrow with the value.
+/// The value chip in the top-left corner of a card's portrait: a coloured stripe and an arrow with
+/// the value. The card's own marks sit elsewhere - its tier letter at the foot on the left (x 6,
+/// y 68), its position icons at the foot on the right, the pick/ban/Fearless badges top right.
 fn chip_source() -> String {
     format!(
-        "{TAG}:color {{ x: 6px; y: 62px; width: 58px; height: 20px; color: #07080be0; ignore_event: true; \
+        "{TAG}:color {{ x: 6px; y: 6px; width: 58px; height: 20px; color: #07080be0; ignore_event: true; \
          rounding: Uniform {{ rounding: 4; }} \
          #stripe:color {{ width: 3px; height: 100%; color: {}; ignore_event: true; }} \
          #text:label {{ @\"asset/base/style/main#bold_label\"; x: 7px; width: 49px; height: 100%; size: 12; \
