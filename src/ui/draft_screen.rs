@@ -4,9 +4,9 @@
 //!   player's line-up beats the enemy's as picked so far, with a bar;
 //! - **advice** (bottom right): the best picks and the best ban for the player right now, each
 //!   with what it is worth and why (lane, synergy, matchups, the player's mastery);
-//! - **grid values**: on every champion card, a value chip in the portrait's top-left corner - an
-//!   arrow and what picking it is worth to the player now, in win-rate points, with a stripe in
-//!   its colour;
+//! - **grid values**: on every champion card, at the right end of its name row (under the
+//!   portrait) - an arrow and what picking it is worth to the player now, in win-rate points,
+//!   coloured green / red / grey;
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
 //!   of how sure that is - from the champions' lane history, so it works in every language;
 //! - **swap phase**: the best way to seat the team's five champions on its players
@@ -232,19 +232,23 @@ fn overlay_source() -> String {
     )
 }
 
-/// The value chip in the top-left corner of a card's portrait: a coloured stripe and an arrow with
-/// the value. The card's own marks sit elsewhere - its tier letter at the foot on the left (x 6,
-/// y 68), its position icons at the foot on the right, the pick/ban/Fearless badges top right.
+/// The value on a card: small coloured text at the right end of the name row, under the
+/// portrait (nothing of the champion is covered; the card's own marks are on the portrait - tier
+/// letter bottom left, position icons bottom right, pick/ban/Fearless badges top right). The
+/// stripe child is kept, hidden, for the colour writes.
 fn chip_source() -> String {
     format!(
-        "{TAG}:color {{ x: 6px; y: 6px; width: 58px; height: 20px; color: #07080be0; ignore_event: true; \
-         rounding: Uniform {{ rounding: 4; }} \
-         #stripe:color {{ width: 3px; height: 100%; color: {}; ignore_event: true; }} \
-         #text:label {{ @\"asset/base/style/main#bold_label\"; x: 7px; width: 49px; height: 100%; size: 12; \
-         align_x: Left; align_y: Center; text: \"\"; ignore_event: true; }} }}",
+        "{TAG}:empty {{ anchor_x: 1; pivot_x: 1; anchor_y: 1; pivot_y: 1; x: -6px; y: 0px; width: 46px; height: 37px; \
+         ignore_event: true; \
+         #stripe:color {{ width: 0px; height: 0px; visible: false; color: {}; ignore_event: true; }} \
+         #text:label {{ @\"asset/base/style/main#bold_label\"; width: 100%; height: 100%; size: 13; \
+         align_x: Right; align_y: Center; text: \"\"; ignore_event: true; }} }}",
         color(DIM)
     )
 }
+
+/// The card's name moves to the left of its row to make room for the value.
+const NAME_LEFT: &str = "align_x: Left; x: 8px; width: 74px;";
 
 /// Steps of the lane read's confidence bar.
 const LANE_STEPS: usize = 5;
@@ -524,8 +528,12 @@ impl DraftScreen {
             let by_champ: HashMap<u16, f32> = pick_values.iter().map(|v| (v.champ, v.total)).collect();
             for c in cards.iter().filter(|c| c.champ.is_some()) {
                 let tag = format!("{}.{TAG}", c.path);
-                if !ui.exists(&tag) && !ui.spawn(&c.path, &chip_source()) {
-                    continue;
+                if !ui.exists(&tag) {
+                    if !ui.spawn(&c.path, &chip_source()) {
+                        continue;
+                    }
+                    // a new card (or the game rebuilt it): its name makes room
+                    ui.set_properties(&format!("{}.name", c.path), NAME_LEFT);
                 }
                 let value = id(c).and_then(|x| by_champ.get(&x)).copied();
                 let shown = value.is_some();
@@ -679,6 +687,8 @@ mod tests {
         }
         assert_eq!(ui.visible(&format!("{GRID}.c.{TAG}")), Some(false), "held by the position lock");
         assert_eq!(ui.visible(&format!("{GRID}.d.{TAG}")), Some(true));
+        // the value sits in the name row: the name moved left to make room
+        assert!(ui.nodes[&format!("{GRID}.d.name")].props.iter().any(|p| p == NAME_LEFT));
 
         // the lock lets go of "c": it is the best pick again
         ui.remove(&format!("{GRID}.c.{POSITION_LOCK}"));
