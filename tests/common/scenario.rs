@@ -385,6 +385,66 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         let (code, _) = score(hv.score_pick, 99);
         assert_eq!(code, DraftDecisionKindV1::Pass.code(), "unknown candidate");
 
+        // game 0.6.4 hands the line-ups over (athlete ids in lane-slot order). Players the
+        // model does not know change nothing; a player it saw win with alpha (every match's
+        // players carry its record id here, and alpha's side always wins; the newest record is
+        // read first, so it is in every fit) makes alpha a better pick for his team and a
+        // better ban against it
+        let strangers = [9001usize, 9002, 9003, 9004, 9005];
+        let alpha_player = [30usize; 5];
+        let with_lineups = |f: Option<unsafe extern "C" fn(*const c_void, *const DraftCtxV1, usize, f32, *mut f32) -> u32>,
+                            c: usize,
+                            ally: &[usize],
+                            enemy: &[usize]| {
+            // a plain C struct of numbers and pointers: a bitwise copy
+            let mut fielded: DraftCtxV1 = std::ptr::read(&ctx);
+            fielded.ally_athletes_ptr = ally.as_ptr();
+            fielded.ally_athletes_len = ally.len();
+            fielded.enemy_athletes_ptr = enemy.as_ptr();
+            fielded.enemy_athletes_len = enemy.len();
+            fielded.ally_team = 7;
+            fielded.enemy_team = 8;
+            let mut out = 0.0f32;
+            let code = (f.unwrap())(hook.userdata, &fielded, c, 1.0, &mut out);
+            (code, out)
+        };
+        for c in [0usize, 9] {
+            assert_eq!(with_lineups(hv.score_pick, c, &strangers, &strangers), score(hv.score_pick, c), "unknown players");
+            assert_eq!(with_lineups(hv.score_ban, c, &strangers, &strangers), score(hv.score_ban, c));
+            assert_eq!(with_lineups(hv.score_pick, c, &strangers[..3], &[]), score(hv.score_pick, c), "three, lanes unknown");
+        }
+        let (_, fielded_alpha) = with_lineups(hv.score_pick, 0, &alpha_player, &strangers);
+        assert!(fielded_alpha > alpha, "alpha with his player {fielded_alpha} vs {alpha}");
+        let (_, banned_alpha) = with_lineups(hv.score_ban, 0, &strangers, &alpha_player);
+        assert!(banned_alpha > alpha_ban, "alpha against his player {banned_alpha} vs {alpha_ban}");
+        let (_, own_player) = with_lineups(hv.score_ban, 0, &alpha_player, &strangers);
+        assert_eq!(own_player, alpha_ban, "a ban does not look at the banning team's own players");
+
+        // game 0.6.4: once an AI team has picked, the host asks the hooks for its lane assignment
+        // (phase Position) and the last one that decides wins; this mod never decides, so the
+        // lanes stay with the game or Smart Position Lock
+        let team_picks = [0usize, 1, 2, 4, 3];
+        let lanes: Vec<u32> =
+            [LaneV1::Top, LaneV1::Jungle, LaneV1::Mid, LaneV1::Bottom, LaneV1::Support].iter().map(|l| l.code()).collect();
+        let athletes = [11usize, 12, 13, 14, 15];
+        let mut pos: DraftCtxV1 = zeroed();
+        pos.size = size_of::<DraftCtxV1>();
+        pos.phase = DraftPhaseV1::Position.code();
+        pos.ally_pick_ptr = team_picks.as_ptr();
+        pos.ally_pick_len = team_picks.len();
+        pos.champion_briefs_ptr = briefs.as_ptr();
+        pos.champion_briefs_len = briefs.len();
+        pos.ally_athletes_ptr = athletes.as_ptr();
+        pos.ally_athletes_len = athletes.len();
+        pos.ally_team = 3;
+        pos.enemy_team = usize::MAX;
+        pos.slot_lanes_ptr = lanes.as_ptr();
+        pos.slot_lanes_len = lanes.len();
+        let mut order = [usize::MAX; 5];
+        let written = (hv.decide_positions.expect("the 0.6.4 slot"))(hook.userdata, &pos, order.as_mut_ptr(), order.len());
+        assert_eq!(written, 0, "no lane assignment from this mod");
+        assert_eq!(order, [usize::MAX; 5]);
+
         // the files a player looks at
         let table = std::fs::read_to_string(dir.join("meta_table.txt")).unwrap();
         assert!(table.contains("alpha") && table.contains("patch 2.4"), "{table}");

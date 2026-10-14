@@ -80,6 +80,7 @@ pub fn reset_for_tests() {
     client::reset_for_tests();
     shared::clear();
     server::reset_for_tests();
+    draft::reset_for_tests();
     config::load_now();
 }
 

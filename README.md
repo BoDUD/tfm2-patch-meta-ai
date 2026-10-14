@@ -9,7 +9,7 @@
 3. **首发界面**：按选手实力、位置评分和英雄池（熟练度）推荐五名首发，名单行上标 ★ 和位置；名单下方有空间时列出他们最好的英雄。
 4. **版本分析页**（左侧菜单）：英雄 / 组合 / 选手 / 补丁变化 / 模型 五个标签。英雄表可按位置筛选、按任意列排序，显示对线期经济差；选手页给出训练建议（值得练的英雄）；补丁变化页列出本版本上升、下降和被改动的英雄。
 5. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度。
-6. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。
+6. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。游戏 0.6.4 起还看双方的上场选手：AI 偏向自家选手的拿手英雄，并禁掉对方选手的拿手英雄。
 7. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
 8. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
 
@@ -19,7 +19,7 @@
 
 - **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片名字那一行和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
 - **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
-- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。
+- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。游戏 0.6.4 起 AI 选完人后还有一步"分配位置"，本 Mod 不参与：位置由游戏或 Smart Position Lock 决定（几个 Mod 同时决定时只有最后一个生效，所以本 Mod 不去抢）。
 - **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
 
 启用了哪些 Mod 是从游戏的 `config/game/mods.json` 读的。另外，如果梯队在游戏内换日后连续被别的东西改回去，本 Mod 也会自动停止写入并在 `diag.log` 里说明。
@@ -44,6 +44,8 @@
 
 **选人顾问**对每个可选英雄计算：它在剩余位置里最常打的那个位置的强度 + 与已选队友的配合 + 对已选敌人的克制 + 将由哪名选手使用时的熟练度 − 伤害类型单一的惩罚。禁用价值 = 这个英雄对敌方的价值（含敌方对应选手的熟练度），按出场+禁用率加权。敌方位置推断用每个英雄的历史位置分布对所有分配方式加权，所以和游戏语言无关。
 
+**AI 的 ban/pick** 用同样的估值，经 tanh(价值 / edge_scale) × 强度后加到游戏原有的评分上。从 0.6.4 起，游戏会把双方的上场选手（按位置顺序）交给 AI：选人时再加上本队将打该位置的选手对这个英雄的熟练度，禁用时加上对方该位置选手的（位置不明时取全队平均），乘以 `player_mastery`（默认 0.5），每名选手最多计 ±0.5（对数几率）——默认下这一项最多约 ±6 个胜率百分点，只是推一把。这里的熟练度是模型从本存档比赛里估出的"选手×英雄"效应（扣除英雄本身和选手本身的实力，场次少时接近 0），不是游戏自己的熟练度数值：游戏的原有评分已经算过那个，再加一次就重复了。模型还没拟合出来时（刚读档）AI 照游戏原样选；游戏没给阵容（0.6.4 之前）、选手模型不认识、或 `player_mastery=0` 时，与不看选手时完全一样。
+
 **模型自检**：读完存档后，用除最新 10% 外的比赛拟合，再在最新的比赛上打分（热门方获胜率、Brier 分数），结果写进 `diag.log`、报告和 F8 面板。
 
 ## 设置：`settings.ini`
@@ -61,6 +63,7 @@
 | | `roles` `players` `mastery` `pairs` | 0.3 / 0.35 / 0.2 / 0.15 | 位置、选手、熟练度、配合/克制效应的先验幅度（越大越容易被数据推离 0） |
 | `[draft]` | `pick_strength` / `ban_strength` | 1.0 / 0.8 | 对 AI 原有评分的影响力度 |
 | | `edge_scale` | 0.5 | 价值（对数几率）换算成影响力的尺度：`tanh(价值 / edge_scale)` |
+| | `player_mastery` | 0.5 | 游戏 0.6.4 起：双方上场选手对候选英雄的熟练度在 AI 选人/禁用里的分量，0～2（0 = 不看选手） |
 | `[tiers]` | `min_games` | 10 | 近期场次（本版本 + 往前每个版本减半）少于此值的英雄不分级 |
 | | `s` `a` `b` `c` | 10/20/40/20 | 各梯队所占百分比，其余为 D |
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
@@ -81,7 +84,7 @@
 
 都在 Mod 文件夹里：
 
-- `diag.log`：Mod 读到了什么、做了什么（每个存档第一次读到的数据格式写在 `[probe]` 行，选人界面读到了什么写在 `[ui]` 行）。每次启动游戏重写，上一次的保留为 `diag.prev.log`。反馈问题时请附上它。
+- `diag.log`：Mod 读到了什么、做了什么（每个存档第一次读到的数据格式写在 `[probe]` 行，选人界面读到了什么写在 `[ui]` 行，AI 选人时看到的双方阵容，以及本次启动游戏后最初几次 AI 决定里排在前面的英雄和其中选手所占的分量，写在 `[draft]` 行）。每次启动游戏重写，上一次的保留为 `diag.prev.log`。反馈问题时请附上它。
 - `meta_table.txt` / `meta_report.html`：模型当前的全部数字。
 - `history/`：各存档的比赛备份（删掉只会丢失游戏已删除的旧比赛）。
 - `probe_competition.json`、`probe_records.txt`：存档数据格式样本（游戏更新后数据格式变了时用来适配）。
@@ -92,7 +95,7 @@
 - Linux/WSL：`tools/build.sh`，需要 `rustup target add x86_64-pc-windows-gnu` 和 `gcc-mingw-w64-x86-64`。它会跑测试、交叉编译、打包出 `dist/patch_meta_ai/` 和 zip。加 `--smoke` 还会用 Wine 真正加载 DLL，跑一遍模拟的游戏流程。
 - `cargo test`：单元测试（模型能否从模拟比赛中找回已知的英雄强度、选手实力、配合；补丁改动后的估计；选人界面读写），加上走真实 C 接口的整局模拟（`tests/fake_host.rs`）。`cargo test --release -- --ignored --nocapture fit_time` 测一次存档规模的拟合耗时。
 
-`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.3 自带，ABI 等级 9），版权归 TeamSamoyed。
+`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.4 自带，ABI 等级 10），版权归 TeamSamoyed。Mod 只要求 ABI 等级 1，所以用新 SDK 构建的 DLL 在 0.6.0～0.6.3 上照样能加载。
 
 ## 致谢
 
@@ -107,13 +110,14 @@ Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). V
 3. **the line-up screen**: the five suggested starters (strength, position rating, champion pool);
 4. **a Meta Analysis page** in the left menu: champions (lane filter, lane-phase gold), pairs, players with training suggestions, patch changes, the model;
 5. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
-6. **the AI's bans and picks**, valued in the actual draft (position locks are left to Smart Position Lock, a separate mod; the advice skips the cards it locks);
+6. **the AI's bans and picks**, valued in the actual draft (position locks are left to Smart Position Lock, a separate mod; the advice skips the cards it locks); from game 0.6.4, which hands both line-ups to the AI, also by the fielded players: a pick counts the mastery of the team's player in the lane it would play, a ban that of the enemy's player, times `player_mastery` (0.5, at most ±0.5 log-odds per player before it) - the AI leans to its players' best champions and bans the enemy players' best. The mastery is the model's own player-on-champion effect from this save's matches, not the game's proficiency number, which the game's own score already counts; unknown players, no line-up (older games) or `player_mastery=0` leave the value as before;
 7. **your team's tier list**;
 8. **`meta_report.html`** and `meta_table.txt` in the mod folder.
 
 The game prunes old match records; each save's matches are also kept in `history/` in the mod folder (never in the save) and merged back once the save's recent matches confirm the file is its own.
 
 - `ban_pick` / `tier_list` default to `auto`: they step aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
+- Game 0.6.4 adds a lane-assignment step after an AI team's picks; this mod stays out of it (when several mods decide, the last one wins), so the game or Smart Position Lock assigns the lanes.
 - Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.
-- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK.
+- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK as shipped with game 0.6.4 (ABI level 10); the DLL asks for level 1 only, so it still loads on 0.6.0-0.6.3.

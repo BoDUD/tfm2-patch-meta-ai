@@ -13,11 +13,14 @@ pub struct Snapshot {
     pub meta: Meta,
     /// Physical / magic damage per champion id (from the champions' tags).
     pub damage: HashMap<u16, Damage>,
+    /// Athletes' and teams' names the client has read (for `diag.log`).
+    pub athlete_names: HashMap<u32, String>,
+    pub team_names: HashMap<u32, String>,
 }
 
 impl Snapshot {
     pub fn new(meta: Meta, damage: HashMap<u16, Damage>) -> Self {
-        Self { meta, damage }
+        Self { meta, damage, athlete_names: HashMap::new(), team_names: HashMap::new() }
     }
 
     pub fn damage_of(&self, champ: u16) -> Option<Damage> {

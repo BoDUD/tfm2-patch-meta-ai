@@ -314,12 +314,15 @@ impl DraftScreen {
                 self.on = false;
                 self.drawn = None;
                 self.tagged.clear();
+                crate::draft::set_live(false);
             }
             return;
         }
         if !self.on {
             self.on = true;
             diag::log("[ui] ban/pick screen");
+            // the AI's decisions from now on are the player's own match (diag.log)
+            crate::draft::set_live(true);
         }
         if frame < self.next_read {
             return;
@@ -639,7 +642,7 @@ mod tests {
             &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
             &Settings::default(),
         );
-        Arc::new(Snapshot { meta, damage: HashMap::new() })
+        Arc::new(Snapshot::new(meta, HashMap::new()))
     }
 
     #[test]

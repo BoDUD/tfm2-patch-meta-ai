@@ -252,6 +252,7 @@ pub fn forget_save() {
 
 /// The save was closed.
 pub fn reset() {
+    crate::draft::set_live(false);
     *lock() = None;
     *INFOS.lock().unwrap_or_else(PoisonError::into_inner) = None;
     WANTED.lock().unwrap_or_else(PoisonError::into_inner).clear();
@@ -274,6 +275,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             lane_tags: cfg.lane_tags,
         };
         time(Part::Draft, || st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view));
+    } else {
+        crate::draft::set_live(ui.exists(draft_screen::GRID));
     }
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
