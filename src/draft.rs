@@ -3,29 +3,63 @@
 //!
 //! - **pick**: its strength in the best lane still open, its synergy with the picks already on
 //!   the team, its matchups against the enemy's picks, and a cost for one-sided damage;
-//! - **ban**: what it would be worth to the enemy, weighted by how often it is played or banned.
+//! - **ban**: what it would be worth to the enemy, weighted by how often it is played or banned;
+//! - **players** (game 0.6.4+, ABI level 10, which hands both line-ups over - athlete ids in
+//!   lane-slot order): a pick also counts the mastery of the team's player in the lane the
+//!   champion would play, a ban that of the enemy's player there (the whole line-up's average
+//!   when the lane is not known), up to [`PLAYER_CAP`] and times `player_mastery` (0.5). The
+//!   AI leans to its players' best champions and bans the enemy players' best ones.
 //!
 //! The value (log-odds) goes through `tanh(value / edge_scale)` so one extreme estimate cannot
 //! swamp the game's own reasoning, then `pick_strength` / `ban_strength` scale it.
 //!
-//! Position locks are another mod's job (Smart Position Lock): its "out of reach" score replaces
-//! the game's, which no nudge here can undo. Game 0.6.4 (ABI level 10) adds a `Position` phase
-//! after an AI team's last pick, where a hook's `decide_positions` may reassign the lanes and the
-//! last hook that decides wins: this hook keeps the trait's default (`None`), so the lanes stay
-//! with the game or Smart Position Lock. The score hooks never see that phase.
+//! The mastery is the model's own player-on-champion effect - how much more that player won on
+//! that champion in this save than the champion's strength there and the player's own strength
+//! say, shrunk towards 0 until enough games back it - never the game's proficiency number: the
+//! game's own score already counts that, and adding it here would count it twice. The hook
+//! reads no records (it cannot): the model is the snapshot the client publishes after every fit
+//! (`shared`), and the line-ups come with each decision. Before the first fit of a save the hook
+//! passes. Players the model does not know, a line-up the game does not hand over (games before
+//! 0.6.4, a line-up not known yet) and `player_mastery = 0` leave the value exactly what it is
+//! without line-ups.
+//!
+//! Position locks are another mod's job (Smart Position Lock): its "out of reach" score
+//! (`Replace`, at priority 10000 - after this hook, [`PRIORITY`]) replaces whatever was added
+//! here. Game 0.6.4 also adds a `Position` phase after an AI team's last pick, where a hook's
+//! `decide_positions` may reassign the lanes and the last hook that decides wins: this hook
+//! keeps the trait's default (`None`), so the lanes stay with the game or Smart Position Lock.
+//! The score hooks never see that phase.
+//!
+//! `diag.log` gets the first decisions of a game session (`[draft]` lines): the line-ups the
+//! game handed over, and for the best candidates their value, the players' part of it and what
+//! was added to the game's score.
 
-use mod_api_stable::{StableDraftContext, StableDraftDecision, StableDraftHook};
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use std::sync::Arc;
+use mod_api_stable::{LaneV1, StableDraftContext, StableDraftDecision, StableDraftHook};
 
+use crate::advisor::PickValue;
+use crate::history::Role;
 use crate::shared::Snapshot;
-use crate::{advisor, config, shared};
+use crate::{advisor, config, diag, shared};
 
 pub struct MetaDraftHook;
+
+/// Score hooks run in priority order, lower first. Smart Position Lock replaces the score of a
+/// pick its locks rule out at priority 10000, after this hook, so its "out of reach" stands
+/// whatever this hook added. Keep this below it.
+pub const PRIORITY: i32 = 0;
 
 impl StableDraftHook for MetaDraftHook {
     fn id(&self) -> String {
         format!("{}:draft", crate::MOD_ID)
+    }
+
+    fn priority(&self) -> i32 {
+        PRIORITY
     }
 
     fn score_ban(&self, ctx: &StableDraftContext<'_>, candidate: usize, _base: f32) -> StableDraftDecision {
@@ -37,12 +71,52 @@ impl StableDraftHook for MetaDraftHook {
     }
 }
 
+/// A team's fielded players and the lane each plays (`None`: not known).
+pub type Lineup = Vec<(u32, Option<Role>)>;
+
+/// Both line-ups of a draft: the deciding team's and its opponent's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Lineups {
+    pub ally: Lineup,
+    pub enemy: Lineup,
+}
+
+impl Lineups {
+    /// From what the game hands over: athlete ids in lane-slot order, and the lanes of the
+    /// deciding team's slots when the context lists them (the `Position` phase only). A full
+    /// line-up of five plays top to support; any other count's lanes are not known.
+    pub fn from_game(ally: &[usize], enemy: &[usize], ally_slot_lanes: &[LaneV1]) -> Self {
+        Self { ally: lineup(ally, ally_slot_lanes), enemy: lineup(enemy, &[]) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ally.is_empty() && self.enemy.is_empty()
+    }
+}
+
+fn lineup(athletes: &[usize], slot_lanes: &[LaneV1]) -> Lineup {
+    let lanes: Vec<Option<Role>> = if !slot_lanes.is_empty() && slot_lanes.len() == athletes.len() {
+        slot_lanes.iter().map(|lane| Role::ALL.get(lane.code() as usize).copied()).collect()
+    } else if athletes.len() == Role::ALL.len() {
+        Role::ALL.into_iter().map(Some).collect()
+    } else {
+        vec![None; athletes.len()]
+    };
+    athletes.iter().zip(lanes).filter_map(|(a, lane)| Some((u32::try_from(*a).ok()?, lane))).collect()
+}
+
 fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDraftDecision {
     let cfg = config::get();
     if !cfg.ban_pick_on() {
         return StableDraftDecision::Pass;
     }
-    let Some(snapshot) = shared::get() else { return StableDraftDecision::Pass };
+    let Some(snapshot) = shared::get() else {
+        diag::log_once(
+            "draft-cold",
+            "[draft] the AI drafted with no model ready (no save open, or its matches not read yet): left to the game",
+        );
+        return StableDraftDecision::Pass;
+    };
     let ids = |list: &[usize]| -> Vec<u16> {
         list.iter().filter_map(|id| ctx.champion_name(*id)).filter_map(|n| snapshot.meta.names.get(n)).collect()
     };
@@ -50,10 +124,19 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
         return StableDraftDecision::Pass;
     };
     let ally = ids(ctx.ally_picks());
+    let enemy = ids(ctx.enemy_picks());
     let offer = offer_ids(&snapshot, ctx.available_champions(), &ids);
-    let value = value(&snapshot, cand, &ally, &ids(ctx.enemy_picks()), ban, &offer);
+    let lineups = if cfg.player_mastery > 0.0 {
+        Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes())
+    } else {
+        Lineups::default()
+    };
+    let draft = Draft { ally: &ally, enemy: &enemy, offer: &offer, lineups: &lineups };
+    let v = value_with(&snapshot, cand, &draft, ban, cfg.player_mastery);
     let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
-    decision(amount(value, cfg.edge_scale, strength))
+    let add = amount(v.total, cfg.edge_scale, strength);
+    note(ctx, &snapshot, &lineups, ban, &v, add, cfg.player_mastery);
+    decision(add)
 }
 
 /// The model it was for, the game's ids, and the model's ids.
@@ -62,7 +145,7 @@ type Offer = (usize, Vec<usize>, Vec<u16>);
 thread_local! {
     /// The offer of the decision in progress, as the model's ids: the game asks about every
     /// candidate of one decision in a row, with the same offer.
-    static OFFER: std::cell::RefCell<Option<Offer>> = const { std::cell::RefCell::new(None) };
+    static OFFER: RefCell<Option<Offer>> = const { RefCell::new(None) };
 }
 
 fn offer_ids(snapshot: &Arc<Snapshot>, available: &[usize], ids: &dyn Fn(&[usize]) -> Vec<u16>) -> Vec<u16> {
@@ -83,10 +166,10 @@ fn offer_ids(snapshot: &Arc<Snapshot>, available: &[usize], ids: &dyn Fn(&[usize
 thread_local! {
     /// The open lanes of the last team asked about: the game scores every candidate of one
     /// decision in a row, with the same picks (hooks may run on several threads).
-    static OPEN: std::cell::RefCell<Option<(Vec<u16>, Vec<crate::history::Role>)>> = const { std::cell::RefCell::new(None) };
+    static OPEN: RefCell<Option<(Vec<u16>, Vec<Role>)>> = const { RefCell::new(None) };
 }
 
-fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<crate::history::Role> {
+fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<Role> {
     OPEN.with(|cell| {
         let mut cache = cell.borrow_mut();
         if let Some((key, open)) = cache.as_ref() {
@@ -100,20 +183,43 @@ fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<crate::history::Role> {
     })
 }
 
-/// The model's value (log-odds) of picking or banning `cand` in this draft. `offer` is what is
-/// still on offer (for how counterable a pick is while the other side has picks left).
-pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool, offer: &[u16]) -> f32 {
+/// One decision in the model's ids.
+pub struct Draft<'a> {
+    pub ally: &'a [u16],
+    pub enemy: &'a [u16],
+    /// What is still on offer (how counterable a pick is while the other side has picks left).
+    pub offer: &'a [u16],
+    pub lineups: &'a Lineups,
+}
+
+/// A fielded player's mastery counts up to this much (log-odds, about 12 win-rate points)
+/// before `player_mastery` weighs it: at the default 0.5 the players' part of a value stays
+/// within +-0.25 (about 6 points), whatever the model makes of a few lopsided games.
+pub const PLAYER_CAP: f32 = 0.5;
+
+/// The model's value (log-odds) of picking or banning `cand` in this draft, the fielded
+/// players' mastery counted at `player_weight`: a pick's for the deciding team's player in the
+/// lane it would play, a ban's for the enemy's.
+pub fn value_with(snapshot: &Snapshot, cand: u16, draft: &Draft<'_>, ban: bool, player_weight: f32) -> PickValue {
     let damage = |c: u16| snapshot.damage_of(c);
     let meta = &snapshot.meta;
+    let (ally, enemy) = (draft.ally, draft.enemy);
+    let mastery = advisor::Mastery { weight: player_weight, cap: PLAYER_CAP };
     if ban {
         let open = open_lanes(snapshot, enemy);
-        let v = advisor::ban_value_in(meta, cand, ally, enemy, &[], &damage, &open);
-        advisor::with_exposure(meta, v, 5usize.saturating_sub(ally.len()), offer).total
+        let v = advisor::ban_value_weighted(meta, cand, ally, enemy, &draft.lineups.enemy, mastery, &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(ally.len()), draft.offer)
     } else {
         let open = open_lanes(snapshot, ally);
-        let v = advisor::pick_value_in(meta, cand, ally, enemy, &[], &damage, &open);
-        advisor::with_exposure(meta, v, 5usize.saturating_sub(enemy.len()), offer).total
+        let v = advisor::pick_value_weighted(meta, cand, ally, enemy, &draft.lineups.ally, mastery, &damage, &open);
+        advisor::with_exposure(meta, v, 5usize.saturating_sub(enemy.len()), draft.offer)
     }
+}
+
+/// [`value_with`] without line-ups: the value before game 0.6.4.
+pub fn value(snapshot: &Snapshot, cand: u16, ally: &[u16], enemy: &[u16], ban: bool, offer: &[u16]) -> f32 {
+    let none = Lineups::default();
+    value_with(snapshot, cand, &Draft { ally, enemy, offer, lineups: &none }, ban, 0.0).total
 }
 
 /// What is added to the game's score.
@@ -129,9 +235,223 @@ pub fn decision(v: f32) -> StableDraftDecision {
     }
 }
 
+// ---------------------------------------------------------------------------------- diag.log
+
+/// The ban/pick screen is open (set by `ui`): the drafts now are the player's own match.
+static LIVE: AtomicBool = AtomicBool::new(false);
+/// Decisions written out per game session: in the player's own matches (the ban/pick screen is
+/// open), and in the drafts the game simulates off screen (the other matches of a match day).
+const LIVE_DECISIONS: u32 = 24;
+const OFF_SCREEN_DECISIONS: u32 = 6;
+static LIVE_LOGGED: AtomicU32 = AtomicU32::new(0);
+static OFF_SCREEN_LOGGED: AtomicU32 = AtomicU32::new(0);
+/// Line-up pairs written out (each once) per game session, at most [`LINEUP_LINES`].
+const LINEUP_LINES: usize = 40;
+static LINEUPS_SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Candidates shown per decision.
+const SHOWN: usize = 3;
+
+/// The ban/pick screen opened (`true`) or closed.
+pub fn set_live(live: bool) {
+    LIVE.store(live, Ordering::Relaxed);
+}
+
+/// The decision in progress on this thread (the game asks about every candidate of one decision
+/// in a row; hooks may run on several threads).
+struct Pending {
+    key: u64,
+    /// Written to `diag.log` (else only followed, so the next decision is told apart).
+    logged: bool,
+    /// Candidates on offer: the decision is written out once each was asked about.
+    expected: usize,
+    seen: usize,
+    head: String,
+    /// (value, players' part, text) of each candidate.
+    rows: Vec<(f32, f32, String)>,
+}
+
+thread_local! {
+    static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
+}
+
+fn decision_key(ctx: &StableDraftContext<'_>, ban: bool) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (ban, ctx.ally_team(), ctx.enemy_team(), ctx.ally_picks(), ctx.enemy_picks()).hash(&mut h);
+    (ctx.ally_bans(), ctx.enemy_bans(), ctx.available_champions().len()).hash(&mut h);
+    h.finish()
+}
+
+/// One scored candidate, for `diag.log`.
+fn note(ctx: &StableDraftContext<'_>, snapshot: &Snapshot, lineups: &Lineups, ban: bool, v: &PickValue, add: f32, weight: f32) {
+    let key = decision_key(ctx, ban);
+    PENDING.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        if pending.as_ref().is_none_or(|p| p.key != key) {
+            if let Some(done) = pending.as_mut() {
+                flush(done);
+            }
+            *pending = Some(start(ctx, snapshot, lineups, ban, key, weight));
+        }
+        let Some(p) = pending.as_mut() else { return };
+        p.seen += 1;
+        if p.logged {
+            p.rows.push((v.total, v.mastery, row(snapshot, v, add, ban)));
+            if p.seen >= p.expected {
+                flush(p);
+            }
+        }
+    });
+}
+
+/// A new decision: written out while this session's share is not used up.
+fn start(ctx: &StableDraftContext<'_>, snapshot: &Snapshot, lineups: &Lineups, ban: bool, key: u64, weight: f32) -> Pending {
+    let live = LIVE.load(Ordering::Relaxed);
+    let (count, cap) = if live { (&LIVE_LOGGED, LIVE_DECISIONS) } else { (&OFF_SCREEN_LOGGED, OFF_SCREEN_DECISIONS) };
+    let logged = count.load(Ordering::Relaxed) < cap && count.fetch_add(1, Ordering::Relaxed) < cap;
+    let mut head = String::new();
+    if logged {
+        let number = if ban { ctx.ally_bans().len() } else { ctx.ally_picks().len() } + 1;
+        head = format!(
+            "[draft] {} {} {number} vs {}{}",
+            team(snapshot, ctx.ally_team()),
+            if ban { "ban" } else { "pick" },
+            team(snapshot, ctx.enemy_team()),
+            if live { ", on screen" } else { "" }
+        );
+        lineup_line(ctx, snapshot, lineups, live, weight);
+    }
+    Pending { key, logged, expected: ctx.available_champions().len().max(1), seen: 0, head, rows: Vec::new() }
+}
+
+/// The decision's best candidates (and the one the players moved most), written out once.
+fn flush(p: &mut Pending) {
+    if !p.logged || p.rows.is_empty() {
+        p.logged = false;
+        return;
+    }
+    p.logged = false;
+    let mut rows = std::mem::take(&mut p.rows);
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut shown: Vec<String> = rows.iter().take(SHOWN).map(|r| r.2.clone()).collect();
+    let moved = rows
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1 .1.abs().partial_cmp(&b.1 .1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some((i, r)) = moved {
+        if i >= SHOWN && r.1 != 0.0 {
+            shown.push(format!("players moved most: {}", r.2));
+        }
+    }
+    diag::log(&format!("{} ({} asked): {}", p.head, rows.len(), shown.join("; ")));
+}
+
+fn points(v: f32) -> f32 {
+    (crate::glm::sigmoid(v) - 0.5) * 100.0
+}
+
+/// `ahri +4.1 (players +1.2: Mid #583 Faker) -> +0.71`: the value and the players' part in
+/// win-rate points, and what was added to the game's score.
+fn row(snapshot: &Snapshot, v: &PickValue, add: f32, ban: bool) -> String {
+    let whose = if ban { "their players" } else { "players" };
+    let players = if v.mastery == 0.0 {
+        format!("{whose} 0")
+    } else {
+        match v.player {
+            Some(a) => format!(
+                "{whose} {:+.1}: {} {}",
+                points(v.mastery),
+                v.role.map_or("?", |r| r.name()),
+                athlete(snapshot, a)
+            ),
+            None => format!("{whose} {:+.1}: line-up", points(v.mastery)),
+        }
+    };
+    format!("{} {:+.1} ({players}) -> {add:+.2}", snapshot.meta.names.name(v.champ), points(v.total))
+}
+
+fn athlete(snapshot: &Snapshot, a: u32) -> String {
+    match snapshot.athlete_names.get(&a) {
+        Some(name) => format!("#{a} {name}"),
+        None => format!("#{a}"),
+    }
+}
+
+fn team(snapshot: &Snapshot, id: Option<usize>) -> String {
+    match id {
+        Some(id) => match u32::try_from(id).ok().and_then(|t| snapshot.team_names.get(&t)) {
+            Some(name) => format!("{name} (#{id})"),
+            None => format!("team #{id}"),
+        },
+        None => "team ?".to_string(),
+    }
+}
+
+/// The line-ups of a logged decision, each pair once per session: every player with their lane,
+/// and how many of them the model saw play that lane most (a check of the lane-slot order).
+fn lineup_line(ctx: &StableDraftContext<'_>, snapshot: &Snapshot, lineups: &Lineups, live: bool, weight: f32) {
+    if weight <= 0.0 {
+        diag::log_once("draft-lineups-off", "[draft] player_mastery=0: the line-ups are not used");
+        return;
+    }
+    if lineups.is_empty() {
+        diag::log_once(
+            "draft-no-lineups",
+            "[draft] the game hands over no line-ups (a game before 0.6.4, or a line-up not known yet): \
+             picks and bans without the players' mastery",
+        );
+        return;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (ctx.ally_team(), ctx.enemy_team(), lineups.ally.as_slice(), lineups.enemy.as_slice()).hash(&mut h);
+    let key = h.finish();
+    {
+        let mut seen = LINEUPS_SEEN.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.contains(&key) || seen.len() >= LINEUP_LINES {
+            return;
+        }
+        seen.push(key);
+    }
+    let show = |lineup: &Lineup| -> String {
+        let (mut fits, mut known) = (0, 0);
+        let players: Vec<String> = lineup
+            .iter()
+            .map(|(a, lane)| {
+                if let (Some(lane), Some(usual)) = (lane, snapshot.meta.usual_lane(*a)) {
+                    known += 1;
+                    fits += (*lane == usual) as u32;
+                }
+                format!("{} {}", lane.map_or("?", |r| r.name()), athlete(snapshot, *a))
+            })
+            .collect();
+        let check = if known > 0 { format!(", {fits}/{known} in their usual lane") } else { String::new() };
+        format!("[{}]{check}", players.join(", "))
+    };
+    diag::log(&format!(
+        "[draft] line-ups{}: {} {} vs {} {}",
+        if live { " on screen" } else { "" },
+        team(snapshot, ctx.ally_team()),
+        show(&lineups.ally),
+        team(snapshot, ctx.enemy_team()),
+        show(&lineups.enemy)
+    ));
+}
+
+/// Test support: a new game session's logging.
+#[doc(hidden)]
+pub fn reset_for_tests() {
+    LIVE.store(false, Ordering::Relaxed);
+    LIVE_LOGGED.store(0, Ordering::Relaxed);
+    OFF_SCREEN_LOGGED.store(0, Ordering::Relaxed);
+    LINEUPS_SEEN.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    PENDING.with(|cell| *cell.borrow_mut() = None);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::tests::{simulate, NAMES};
+    use crate::meta::{build, Effect, Inputs, Settings, Tally};
+    use std::collections::HashMap;
 
     #[test]
     fn amounts_are_bounded() {
@@ -145,5 +465,210 @@ mod tests {
         assert!(matches!(decision(0.3), StableDraftDecision::Add(v) if (v - 0.3).abs() < 1e-6));
         assert!(matches!(decision(0.0), StableDraftDecision::Pass));
         assert!(matches!(decision(f32::NAN), StableDraftDecision::Pass));
+    }
+
+    #[test]
+    fn runs_before_the_position_lock() {
+        // Smart Position Lock replaces the scores it rules out at priority 10000: after this hook
+        assert!(MetaDraftHook.priority() < 10_000);
+    }
+
+    #[test]
+    fn line_ups_from_the_game() {
+        let five = Lineups::from_game(&[11, 12, 13, 14, 15], &[21, 22, 23, 24, 25], &[]);
+        assert_eq!(five.ally, Role::ALL.iter().zip(11u32..).map(|(r, a)| (a, Some(*r))).collect::<Lineup>());
+        assert_eq!(five.enemy[4], (25, Some(Role::Support)));
+        // the slots' own lanes when the game lists them (deciding team only)
+        let seated = Lineups::from_game(
+            &[11, 12, 13, 14, 15],
+            &[21, 22, 23, 24, 25],
+            &[LaneV1::Support, LaneV1::Bottom, LaneV1::Mid, LaneV1::Jungle, LaneV1::Top],
+        );
+        assert_eq!(seated.ally[0], (11, Some(Role::Support)));
+        assert_eq!(seated.enemy[0], (21, Some(Role::Top)));
+        // not five: lanes unknown; nothing: nothing
+        let three = Lineups::from_game(&[11, 12, 13], &[], &[]);
+        assert_eq!(three.ally, vec![(11, None), (12, None), (13, None)]);
+        assert!(three.enemy.is_empty() && !three.is_empty());
+        assert!(Lineups::from_game(&[], &[], &[]).is_empty());
+    }
+
+    fn snapshot() -> Snapshot {
+        let (names, games) = simulate(2000, "1.1", |n| if n == "c" { 0.4 } else { 0.0 }, 5);
+        let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        let meta = build(
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Settings::default(),
+        );
+        Snapshot::new(meta, HashMap::new())
+    }
+
+    /// Athlete 501 (unknown to the simulation) masters "f".
+    fn with_mastery(mut s: Snapshot, value: f32) -> (Snapshot, u16) {
+        let f = s.meta.names.get("f").unwrap();
+        s.meta.mastery.insert((501, f), Effect { value, sd: 0.1, tally: Tally { games: 40, wins: 30 } });
+        (s, f)
+    }
+
+    /// A full line-up with `who` in `lane` and players the model does not know elsewhere.
+    fn lineup_with(who: u32, lane: Role) -> Lineup {
+        Role::ALL.iter().map(|r| (if *r == lane { who } else { 900 + r.index() as u32 }, Some(*r))).collect()
+    }
+
+    #[test]
+    fn fielded_players_count_for_picks_and_bans() {
+        let (s, f) = with_mastery(snapshot(), 0.5);
+        let offer: Vec<u16> = (0..12).collect();
+        let (ally, enemy) = (vec![s.meta.names.get("a").unwrap()], vec![s.meta.names.get("b").unwrap()]);
+        let plain = |ban: bool| value(&s, f, &ally, &enemy, ban, &offer);
+        let with = |lineups: &Lineups, ban: bool, w: f32| {
+            value_with(&s, f, &Draft { ally: &ally, enemy: &enemy, offer: &offer, lineups }, ban, w)
+        };
+        // the lane "f" would play for the AI team, and for its opponent
+        let none = Lineups::default();
+        let pick_lane = with(&none, false, 0.5).role.unwrap();
+        let ban_lane = with(&none, true, 0.5).role.unwrap();
+
+        // pick: the team's own player in that lane counts, at the weight
+        let ours = Lineups { ally: lineup_with(501, pick_lane), enemy: Vec::new() };
+        let v = with(&ours, false, 0.5);
+        assert_eq!(v.player, Some(501));
+        assert!((v.mastery - 0.25).abs() < 1e-6 && (v.total - plain(false) - 0.25).abs() < 1e-5, "{v:?}");
+        // ... not the enemy's, and only in that lane
+        let theirs = Lineups { ally: Vec::new(), enemy: lineup_with(501, ban_lane) };
+        assert_eq!(with(&theirs, false, 0.5).total, plain(false));
+        let elsewhere = Role::ALL.into_iter().find(|r| *r != pick_lane).unwrap();
+        assert_eq!(with(&Lineups { ally: lineup_with(501, elsewhere), enemy: Vec::new() }, false, 0.5).total, plain(false));
+
+        // ban: the enemy's player in the lane it would play for them makes it a better ban
+        let b = with(&theirs, true, 0.5);
+        assert_eq!(b.player, Some(501));
+        assert!(b.total > plain(true), "{b:?} vs {}", plain(true));
+        assert_eq!(with(&ours, true, 0.5).total, plain(true), "our own player does not make it a ban");
+
+        // a line-up whose lanes are not known: the line-up as a whole
+        let three = Lineups { ally: vec![(501, None), (902, None), (903, None)], enemy: Vec::new() };
+        let v = with(&three, false, 0.5);
+        assert!(v.player.is_none() && (v.mastery - 0.5 / 3.0 * 0.5).abs() < 1e-6, "{v:?}");
+    }
+
+    #[test]
+    fn unknown_players_and_no_line_ups_change_nothing() {
+        let (s, f) = with_mastery(snapshot(), 0.5);
+        let offer: Vec<u16> = (0..12).collect();
+        let ally = vec![s.meta.names.get("a").unwrap()];
+        for cand in [f, s.meta.names.get("c").unwrap(), s.meta.names.get("l").unwrap()] {
+            for ban in [false, true] {
+                let before = value(&s, cand, &ally, &[], ban, &offer);
+                let at = |lineups: &Lineups, w: f32| {
+                    value_with(&s, cand, &Draft { ally: &ally, enemy: &[], offer: &offer, lineups }, ban, w).total
+                };
+                let strangers: Lineup = Role::ALL.iter().map(|r| (900 + r.index() as u32, Some(*r))).collect();
+                let unknown = Lineups { ally: strangers.clone(), enemy: strangers };
+                assert_eq!(at(&unknown, 0.5), before, "players the model does not know");
+                assert_eq!(at(&Lineups::default(), 0.5), before, "no line-ups");
+                let fielded = Lineups { ally: lineup_with(501, Role::Top), enemy: lineup_with(501, Role::Top) };
+                for lane in Role::ALL {
+                    let all = Lineups { ally: lineup_with(501, lane), enemy: lineup_with(501, lane) };
+                    assert_eq!(at(&all, 0.0), before, "player_mastery = 0");
+                }
+                assert_eq!(at(&fielded, 0.0), before);
+            }
+        }
+    }
+
+    #[test]
+    fn a_nudge_not_an_override() {
+        // however lopsided the model's mastery, the players' part is capped: at the default
+        // weight it moves the score by at most half the strength (tanh is 1-Lipschitz)
+        let (s, f) = with_mastery(snapshot(), 2.0);
+        let offer: Vec<u16> = (0..12).collect();
+        let none = Lineups::default();
+        let lane = value_with(&s, f, &Draft { ally: &[], enemy: &[], offer: &offer, lineups: &none }, false, 0.5).role.unwrap();
+        let ours = Lineups { ally: lineup_with(501, lane), enemy: Vec::new() };
+        let cfg = config::Config::default();
+        let v = value_with(&s, f, &Draft { ally: &[], enemy: &[], offer: &offer, lineups: &ours }, false, cfg.player_mastery);
+        assert!((v.mastery - PLAYER_CAP * cfg.player_mastery).abs() < 1e-6, "{v:?}");
+        let before = amount(value(&s, f, &[], &[], false, &offer), cfg.edge_scale, cfg.pick_strength);
+        let after = amount(v.total, cfg.edge_scale, cfg.pick_strength);
+        assert!(after > before && after - before <= 0.5 * cfg.pick_strength + 1e-6, "{before} -> {after}");
+        assert!(after < cfg.pick_strength);
+    }
+
+    /// One AI decision through the hook as the game makes it, with what `diag.log` gets.
+    #[test]
+    fn the_hook_uses_the_line_ups_and_logs_them() {
+        use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
+        let _serial = crate::tests::serial();
+        let dir = std::env::temp_dir().join(format!("patch_meta_ai_draft_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var(crate::paths::DIR_ENV, &dir);
+        crate::reset_for_tests();
+
+        let (mut s, f) = with_mastery(snapshot(), 0.4);
+        s.athlete_names.insert(501, "Faker".into());
+        s.team_names.insert(12, "T1".into());
+        let names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
+        let briefs: Vec<ChampionBriefV1> =
+            names.iter().map(|n| ChampionBriefV1 { name: StrV1::from_str(n), ..Default::default() }).collect();
+        let available: Vec<usize> = (0..names.len()).collect();
+        let none = Lineups::default();
+        let offer: Vec<u16> = (0..12).collect();
+        let lane = value_with(&s, f, &Draft { ally: &[], enemy: &[], offer: &offer, lineups: &none }, false, 0.5).role.unwrap();
+        let ours: Vec<usize> = lineup_with(501, lane).iter().map(|(a, _)| *a as usize).collect();
+        let theirs = [31usize, 32, 33, 34, 35];
+        shared::publish(s);
+
+        let ctx_with = |athletes: &[usize], enemy_athletes: &[usize]| {
+            // SAFETY: a plain C struct; every pointer set below outlives the calls
+            let mut raw: DraftCtxV1 = unsafe { std::mem::zeroed() };
+            raw.size = std::mem::size_of::<DraftCtxV1>();
+            raw.phase = DraftPhaseV1::Pick.code();
+            raw.available_ptr = available.as_ptr();
+            raw.available_len = available.len();
+            raw.champion_briefs_ptr = briefs.as_ptr();
+            raw.champion_briefs_len = briefs.len();
+            raw.ally_athletes_ptr = athletes.as_ptr();
+            raw.ally_athletes_len = athletes.len();
+            raw.enemy_athletes_ptr = enemy_athletes.as_ptr();
+            raw.enemy_athletes_len = enemy_athletes.len();
+            raw.ally_team = 12;
+            raw.enemy_team = 60;
+            raw
+        };
+        let ask = |raw: &DraftCtxV1, cand: usize| -> f32 {
+            // SAFETY: `raw` lives for the call
+            let ctx = unsafe { StableDraftContext::from_raw(raw) }.unwrap();
+            match MetaDraftHook.score_pick(&ctx, cand, 0.0) {
+                StableDraftDecision::Add(v) => v,
+                _ => 0.0,
+            }
+        };
+        set_live(true);
+        let fielded = ctx_with(&ours, &theirs);
+        let scores: Vec<f32> = available.iter().map(|c| ask(&fielded, *c)).collect();
+        let bare = ctx_with(&[], &[]);
+        let before: Vec<f32> = available.iter().map(|c| ask(&bare, *c)).collect();
+        assert!(scores[f as usize] > before[f as usize], "{} vs {}", scores[f as usize], before[f as usize]);
+        for c in available.iter().filter(|c| **c != f as usize) {
+            // the others' players are not known to the model: nothing changes for them
+            assert_eq!(scores[*c], before[*c], "{}", names[*c]);
+        }
+        set_live(false);
+
+        let log = std::fs::read_to_string(dir.join(diag::LOG_FILE)).unwrap();
+        assert!(log.contains("[draft] line-ups on screen: T1 (#12) ["), "{log}");
+        assert!(log.contains(&format!("{} #501 Faker", lane.name())), "{log}");
+        assert!(log.contains("[draft] T1 (#12) pick 1 vs team #60, on screen (12 asked): "), "{log}");
+        // 0.4 x player_mastery 0.5 = +0.2 log-odds = +5.0 win-rate points
+        assert!(log.contains(&format!(" (players +5.0: {} #501 Faker) -> +", lane.name())), "{log}");
+        // the same decision again (the game asks once more): not written twice
+        let again: Vec<f32> = available.iter().map(|c| ask(&fielded, *c)).collect();
+        assert_eq!(again, scores);
+        let log2 = std::fs::read_to_string(dir.join(diag::LOG_FILE)).unwrap();
+        assert_eq!(log2.matches("line-ups on screen").count(), 1);
+        crate::reset_for_tests();
+        shared::clear();
     }
 }

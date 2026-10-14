@@ -418,7 +418,7 @@ mod tests {
             &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
             &Settings::default(),
         );
-        let snapshot = Snapshot { meta, damage: HashMap::new() };
+        let snapshot = Snapshot::new(meta, HashMap::new());
         let mut context = Context { team_name: "Mods FC".into(), ..Default::default() };
         let roster: Vec<(u32, Option<Role>)> = (1..=5).map(|a| (a, Some(Role::ALL[a as usize - 1]))).collect();
         context.rosters.insert("mods fc".into(), roster.clone());

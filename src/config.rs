@@ -74,6 +74,9 @@ pub struct Config {
     pub ban_strength: f32,
     /// Log-odds edge that gives tanh(1) = 76% of the strength.
     pub edge_scale: f32,
+    /// How much the fielded players' mastery of a candidate counts in the AI's picks and bans
+    /// (game 0.6.4+ hands the line-ups over); 0 = not at all.
+    pub player_mastery: f32,
     // [tiers]
     pub min_games: f32,
     /// Shares of the ranked champions, in percent (D gets the rest).
@@ -119,6 +122,7 @@ impl Default for Config {
             pick_strength: 1.0,
             ban_strength: 0.8,
             edge_scale: 0.5,
+            player_mastery: 0.5,
             min_games: 10.0,
             s_percent: 10.0,
             a_percent: 20.0,
@@ -248,6 +252,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "pick_strength" => cfg.pick_strength = number(value)?,
         "ban_strength" => cfg.ban_strength = number(value)?,
         "edge_scale" => cfg.edge_scale = number(value)?,
+        "player_mastery" => cfg.player_mastery = number(value)?,
         "min_games" => cfg.min_games = number(value)?,
         "s" => cfg.s_percent = number(value)?,
         "a" => cfg.a_percent = number(value)?,
@@ -287,6 +292,8 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     check("ban_strength", &mut cfg.ban_strength, (0.0..=5.0).contains(&v), d.ban_strength);
     let v = cfg.edge_scale;
     check("edge_scale", &mut cfg.edge_scale, v > 0.01, d.edge_scale);
+    let v = cfg.player_mastery;
+    check("player_mastery", &mut cfg.player_mastery, (0.0..=2.0).contains(&v), d.player_mastery);
     let v = cfg.min_games;
     check("min_games", &mut cfg.min_games, v >= 0.0, d.min_games);
     for (name, value, fallback) in [
@@ -409,7 +416,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         c.tier_list.as_str(),
         c.patches,
@@ -425,6 +432,7 @@ pub fn summary(c: &Config) -> String {
         c.pick_strength,
         c.ban_strength,
         c.edge_scale,
+        c.player_mastery,
         c.min_games,
         c.s_percent,
         c.a_percent,
@@ -502,6 +510,19 @@ pairs=0.15
 pick_strength=1.0
 ban_strength=0.8
 edge_scale=0.5
+; player_mastery : game 0.6.4+ tells the AI which players each team fields. A pick's value then
+;   also counts the mastery of the AI team's player in the lane the champion would play (the
+;   whole line-up's average when that lane is unknown), a ban's that of the enemy's player, times
+;   player_mastery: the AI leans to its players' best champions and bans the enemy players' best.
+;   Mastery = how much more a player wins on a champion than the champion and the player do on
+;   their own (this save's matches). The game's own proficiency is not added again: its score
+;   already counts it. 0 = off; players the model does not know count nothing.
+; player_mastery：游戏 0.6.4 起会告诉 AI 双方的上场选手。选人的估值再加上本队将打该位置的选手对这个
+;   英雄的熟练度（位置不明时取全队平均），禁用加上敌方选手的，乘以 player_mastery：AI 会偏向自己选手
+;   的拿手英雄，并禁掉对方选手的拿手英雄。熟练度 = 选手用这个英雄比英雄和选手本身的水平多赢多少（来自
+;   本存档的比赛）。游戏自己的熟练度数值不会再加一遍（游戏的评分已经算过）。0 = 关闭；模型不认识的
+;   选手不计。
+player_mastery=0.5
 
 [tiers]
 ; Ranked champions (at least min_games recent games: this patch's, plus each earlier patch's

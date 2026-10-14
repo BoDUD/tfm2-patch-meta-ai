@@ -194,6 +194,8 @@ pub struct Meta {
     pub side: f32,
     pub athletes: HashMap<u32, Effect>,
     pub mastery: HashMap<(u32, u16), Effect>,
+    /// Each athlete's kept competition games per lane (`Role::index` order).
+    pub athlete_lanes: HashMap<u32, [u32; 5]>,
     pub synergy: HashMap<(u16, u16), Effect>,
     pub counter: HashMap<(u16, u16), Effect>,
     /// Team-strategy choices and their pairing with champions.
@@ -264,6 +266,13 @@ impl Meta {
 
     pub fn mastery(&self, athlete: u32, champ: u16) -> Effect {
         self.mastery.get(&(athlete, champ)).copied().unwrap_or_default()
+    }
+
+    /// The lane an athlete played most in the kept competition matches.
+    pub fn usual_lane(&self, athlete: u32) -> Option<Role> {
+        let games = self.athlete_lanes.get(&athlete)?;
+        let (i, n) = games.iter().enumerate().max_by_key(|(i, n)| (**n, std::cmp::Reverse(*i)))?;
+        (*n > 0).then(|| Role::ALL[i])
     }
 }
 
@@ -381,6 +390,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let mut per_version: Vec<HashMap<u16, Tally>> = vec![HashMap::new(); versions.len()];
     let mut picks: HashMap<u16, u32> = HashMap::new();
     let mut bans: HashMap<u16, u32> = HashMap::new();
+    let mut athlete_lanes: HashMap<u32, [u32; 5]> = HashMap::new();
     let (mut matches, mut solo_matches, mut current_matches) = (0u32, 0u32, 0u32);
     let mut terms = Vec::new();
     for game in inp.games {
@@ -414,6 +424,10 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
                 if let Some(a) = s.athlete {
                     tallies.entry(Key::Athlete(a)).or_default().add(won);
                     tallies.entry(Key::Mastery(a, s.champ)).or_default().add(won);
+                    // the lanes competition records name (solo rank's are inferred)
+                    if let (false, Some(role)) = (game.solo, s.role) {
+                        athlete_lanes.entry(a).or_default()[role.index()] += 1;
+                    }
                 }
                 for t in &slots[i + 1..] {
                     let ((x, y), _) = pair(s.champ, t.champ);
@@ -600,6 +614,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         }
     }
     out.lane_gold = lane_gold;
+    out.athlete_lanes = athlete_lanes;
     out.names = names;
     out.keys = reg.keys;
     out.beta = fit.beta;

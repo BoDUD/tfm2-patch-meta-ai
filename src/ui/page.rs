@@ -1321,7 +1321,7 @@ mod tests {
             &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
             &Settings::default(),
         );
-        Snapshot { meta, damage: HashMap::new() }
+        Snapshot::new(meta, HashMap::new())
     }
 
     fn management() -> FakeUi {

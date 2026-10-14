@@ -25,6 +25,24 @@ pub fn player_in(roster: &Roster, role: Role) -> Option<u32> {
     roster.iter().find(|(_, r)| *r == Some(role)).map(|(a, _)| *a)
 }
 
+/// The mastery (the model's player-on-champion effect) that counts for `cand` played in `role`:
+/// the player of `roster` in that lane, and which player that is. When the lane, or every
+/// player's lane, is unknown: the line-up as a whole - the average over its players (no single
+/// player). Nothing for an empty roster, or when nobody plays that lane.
+pub fn lineup_mastery(meta: &Meta, roster: &Roster, role: Option<Role>, cand: u16) -> (f32, Option<u32>) {
+    if roster.is_empty() {
+        return (0.0, None);
+    }
+    let lanes_known = roster.iter().any(|(_, r)| r.is_some());
+    match role {
+        Some(r) if lanes_known => match player_in(roster, r) {
+            Some(a) => (meta.mastery(a, cand).value, Some(a)),
+            None => (0.0, None),
+        },
+        _ => (roster.iter().map(|(a, _)| meta.mastery(*a, cand).value).sum::<f32>() / roster.len() as f32, None),
+    }
+}
+
 /// Physical or magic damage (from the champion's tags).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Damage {
@@ -181,8 +199,10 @@ pub struct PickValue {
     pub synergy: f32,
     pub counter: f32,
     pub balance: f32,
-    /// The mastery of the player who would play it.
+    /// The mastery of the player who would play it (as counted in `total`).
     pub mastery: f32,
+    /// That player (`None`: nobody known, or the line-up as a whole).
+    pub player: Option<u32>,
     /// What the other team's remaining picks could take from it by countering it.
     pub exposure: f32,
     pub total: f32,
@@ -219,6 +239,35 @@ pub fn pick_value_in(
     damage: &dyn Fn(u16) -> Option<Damage>,
     open: &[Role],
 ) -> PickValue {
+    pick_value_weighted(meta, cand, ally, enemy, players, Mastery::FULL, damage, open)
+}
+
+/// How a player's mastery counts in a value: limited to `±cap`, then times `weight`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mastery {
+    pub weight: f32,
+    pub cap: f32,
+}
+
+impl Mastery {
+    /// As the model has it (the player's own advice).
+    pub const FULL: Mastery = Mastery { weight: 1.0, cap: f32::INFINITY };
+}
+
+/// [`pick_value_in`] with the players' mastery counted as `mastery` says (weight 0 = not at
+/// all). The AI's draft hook adds to the game's own score, which already rewards the champions
+/// its players are proficient in, so it counts the mastery for less than the player's advice.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_value_weighted(
+    meta: &Meta,
+    cand: u16,
+    ally: &[u16],
+    enemy: &[u16],
+    players: &Roster,
+    mastery: Mastery,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    open: &[Role],
+) -> PickValue {
     // the open lane it plays most often (not the one whose estimate happens to be highest:
     // that would favour lucky noise); strength only breaks ties
     let (role, strength) = open
@@ -230,7 +279,12 @@ pub fn pick_value_in(
     let synergy: f32 = ally.iter().map(|a| meta.synergy(cand, *a).value).sum();
     let counter: f32 = enemy.iter().map(|e| meta.counter(cand, *e).value).sum();
     let balance = balance_cost(cand, ally, damage);
-    let mastery = role.and_then(|r| player_in(players, r)).map_or(0.0, |a| meta.mastery(a, cand).value);
+    let (mastery, player) = if mastery.weight > 0.0 {
+        let (m, player) = lineup_mastery(meta, players, role, cand);
+        (m.clamp(-mastery.cap, mastery.cap) * mastery.weight, player)
+    } else {
+        (0.0, None)
+    };
     PickValue {
         champ: cand,
         role,
@@ -239,6 +293,7 @@ pub fn pick_value_in(
         counter,
         balance,
         mastery,
+        player,
         exposure: 0.0,
         total: strength + synergy + counter - balance + mastery,
     }
@@ -328,7 +383,22 @@ pub fn ban_value_in(
     damage: &dyn Fn(u16) -> Option<Damage>,
     enemy_open: &[Role],
 ) -> PickValue {
-    let mut v = pick_value_in(meta, cand, enemy, ally, enemy_players, damage, enemy_open);
+    ban_value_weighted(meta, cand, ally, enemy, enemy_players, Mastery::FULL, damage, enemy_open)
+}
+
+/// [`ban_value_in`] with the enemy players' mastery counted as `mastery` says.
+#[allow(clippy::too_many_arguments)]
+pub fn ban_value_weighted(
+    meta: &Meta,
+    cand: u16,
+    ally: &[u16],
+    enemy: &[u16],
+    enemy_players: &Roster,
+    mastery: Mastery,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    enemy_open: &[Role],
+) -> PickValue {
+    let mut v = pick_value_weighted(meta, cand, enemy, ally, enemy_players, mastery, damage, enemy_open);
     let presence = meta.by_id(cand).map_or(0.0, |c| c.presence());
     let factor = crate::model::presence_factor(presence, meta.typical_presence);
     // a weak champion is not worth a ban however popular it is
