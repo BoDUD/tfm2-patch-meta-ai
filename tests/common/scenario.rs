@@ -385,6 +385,31 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         let (code, _) = score(hv.score_pick, 99);
         assert_eq!(code, DraftDecisionKindV1::Pass.code(), "unknown candidate");
 
+        // game 0.6.4: once an AI team has picked, the host asks the hooks for its lane assignment
+        // (phase Position) and the last one that decides wins; this mod never decides, so the
+        // lanes stay with the game or Smart Position Lock
+        let team_picks = [0usize, 1, 2, 4, 3];
+        let lanes: Vec<u32> =
+            [LaneV1::Top, LaneV1::Jungle, LaneV1::Mid, LaneV1::Bottom, LaneV1::Support].iter().map(|l| l.code()).collect();
+        let athletes = [11usize, 12, 13, 14, 15];
+        let mut pos: DraftCtxV1 = zeroed();
+        pos.size = size_of::<DraftCtxV1>();
+        pos.phase = DraftPhaseV1::Position.code();
+        pos.ally_pick_ptr = team_picks.as_ptr();
+        pos.ally_pick_len = team_picks.len();
+        pos.champion_briefs_ptr = briefs.as_ptr();
+        pos.champion_briefs_len = briefs.len();
+        pos.ally_athletes_ptr = athletes.as_ptr();
+        pos.ally_athletes_len = athletes.len();
+        pos.ally_team = 3;
+        pos.enemy_team = usize::MAX;
+        pos.slot_lanes_ptr = lanes.as_ptr();
+        pos.slot_lanes_len = lanes.len();
+        let mut order = [usize::MAX; 5];
+        let written = (hv.decide_positions.expect("the 0.6.4 slot"))(hook.userdata, &pos, order.as_mut_ptr(), order.len());
+        assert_eq!(written, 0, "no lane assignment from this mod");
+        assert_eq!(order, [usize::MAX; 5]);
+
         // the files a player looks at
         let table = std::fs::read_to_string(dir.join("meta_table.txt")).unwrap();
         assert!(table.contains("alpha") && table.contains("patch 2.4"), "{table}");

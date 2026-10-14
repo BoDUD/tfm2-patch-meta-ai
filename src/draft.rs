@@ -9,7 +9,10 @@
 //! swamp the game's own reasoning, then `pick_strength` / `ban_strength` scale it.
 //!
 //! Position locks are another mod's job (Smart Position Lock): its "out of reach" score replaces
-//! the game's, which no nudge here can undo.
+//! the game's, which no nudge here can undo. Game 0.6.4 (ABI level 10) adds a `Position` phase
+//! after an AI team's last pick, where a hook's `decide_positions` may reassign the lanes and the
+//! last hook that decides wins: this hook keeps the trait's default (`None`), so the lanes stay
+//! with the game or Smart Position Lock. The score hooks never see that phase.
 
 use mod_api_stable::{StableDraftContext, StableDraftDecision, StableDraftHook};
 

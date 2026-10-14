@@ -19,7 +19,7 @@
 
 - **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片名字那一行和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
 - **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
-- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。
+- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。游戏 0.6.4 起 AI 选完人后还有一步"分配位置"，本 Mod 不参与：位置由游戏或 Smart Position Lock 决定（几个 Mod 同时决定时只有最后一个生效，所以本 Mod 不去抢）。
 - **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
 
 启用了哪些 Mod 是从游戏的 `config/game/mods.json` 读的。另外，如果梯队在游戏内换日后连续被别的东西改回去，本 Mod 也会自动停止写入并在 `diag.log` 里说明。
@@ -92,7 +92,7 @@
 - Linux/WSL：`tools/build.sh`，需要 `rustup target add x86_64-pc-windows-gnu` 和 `gcc-mingw-w64-x86-64`。它会跑测试、交叉编译、打包出 `dist/patch_meta_ai/` 和 zip。加 `--smoke` 还会用 Wine 真正加载 DLL，跑一遍模拟的游戏流程。
 - `cargo test`：单元测试（模型能否从模拟比赛中找回已知的英雄强度、选手实力、配合；补丁改动后的估计；选人界面读写），加上走真实 C 接口的整局模拟（`tests/fake_host.rs`）。`cargo test --release -- --ignored --nocapture fit_time` 测一次存档规模的拟合耗时。
 
-`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.3 自带，ABI 等级 9），版权归 TeamSamoyed。
+`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.4 自带，ABI 等级 10），版权归 TeamSamoyed。Mod 只要求 ABI 等级 1，所以用新 SDK 构建的 DLL 在 0.6.0～0.6.3 上照样能加载。
 
 ## 致谢
 
@@ -114,6 +114,7 @@ Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). V
 The game prunes old match records; each save's matches are also kept in `history/` in the mod folder (never in the save) and merged back once the save's recent matches confirm the file is its own.
 
 - `ban_pick` / `tier_list` default to `auto`: they step aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
+- Game 0.6.4 adds a lane-assignment step after an AI team's picks; this mod stays out of it (when several mods decide, the last one wins), so the game or Smart Position Lock assigns the lanes.
 - Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.
-- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK.
+- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK as shipped with game 0.6.4 (ABI level 10); the DLL asks for level 1 only, so it still loads on 0.6.0-0.6.3.
