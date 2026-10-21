@@ -29,6 +29,8 @@ const GROUPS: [(&str, &str); 12] = [
     ("early_serpen_top", "sub1.early_serpen_top"),
     ("minion_wave", "sub2.minion_wave"),
     ("object_buildup", "sub2.object_buildup"),
+    // gone from the game 0.6.4 screen (the records still carry it): like any option the screen
+    // does not show, it gets no chip; kept for the games that still show it
     ("object_battle", "sub2.object_battle"),
     ("object_finish", "sub2.object_finish"),
     ("morgard_use", "sub3.morgard_use"),
@@ -142,7 +144,7 @@ mod tests {
         }
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());
-        let snapshot = Snapshot { meta, damage: HashMap::new() };
+        let snapshot = Snapshot::new(meta, HashMap::new());
         let team: Vec<u16> = (0..5).collect();
         let mut ui = FakeUi::default();
         ui.add("main", "strategy_ui");

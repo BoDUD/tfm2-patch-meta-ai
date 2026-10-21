@@ -965,7 +965,10 @@ fn collect(st: &mut State, cfg: &Config, team: usize) {
         backtest: st.backtest,
         html: cfg.report,
     });
-    shared::publish(shared::Snapshot::new(meta, st.damage.clone()));
+    let mut snapshot = shared::Snapshot::new(meta, st.damage.clone());
+    snapshot.athlete_names = st.labels.athletes.clone();
+    snapshot.team_names = st.team_names.clone();
+    shared::publish(snapshot);
 }
 
 /// What the report files are built from, besides the published model.
