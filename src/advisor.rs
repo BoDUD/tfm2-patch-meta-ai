@@ -13,6 +13,19 @@
 //! pick the other team has left, a last pick by none. So a pick loses what its worst likely
 //! counters on offer would take from it, in proportion to the picks the other team has left -
 //! early picks lean to safe champions, late picks to counters.
+//!
+//! A pick also counts what it does to its team's **composition** (`Meta::comp_score`: the gaps a
+//! line-up has - no frontline, no engage, one damage type... - with its open slots counted as
+//! average champions, so a gap weighs more the fewer picks are left to fill it).
+//!
+//! **Bans** ([`ban_board`]) are valued the way a coach does it: not "how good is it" but "how
+//! much worse does the enemy's draft get without it". For every lane the enemy still has to fill,
+//! the enemy's options are valued as picks of theirs (strength there, synergy with their picks,
+//! matchups against ours, composition, their player's mastery); a ban is worth what the enemy's
+//! best option in those lanes loses - nothing when an equally good substitute is left, a lot for
+//! the one champion nothing else replaces, and more for a flex pick that threatens several lanes.
+//! What the same ban takes from our own options is subtracted, more when we would get the
+//! champion first.
 
 use crate::history::Role;
 use crate::meta::Meta;
@@ -68,16 +81,32 @@ pub struct Lanes {
     pub confidence: f32,
 }
 
+/// A champion's share of play in each lane: its games there, with its League lanes (when it is a
+/// League champion) counting as [`ROLE_EVIDENCE`] games. `None`: too few games and no League
+/// lanes - any lane is as likely.
+pub fn lane_shares(meta: &Meta, champ: u16) -> Option<[f32; 5]> {
+    let c = meta.by_id(champ)?;
+    let games: u32 = c.roles.iter().map(|r| r.tally.games).sum();
+    let prior = meta.lane_priors.get(champ as usize).copied().flatten();
+    if games < ROLE_EVIDENCE && prior.is_none() {
+        return None;
+    }
+    let weight = if prior.is_some() { ROLE_EVIDENCE as f32 } else { 0.0 };
+    let prior = prior.unwrap_or([0.2; 5]);
+    let mut out = [0.0; 5];
+    for (i, o) in out.iter_mut().enumerate() {
+        // a little smoothing, so an unseen lane is unlikely but possible
+        *o = (c.roles[i].tally.games as f32 + weight * prior[i] + 0.05) / (games as f32 + weight + 0.25);
+    }
+    Some(out)
+}
+
 /// How well a champion fits a lane, as a log-likelihood from its share of games there.
 fn lane_fit(meta: &Meta, champ: u16, role: Role) -> f32 {
-    let Some(c) = meta.by_id(champ) else { return 0.0 };
-    let games: u32 = c.roles.iter().map(|r| r.tally.games).sum();
-    if games < ROLE_EVIDENCE {
-        return (0.2f32).ln();
+    match lane_shares(meta, champ) {
+        Some(shares) => shares[role.index()].ln(),
+        None => (0.2f32).ln(),
     }
-    // a little smoothing, so an unseen lane is unlikely but possible
-    let share = (c.roles[role.index()].tally.games as f32 + 0.25) / (games as f32 + 1.25);
-    share.ln()
 }
 
 /// The most likely lane for each pick (at most five), and how sure that is: every one-to-one
@@ -161,12 +190,12 @@ pub fn lane_probabilities(meta: &Meta, picks: &[u16]) -> Vec<[f32; 5]> {
 /// A champion's strength in a lane (log-odds), with the off-role cost.
 pub fn strength_in(meta: &Meta, champ: u16, role: Role) -> f32 {
     let Some(c) = meta.by_id(champ) else { return 0.0 };
-    let games: u32 = c.roles.iter().map(|r| r.tally.games).sum();
-    let off = games >= ROLE_EVIDENCE && c.role_share()[role.index()] < OFF_ROLE_SHARE;
+    let off = lane_shares(meta, champ).is_some_and(|s| s[role.index()] < OFF_ROLE_SHARE);
     c.strength + c.roles[role.index()].value - if off { OFF_ROLE_COST } else { 0.0 }
 }
 
-/// A team's own strength: its champions in their lanes and the synergy of every pair.
+/// A team's own strength: its champions in their lanes, the synergy of every pair and its
+/// composition.
 pub fn team_strength(meta: &Meta, picks: &[u16]) -> f32 {
     let lanes = lanes(meta, picks);
     let mut total: f32 = picks.iter().zip(&lanes.roles).map(|(c, r)| strength_in(meta, *c, *r)).sum();
@@ -175,7 +204,7 @@ pub fn team_strength(meta: &Meta, picks: &[u16]) -> f32 {
             total += meta.synergy(*a, *b).value;
         }
     }
-    total
+    total + meta.comp_score(picks).0
 }
 
 /// Probability that `ally` beats `enemy` (picks so far; missing picks count as average).
@@ -199,6 +228,10 @@ pub struct PickValue {
     pub synergy: f32,
     pub counter: f32,
     pub balance: f32,
+    /// What it does to its team's composition (filling a gap > 0).
+    pub comp: f32,
+    /// The composition gap it fills most, when that is worth mentioning (`knowledge::COMP_NAMES`).
+    pub fills: Option<usize>,
     /// The mastery of the player who would play it (as counted in `total`).
     pub mastery: f32,
     /// That player (`None`: nobody known, or the line-up as a whole).
@@ -278,7 +311,9 @@ pub fn pick_value_weighted(
         .unwrap_or((None, meta.by_id(cand).map_or(0.0, |c| c.strength) - OFF_ROLE_COST));
     let synergy: f32 = ally.iter().map(|a| meta.synergy(cand, *a).value).sum();
     let counter: f32 = enemy.iter().map(|e| meta.counter(cand, *e).value).sum();
-    let balance = balance_cost(cand, ally, damage);
+    // the composition: the League profiles' gaps when they are known, else the plain damage mix
+    let (comp, fills) = comp_gain(meta, cand, ally);
+    let balance = if meta.open_slot.is_some() { 0.0 } else { balance_cost(cand, ally, damage) };
     let (mastery, player) = if mastery.weight > 0.0 {
         let (m, player) = lineup_mastery(meta, players, role, cand);
         (m.clamp(-mastery.cap, mastery.cap) * mastery.weight, player)
@@ -292,11 +327,31 @@ pub fn pick_value_weighted(
         synergy,
         counter,
         balance,
+        comp,
+        fills,
         mastery,
         player,
         exposure: 0.0,
-        total: strength + synergy + counter - balance + mastery,
+        total: strength + synergy + counter - balance + comp + mastery,
     }
+}
+
+/// What adding `cand` does to the composition of a team that has `ally` (log-odds), and the gap
+/// it fills most when that is at least 1 win-rate point.
+pub fn comp_gain(meta: &Meta, cand: u16, ally: &[u16]) -> (f32, Option<usize>) {
+    if meta.open_slot.is_none() || ally.len() >= 5 {
+        return (0.0, None);
+    }
+    let (before, parts_before) = meta.comp_score(ally);
+    let mut with = ally.to_vec();
+    with.push(cand);
+    let (after, parts_after) = meta.comp_score(&with);
+    let best = (0..parts_before.len())
+        .map(|i| (i, parts_after[i] - parts_before[i]))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|(_, g)| *g >= 0.04)
+        .map(|(i, _)| i);
+    (after - before, best)
 }
 
 /// How much of the counter threat the other team's remaining picks pose counts.
@@ -404,6 +459,158 @@ pub fn ban_value_weighted(
     // a weak champion is not worth a ban however popular it is
     v.total = if v.total > 0.0 { v.total * factor } else { v.total };
     v
+}
+
+/// One side of a draft: its picks so far and its fielded players.
+#[derive(Clone, Copy)]
+pub struct Team<'a> {
+    pub picks: &'a [u16],
+    pub players: &'a Roster,
+}
+
+/// A ban candidate valued on the [`ban_board`] (log-odds).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BanValue {
+    pub champ: u16,
+    /// What the ban takes from the enemy's draft: how much worse their best option gets in the
+    /// lanes they still have to fill.
+    pub deny: f32,
+    /// What it takes from ours (before the pick-order weight).
+    pub own: f32,
+    /// Its value to the enemy in the lane where the ban hurts them most (the reasons).
+    pub threat: PickValue,
+    /// How many of the enemy's open lanes it is a real option in (flex pick).
+    pub lanes: u8,
+    /// Nothing else on offer comes close to it there (the ban takes most of what it is worth).
+    pub irreplaceable: bool,
+    pub total: f32,
+}
+
+/// The options per lane "the best option" is taken over.
+const BAN_OPTIONS: usize = 8;
+/// How soft "the best option" is (log-odds): a team does not always take the top one.
+const BAN_SOFTNESS: f32 = 0.08;
+/// A flex pick's lanes after the one where the ban hurts most count this much each.
+const FLEX_WEIGHT: f32 = 0.35;
+/// A lane counts for a flex pick when the ban takes at least this much there.
+const FLEX_MIN: f32 = 0.02;
+/// How likely the enemy is to take a champion, from how often it is played or banned: at most
+/// this much (log-odds) either way.
+const PRESENCE_WEIGHT: f32 = 0.1;
+
+/// Whether the team with `ours` picks takes the next champion before the team with `theirs`, in
+/// the standard order (B R R B B R, then R B B R): the side with fewer picks goes first; at equal
+/// counts blue goes first after an even number each (0-0, 2-2, 4-4) and red after an odd one
+/// (1-1, 3-3: red opens the second pick phase). `None` when that needs the side and it is unknown.
+pub fn picks_first(ours: usize, theirs: usize, blue: Option<bool>) -> Option<bool> {
+    if ours != theirs {
+        return Some(ours < theirs);
+    }
+    blue.map(|b| b == ours.is_multiple_of(2))
+}
+
+/// `tau * ln(sum(exp(v / tau)))` over `values`: the best of them, softened.
+fn smooth_best(values: impl Iterator<Item = f32>) -> f32 {
+    let values: Vec<f32> = values.collect();
+    let Some(top) = values.iter().copied().reduce(f32::max) else { return 0.0 };
+    top + BAN_SOFTNESS * values.iter().map(|v| ((v - top) / BAN_SOFTNESS).exp()).sum::<f32>().ln()
+}
+
+/// For every lane `team` still has to fill: the best `BAN_OPTIONS + 1` options on offer as
+/// its picks there, best first.
+fn lane_options(
+    meta: &Meta,
+    team: Team<'_>,
+    other: &[u16],
+    mastery: Mastery,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    offer: &[u16],
+    likely: &dyn Fn(u16) -> f32,
+) -> Vec<Vec<PickValue>> {
+    if team.picks.len() >= 5 {
+        return Vec::new();
+    }
+    open_lanes(meta, team.picks)
+        .into_iter()
+        .map(|role| {
+            let mut options: Vec<PickValue> = offer
+                .iter()
+                .map(|c| {
+                    let mut v = pick_value_weighted(meta, *c, team.picks, other, team.players, mastery, damage, &[role]);
+                    v.total += likely(*c);
+                    v
+                })
+                .collect();
+            options.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+            options.truncate(BAN_OPTIONS + 1);
+            options
+        })
+        .collect()
+}
+
+/// What banning `champ` takes from a team with these lane options: per lane, how much its
+/// softened best option drops; the worst lane fully, the others at [`FLEX_WEIGHT`]. Also the
+/// lane where it hurts most (its option there), how many lanes it matters in, and whether the
+/// next option in that lane is far behind.
+fn drop_of(lanes: &[Vec<PickValue>], champ: u16) -> (f32, Option<PickValue>, u8, bool) {
+    let mut drops: Vec<(f32, &PickValue, bool)> = Vec::new();
+    for options in lanes {
+        let Some(at) = options.iter().position(|v| v.champ == champ) else { continue };
+        if at >= BAN_OPTIONS {
+            continue;
+        }
+        let with = smooth_best(options[..BAN_OPTIONS.min(options.len())].iter().map(|v| v.total));
+        let without = smooth_best(
+            options.iter().enumerate().filter(|(i, _)| *i != at).take(BAN_OPTIONS).map(|(_, v)| v.total),
+        );
+        let next = options.iter().enumerate().find(|(i, _)| *i != at).map_or(f32::NEG_INFINITY, |(_, v)| v.total);
+        let lone = options[at].total - next >= 0.1;
+        drops.push(((with - without).max(0.0), &options[at], lone));
+    }
+    drops.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let Some(&(worst, threat, lone)) = drops.first() else { return (0.0, None, 0, false) };
+    let rest: f32 = drops[1..].iter().map(|d| d.0).sum();
+    let lanes = drops.iter().filter(|d| d.0 >= FLEX_MIN).count() as u8;
+    (worst + FLEX_WEIGHT * rest, Some(threat.clone()), lanes, lone)
+}
+
+/// Every champion on offer valued as our ban, best first (see the module notes). `blue`: whether
+/// we are the blue side (`None`: not known), for who would get a champion first.
+#[allow(clippy::too_many_arguments)]
+pub fn ban_board(
+    meta: &Meta,
+    us: Team<'_>,
+    them: Team<'_>,
+    mastery: Mastery,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    offer: &[u16],
+    blue: Option<bool>,
+) -> Vec<BanValue> {
+    let likely = |c: u16| {
+        let presence = meta.by_id(c).map_or(0.0, |c| c.presence());
+        PRESENCE_WEIGHT * crate::model::presence_factor(presence, meta.typical_presence).ln() / 2f32.ln()
+    };
+    let theirs = lane_options(meta, them, us.picks, mastery, damage, offer, &likely);
+    let ours = lane_options(meta, us, them.picks, mastery, damage, offer, &|_| 0.0);
+    // a champion we would get first costs us more to ban
+    let own_weight = match picks_first(us.picks.len(), them.picks.len(), blue) {
+        Some(true) => 0.7,
+        Some(false) => 0.25,
+        None => 0.45,
+    };
+    let mut board: Vec<BanValue> = offer
+        .iter()
+        .map(|c| {
+            let (deny, threat, lanes, irreplaceable) = drop_of(&theirs, *c);
+            let (own, _, _, _) = drop_of(&ours, *c);
+            let threat = threat.unwrap_or_else(|| {
+                pick_value_weighted(meta, *c, them.picks, us.picks, them.players, mastery, damage, &open_lanes(meta, them.picks))
+            });
+            BanValue { champ: *c, deny, own, threat, lanes, irreplaceable, total: deny - own_weight * own }
+        })
+        .collect();
+    board.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+    board
 }
 
 #[cfg(test)]
@@ -552,6 +759,41 @@ mod tests {
             ban_value_in(&m, c, &ally, &enemy, &[], &none, &e);
         }
         eprintln!("one draft state, 120 candidates: per candidate {before:?}, shared {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn bans_take_what_has_no_substitute() {
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
+        let us = Team { picks: &[], players: &[] };
+        let them = Team { picks: &[], players: &[] };
+        let board = ban_board(&m, us, them, Mastery::FULL, &none, &offer, Some(false));
+        assert_eq!(board.len(), offer.len());
+        // c is the strong one in the simulation; l the weak one
+        let rank = |n: &str| board.iter().position(|b| b.champ == m.names.get(n).unwrap()).unwrap();
+        assert!(rank("c") < 3, "{board:?}");
+        assert!(rank("l") > rank("c"));
+        assert!(board.windows(2).all(|w| w[0].total >= w[1].total));
+        // a ban never helps the enemy
+        assert!(board.iter().all(|b| b.deny >= 0.0 && b.own >= 0.0));
+        // nothing left to deny once they have picked five
+        let five: Vec<u16> = (0..5).collect();
+        let offer_rest: Vec<u16> = (5..NAMES.len() as u16).collect();
+        let late = ban_board(&m, us, Team { picks: &five, players: &[] }, Mastery::FULL, &none, &offer_rest, None);
+        assert!(late.iter().all(|b| b.deny == 0.0));
+    }
+
+    #[test]
+    fn standard_pick_order() {
+        // B R R B B R | R B B R
+        let order = [(0, 0, true), (1, 0, false), (1, 1, false), (1, 2, true), (2, 2, true), (3, 2, false), (3, 3, false), (3, 4, true), (4, 4, true), (5, 4, false)];
+        for (b, r, blue_next) in order {
+            assert_eq!(picks_first(b, r, Some(true)), Some(blue_next), "{b}-{r}");
+            assert_eq!(picks_first(r, b, Some(false)), Some(!blue_next), "{b}-{r} from red");
+        }
+        assert_eq!(picks_first(2, 2, None), None);
+        assert_eq!(picks_first(1, 2, None), Some(true));
     }
 
     #[test]

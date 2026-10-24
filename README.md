@@ -4,7 +4,7 @@
 
 按你存档里的真实胜负数据工作的原生 Mod（稳定版 Mod API，游戏 0.6 及以上）。2.0 起，它用**一个统一的统计模型**同时估计英雄强度、分位置强度、选手实力与熟练度、队友配合和对位克制，然后：
 
-1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。选人顺序也算在内：对方后面还有几手、有没有强力克制，都会压低先手暴露的英雄的价值。Fearless 模式下显示本系列已锁定的英雄数。换位阶段，右下角改为显示把五个英雄分给五名选手的最佳方式。
+1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由；禁用阶段给出最该禁的三个，见下文"教练式禁用"），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。选人顺序也算在内：对方后面还有几手、有没有强力克制，都会压低先手暴露的英雄的价值。Fearless 模式下显示本系列已锁定的英雄数。换位阶段，右下角改为显示把五个英雄分给五名选手的最佳方式。
 2. **战术界面**：选完人后，模型按你的阵容和本存档里各战术的实际胜负，在值得改的战术选项上标出 ★ 和收益。
 3. **首发界面**：按选手实力、位置评分和英雄池（熟练度）推荐五名首发，名单行上标 ★ 和位置；名单下方有空间时列出他们最好的英雄。
 4. **版本分析页**（左侧菜单）：英雄 / 组合 / 选手 / 补丁变化 / 模型 五个标签。英雄表可按位置筛选、按任意列排序，显示对线期经济差；选手页给出训练建议（值得练的英雄）；补丁变化页列出本版本上升、下降和被改动的英雄。
@@ -14,6 +14,24 @@
 8. **报告**：Mod 文件夹里的 `meta_report.html`（浏览器打开，可排序、搜索）和 `meta_table.txt`。
 
 数据全部来自你的存档：大会比赛、单排、球队新闻里的补丁公告。游戏会删掉很旧的比赛记录，所以 Mod 把每个存档的比赛另存在 Mod 文件夹的 `history/` 里（不改存档），下次读档时补回来；只有存档里最近的比赛确实出现在这个文件里时才会合并，同一支队伍的不同存档不会混在一起。
+
+## 教练式禁用（3+2 等任何禁用规则）
+
+禁用阶段（第一轮 3 个、第二轮 2 个，或其他任何规则），右下角的三行换成**最该禁的三个英雄**（禁 1 / 禁 2 / 禁 3），英雄卡片上显示禁掉它值多少（禁 x.x）。对方禁用时，三行显示**对方最想禁我们的**（敌禁?）。
+
+禁用价值不是"这个英雄多强"，而是"禁掉它，对方阵容会变差多少"：
+
+- 对方每个还空着的位置，把场上剩下的英雄都按"对方来选"估值（这个位置的强度、和对方已选英雄的配合、对我方已选英雄的克制、补不补得上对方阵容的缺口、对方这个位置的选手熟不熟），禁用价值 = 对方在这些位置上的最佳选择因此下降多少。有同样好的替代品时几乎不值得禁；**没有替代**的、能打多个位置的**摇摆位**英雄值得禁。
+- 第一轮（双方都没选人）自然偏向版本强势、独一档的英雄；第二轮（各选三个之后）只看对方还缺的位置，自然偏向克制我方已选英雄、补对方阵容缺口的英雄。
+- 禁掉的英雄我们也拿不到：减去我方因此损失的选择，下一手是我方先选时减得更多（先手能直接拿走它，没必要禁）。我方选手的拿手英雄因此不容易被建议禁掉。
+- 理由列写出原因，例如"中路 无替代 · 克我方 +1.2 · 补前排"。
+
+选人时，选它还能顺便让对方拿不到：推荐的选人也加上一半"禁掉它的价值"（抢）。AI 的禁用用同样的算法。
+
+**英雄联盟经验**（`lol_prior`，默认 1）：存档里的比赛少时，模型从英雄联盟的经验出发，比赛多了由数据修正：
+- 全部 165 个英雄联盟英雄的官方位置（和 Smart Position Lock 同一份列表），用来判断英雄打哪路；
+- 每个英雄的阵容属性（`presets/league_comp.ini`：伤害类型，前排、开团、保护、消耗、突进、后期输出、控制各 0～2），模型据此学习"阵容缺前排 / 缺开团 / 伤害类型单一 / 控制少 / 输出少 / C 位没人保护"各损失多少胜率，选人和禁用都会算上补阵容缺口的价值；
+- 职业赛场梯队（S～D）作为英雄强度的起点，知名的配合与克制作为配合/克制的起点。
 
 ## 和其他 Mod 一起用
 
@@ -59,6 +77,7 @@
 | | `drift` / `change` | 0.08 / 0.3 | 英雄强度每个版本的变化幅度：未改动 / 被补丁改动（对数几率） |
 | | `patch_shift` | 0.02 | 补丁加强/削弱时起点预移的胜率 |
 | | `solo_weight` | 0.5 | 一场单排算几场大会比赛 |
+| | `lol_prior` | 1 | 英雄联盟经验（梯队、配合/克制、阵容缺口的损失）作为起点的分量，0～3（0 = 不用） |
 | | `reworked` | （空） | 本版本重做的英雄 id，历史数据几乎不计 |
 | | `roles` `players` `mastery` `pairs` | 0.3 / 0.35 / 0.2 / 0.15 | 位置、选手、熟练度、配合/克制效应的先验幅度（越大越容易被数据推离 0） |
 | `[draft]` | `pick_strength` / `ban_strength` | 1.0 / 0.8 | 对 AI 原有评分的影响力度 |
@@ -105,12 +124,12 @@
 
 Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). Version 2 fits one regularised logistic regression over your save's matches - champion strength per patch (a random walk across patches, wider where the patch notes changed a champion), lane offsets, each player's own strength and champion mastery, ally synergy and opponent matchups - on a background thread, and uses it for:
 
-1. **the ban/pick screen**: your line-up's win chance, the best picks and bans now with reasons (aware of the draft order: a champion picked early can still be countered), each champion card's value to you, each enemy pick's likely lane, the Fearless count, and the best seating in the swap phase;
+1. **the ban/pick screen**: your line-up's win chance, the best picks now, and in every ban phase (3+2 included) the three best bans with reasons - or, while the enemy bans, the ones they want against you; picks aware of the draft order (a champion picked early can still be countered); each champion card's value to you, each enemy pick's likely lane, the Fearless count, and the best seating in the swap phase;
 2. **the tactics screen**: a star on each tactic option worth changing for your line-up, with its gain;
 3. **the line-up screen**: the five suggested starters (strength, position rating, champion pool);
 4. **a Meta Analysis page** in the left menu: champions (lane filter, lane-phase gold), pairs, players with training suggestions, patch changes, the model;
 5. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
-6. **the AI's bans and picks**, valued in the actual draft (position locks are left to Smart Position Lock, a separate mod; the advice skips the cards it locks); from game 0.6.4, which hands both line-ups to the AI, also by the fielded players: a pick counts the mastery of the team's player in the lane it would play, a ban that of the enemy's player, times `player_mastery` (0.5, at most ±0.5 log-odds per player before it) - the AI leans to its players' best champions and bans the enemy players' best. The mastery is the model's own player-on-champion effect from this save's matches, not the game's proficiency number, which the game's own score already counts; unknown players, no line-up (older games) or `player_mastery=0` leave the value as before;
+6. **the AI's bans and picks**, valued in the actual draft (a ban by how much worse the enemy's best options in its open lanes get without the champion - an equally good substitute makes it worth little, a flex pick more - less what it takes from our own options; a pick also by what it does to the team's composition) (position locks are left to Smart Position Lock, a separate mod; the advice skips the cards it locks); from game 0.6.4, which hands both line-ups to the AI, also by the fielded players: a pick counts the mastery of the team's player in the lane it would play, a ban that of the enemy's player, times `player_mastery` (0.5, at most ±0.5 log-odds per player before it) - the AI leans to its players' best champions and bans the enemy players' best. The mastery is the model's own player-on-champion effect from this save's matches, not the game's proficiency number, which the game's own score already counts; unknown players, no line-up (older games) or `player_mastery=0` leave the value as before;
 7. **your team's tier list**;
 8. **`meta_report.html`** and `meta_table.txt` in the mod folder.
 

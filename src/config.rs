@@ -61,6 +61,8 @@ pub struct Config {
     pub patch_shift: f32,
     /// One solo-rank game counts as this many competition games.
     pub solo_weight: f32,
+    /// How much of League's built-in knowledge the priors start from (0 = none, 1 = as built in).
+    pub lol_prior: f32,
     /// Champion ids reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
     /// Prior spreads (log-odds) of the lane, player, mastery and pair effects: how far the data
@@ -114,6 +116,7 @@ impl Default for Config {
             change: 0.3,
             patch_shift: 0.02,
             solo_weight: 0.5,
+            lol_prior: 1.0,
             reworked: Vec::new(),
             roles: 0.3,
             players: 0.35,
@@ -158,6 +161,7 @@ impl Config {
             mastery_sd: self.mastery,
             pair_sd: self.pairs,
             solo_weight: self.solo_weight,
+            lol_prior: self.lol_prior,
             ..crate::meta::Settings::default()
         }
     }
@@ -234,6 +238,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "change" => cfg.change = number(value)?,
         "patch_shift" => cfg.patch_shift = number(value)?,
         "solo_weight" => cfg.solo_weight = number(value)?,
+        "lol_prior" => cfg.lol_prior = number(value)?,
         "roles" => cfg.roles = number(value)?,
         "players" => cfg.players = number(value)?,
         "mastery" => cfg.mastery = number(value)?,
@@ -286,6 +291,8 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     check("patch_shift", &mut cfg.patch_shift, (0.0..=0.2).contains(&v), d.patch_shift);
     let v = cfg.solo_weight;
     check("solo_weight", &mut cfg.solo_weight, v >= 0.0, d.solo_weight);
+    let v = cfg.lol_prior;
+    check("lol_prior", &mut cfg.lol_prior, (0.0..=3.0).contains(&v), d.lol_prior);
     let v = cfg.pick_strength;
     check("pick_strength", &mut cfg.pick_strength, (0.0..=5.0).contains(&v), d.pick_strength);
     let v = cfg.ban_strength;
@@ -415,7 +422,7 @@ fn reload(path: &PathBuf) {
 pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
-         reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
+         lol_prior={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         c.tier_list.as_str(),
@@ -424,6 +431,7 @@ pub fn summary(c: &Config) -> String {
         c.change,
         c.patch_shift,
         c.solo_weight,
+        c.lol_prior,
         c.reworked.join(","),
         c.roles,
         c.players,
@@ -490,6 +498,14 @@ drift=0.08
 change=0.3
 patch_shift=0.02
 solo_weight=0.5
+; League champions start from what League says (built in): their competitive tier, known combos
+; and counters, and what a composition without frontline / engage / both damage types / crowd
+; control / damage / protection for its carries loses. The save's matches move all of it.
+; 0 = start every champion at "average", 1 = as built in, up to 3.
+; 英雄联盟英雄从英雄联盟的经验出发（内置）：职业赛场梯队、知名的配合和克制、阵容缺前排 / 开团 /
+; 双伤害类型 / 控制 / 输出 / 保护C位时的损失。存档里的比赛会修正这些。0 = 一律从"平均"出发，
+; 1 = 按内置，最大 3。
+lol_prior=1
 ; champion ids reworked this patch (history barely counts), comma separated
 ; 本版本重做的英雄 id（历史数据几乎不计），逗号分隔，例如 reworked=fighter, demon
 reworked=
