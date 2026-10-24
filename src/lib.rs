@@ -26,6 +26,7 @@ mod diag;
 pub mod draft;
 pub mod glm;
 pub mod history;
+pub mod knowledge;
 pub mod meta;
 pub mod model;
 mod paths;

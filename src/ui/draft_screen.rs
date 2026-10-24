@@ -3,10 +3,13 @@
 //! - **win chance** (bottom left, under the player's picks): the model's probability that the
 //!   player's line-up beats the enemy's as picked so far, with a bar;
 //! - **advice** (bottom right): the best picks and the best ban for the player right now, each
-//!   with what it is worth and why (lane, synergy, matchups, the player's mastery);
+//!   with what it is worth and why (lane, synergy, matchups, composition, the player's mastery).
+//!   In a ban phase (both 3+2 phases and any other format) the three best bans instead - valued
+//!   by how much worse they make the enemy's draft (`advisor::ban_board`) - or, while the enemy
+//!   bans, the three bans they would most want against us;
 //! - **grid values**: on every champion card, at the right end of its name row (under the
 //!   portrait) - an arrow and what picking it is worth to the player now, in win-rate points,
-//!   coloured green / red / grey;
+//!   coloured green / red / grey; in a ban phase what banning it is worth (禁);
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
 //!   of how sure that is - from the champions' lane history, so it works in every language;
 //! - **swap phase**: the best way to seat the team's five champions on its players
@@ -60,6 +63,10 @@ const PANEL: u32 = 0x161721f0;
 /// The layer Smart Position Lock puts over a card the player's team may not pick.
 const POSITION_LOCK: &str = "spl_lock";
 const SWAP: &str = "main.swap";
+/// The phase label (`banpick.ban_phase` / `banpick.pick_phase`) and the arrow on the side whose
+/// turn it is.
+const STEP: &str = "main.header.step";
+const TURN_ARROWS: [&str; 2] = ["main.header.desc.blue_arrow", "main.header.desc.red_arrow"];
 const SWAP_TABLES: [&str; 2] = ["main.swap.blue_table", "main.swap.red_table"];
 
 /// What the overlay shows besides the model.
@@ -96,7 +103,18 @@ impl Card {
 #[derive(Clone, Copy)]
 struct Turn {
     side: usize,
+    /// The player's side is known (not assumed blue).
+    side_known: bool,
     swapping: bool,
+    /// A ban phase.
+    banning: bool,
+    /// The side whose turn it is (`None`: no arrow shown).
+    acting: Option<usize>,
+}
+
+/// A ban phase, by the header's phase label (a text reference, the same in every language).
+fn ban_phase(step: &str) -> bool {
+    step.contains("ban_phase")
 }
 
 #[derive(Default)]
@@ -220,10 +238,10 @@ fn overlay_source() -> String {
     let mut advice = format!("#seating:empty {{ width: 100%; height: 100%; visible: false; ignore_event: true; {seating}}} ");
     for r in 0..ADVICE_ROWS {
         let y = 4 + r as u32 * 26;
-        advice.push_str(&label(&format!("k{r}"), 12, y, 40, 24, 13, DIM, "Left"));
-        advice.push_str(&label(&format!("c{r}"), 56, y, 150, 24, 14, TEXT, "Left"));
-        advice.push_str(&label(&format!("v{r}"), 208, y, 56, 24, 14, GOOD, "Right"));
-        advice.push_str(&label(&format!("w{r}"), 274, y, 178, 24, 12, DIM, "Left"));
+        advice.push_str(&label(&format!("k{r}"), 12, y, 46, 24, 13, DIM, "Left"));
+        advice.push_str(&label(&format!("c{r}"), 58, y, 124, 24, 14, TEXT, "Left"));
+        advice.push_str(&label(&format!("v{r}"), 182, y, 50, 24, 14, GOOD, "Right"));
+        advice.push_str(&label(&format!("w{r}"), 240, y, 214, 24, 12, DIM, "Left"));
     }
     format!(
         "pma:empty {{ width: 100%; height: 100%; ignore_event: true; {}{}}}",
@@ -288,6 +306,9 @@ fn why(v: &PickValue) -> String {
     if let Some(r) = v.role {
         parts.push(r.name().to_string());
     }
+    if let Some(f) = v.fills {
+        parts.push(format!("补{}", crate::knowledge::COMP_NAMES_ZH[f]));
+    }
     if v.synergy.abs() >= 0.02 {
         parts.push(format!("syn {}", signed(points(v.synergy))));
     }
@@ -305,6 +326,41 @@ fn why(v: &PickValue) -> String {
     }
     parts.join(" · ")
 }
+
+/// Why a ban is worth what it is: the lane it denies, whether anything replaces it there, how
+/// many lanes it threatens, what it does against our picks, the enemy player on it, and what it
+/// would cost us. At most four parts (the row is narrow).
+fn why_ban(b: &advisor::BanValue) -> String {
+    let t = &b.threat;
+    let mut parts = Vec::new();
+    if let Some(r) = t.role {
+        parts.push(format!("{}{}", r.name(), if b.irreplaceable { " 无替代" } else { "" }));
+    }
+    if b.lanes >= 2 {
+        parts.push(format!("{}路摇摆", b.lanes));
+    }
+    if t.counter >= 0.02 {
+        parts.push(format!("克我方 {}", signed(points(t.counter))));
+    }
+    if t.mastery >= 0.02 {
+        parts.push(format!("选手 {}", signed(points(t.mastery))));
+    }
+    if let Some(f) = t.fills {
+        parts.push(format!("补{}", crate::knowledge::COMP_NAMES_ZH[f]));
+    }
+    if t.synergy >= 0.03 {
+        parts.push(format!("配合 {}", signed(points(t.synergy))));
+    }
+    if b.own >= 0.03 {
+        parts.push(format!("我方也想要 {}", signed(-points(b.own))));
+    }
+    parts.truncate(4);
+    parts.join(" · ")
+}
+
+/// A pick of ours also keeps the champion from the enemy: this share of what banning it would
+/// take from them counts.
+const CONTEST: f32 = 0.5;
 
 impl DraftScreen {
     /// One frame on a screen that may be the ban/pick screen.
@@ -355,6 +411,8 @@ impl DraftScreen {
         let known = |c: &str| meta.names.get(c).is_some();
         let cards = read_grid(ui, &known, names);
         let swap_phase = ui.visible(SWAP) == Some(true);
+        let banning = ui.text(STEP).is_some_and(|t| ban_phase(&t));
+        let acting = (0..2).find(|s| visible(ui, TURN_ARROWS[*s]));
         if !self.reported {
             self.reported = true;
             let named = cards.iter().filter(|c| c.champ.is_some()).count();
@@ -377,7 +435,7 @@ impl DraftScreen {
         for c in &cards {
             (&c.champ, c.blue, c.red, c.banned, c.locked, c.held).hash(&mut h);
         }
-        (side, Arc::as_ptr(snapshot) as usize, swap_phase).hash(&mut h);
+        (side, Arc::as_ptr(snapshot) as usize, swap_phase, banning, acting).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -398,7 +456,7 @@ impl DraftScreen {
             ui.text(path).and_then(|t| view.rosters.get(&team_key(&t)).cloned()).unwrap_or_default()
         };
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
-        let turn = Turn { side, swapping: swap_phase && side_known };
+        let turn = Turn { side, side_known, swapping: swap_phase && side_known, banning, acting };
         self.draw(ui, snapshot, &cards, turn, &rosters, view);
     }
 
@@ -486,37 +544,62 @@ impl DraftScreen {
         );
 
         // advice: the two best picks and the best ban
-        let (ally_open, enemy_open) = (advisor::open_lanes(meta, &ally), advisor::open_lanes(meta, &enemy));
-        let (their_left, our_left) = (5usize.saturating_sub(enemy.len()), 5usize.saturating_sub(ally.len()));
+        let ally_open = advisor::open_lanes(meta, &ally);
+        let their_left = 5usize.saturating_sub(enemy.len());
+        let (us, them) = (advisor::Team { picks: &ally, players }, advisor::Team { picks: &enemy, players: enemy_players });
+        let blue = turn.side_known.then_some(side == 0);
+        // our bans, valued by what they take from the enemy's draft
+        let board = advisor::ban_board(meta, us, them, advisor::Mastery::FULL, &damage, &open, blue);
+        let deny: HashMap<u16, f32> = board.iter().map(|b| (b.champ, b.deny)).collect();
         let mut pick_values: Vec<PickValue> = pickable
             .iter()
-            .map(|c| advisor::with_exposure(meta, advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open), their_left, &open))
+            .map(|c| {
+                let mut v = advisor::with_exposure(meta, advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open), their_left, &open);
+                // taking it also keeps it from them
+                v.total += CONTEST * deny.get(c).copied().unwrap_or(0.0);
+                v
+            })
             .collect();
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        let mut ban_values: Vec<PickValue> = open
-            .iter()
-            .map(|c| advisor::with_exposure(meta, advisor::ban_value_in(meta, *c, &ally, &enemy, enemy_players, &damage, &enemy_open), our_left, &open))
-            .collect();
-        ban_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+        // the enemy's turn to ban: what they would most want to take from us
+        let their_turn = turn.acting.is_some_and(|a| a != side);
+        let their_bans = if turn.banning && their_turn {
+            advisor::ban_board(meta, them, us, advisor::Mastery::FULL, &damage, &open, blue.map(|b| !b))
+        } else {
+            Vec::new()
+        };
         // the swap phase: the best seating instead of picks and bans
         let seating = if turn.swapping { self.seating(ui, snapshot, &ally, side, players) } else { None };
         ui.set_visible(&format!("{OVERLAY}.advice.seating"), seating.is_some());
-        let rows: [(&str, Option<&PickValue>); ADVICE_ROWS] = if seating.is_some() {
-            [("", None), ("", None), ("", None)]
+        enum Row<'a> {
+            Pick(&'a PickValue),
+            Ban(&'a advisor::BanValue),
+        }
+        let rows: Vec<(&str, Option<Row>)> = if seating.is_some() {
+            vec![("", None), ("", None), ("", None)]
+        } else if turn.banning && their_turn {
+            vec![("敌禁?", their_bans.first().map(Row::Ban)), ("敌禁?", their_bans.get(1).map(Row::Ban)), ("敌禁?", their_bans.get(2).map(Row::Ban))]
+        } else if turn.banning {
+            vec![("禁 1", board.first().map(Row::Ban)), ("禁 2", board.get(1).map(Row::Ban)), ("禁 3", board.get(2).map(Row::Ban))]
         } else {
-            [("Pick 选", pick_values.first()), ("Alt 备", pick_values.get(1)), ("Ban 禁", ban_values.first())]
+            vec![("Pick 选", pick_values.first().map(Row::Pick)), ("Alt 备", pick_values.get(1).map(Row::Pick)), ("Ban 禁", board.first().map(Row::Ban))]
         };
 
-        for (r, (what, v)) in rows.iter().enumerate() {
+        for (r, (what, v)) in rows.iter().enumerate().take(ADVICE_ROWS) {
             let row = |part: &str| format!("{OVERLAY}.advice.{part}{r}");
             ui.set_text(&row("k"), what);
-            match v {
-                Some(v) => {
-                    ui.set_text(&row("c"), &name_ref(meta.names.name(v.champ)));
-                    let pts = points(v.total);
+            let shown = match v {
+                Some(Row::Pick(v)) => Some((v.champ, v.total, why(v))),
+                Some(Row::Ban(b)) => Some((b.champ, b.total, why_ban(b))),
+                None => None,
+            };
+            match shown {
+                Some((champ, total, reason)) => {
+                    ui.set_text(&row("c"), &name_ref(meta.names.name(champ)));
+                    let pts = points(total);
                     ui.set_text(&row("v"), &signed(pts));
                     ui.set_properties(&row("v"), &format!("color: {};", color(if pts >= 0.0 { GOOD } else { BAD })));
-                    ui.set_text(&row("w"), &why(v));
+                    ui.set_text(&row("w"), &reason);
                 }
                 None => {
                     for part in ["c", "v", "w"] {
@@ -528,7 +611,13 @@ impl DraftScreen {
 
         // grid values
         if view.grid_values {
-            let by_champ: HashMap<u16, f32> = pick_values.iter().map(|v| (v.champ, v.total)).collect();
+            // our ban turn: what banning each card is worth; else what picking it is
+            let banning = turn.banning && !their_turn;
+            let by_champ: HashMap<u16, f32> = if banning {
+                board.iter().map(|b| (b.champ, b.total)).collect()
+            } else {
+                pick_values.iter().map(|v| (v.champ, v.total)).collect()
+            };
             for c in cards.iter().filter(|c| c.champ.is_some()) {
                 let tag = format!("{}.{TAG}", c.path);
                 if !ui.exists(&tag) {
@@ -546,7 +635,9 @@ impl DraftScreen {
                 }
                 if let Some(v) = value {
                     let pts = points(v);
-                    let (arrow, c) = if pts >= 1.0 {
+                    let (arrow, c) = if banning {
+                        ("禁", if pts >= 1.0 { BAD } else { DIM })
+                    } else if pts >= 1.0 {
                         ("▲", GOOD)
                     } else if pts <= -1.0 {
                         ("▼", BAD)

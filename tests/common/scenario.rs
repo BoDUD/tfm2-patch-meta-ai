@@ -418,7 +418,8 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         let (_, banned_alpha) = with_lineups(hv.score_ban, 0, &strangers, &alpha_player);
         assert!(banned_alpha > alpha_ban, "alpha against his player {banned_alpha} vs {alpha_ban}");
         let (_, own_player) = with_lineups(hv.score_ban, 0, &alpha_player, &strangers);
-        assert_eq!(own_player, alpha_ban, "a ban does not look at the banning team's own players");
+        // the banning team's own player on it: a worse ban (they would rather pick it)
+        assert!(own_player <= alpha_ban, "own player {own_player} vs {alpha_ban}");
 
         // game 0.6.4: once an AI team has picked, the host asks the hooks for its lane assignment
         // (phase Position) and the last one that decides wins; this mod never decides, so the

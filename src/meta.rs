@@ -11,19 +11,26 @@
 //! - **pairs**: synergy between allies and the matchup between opponents;
 //! - **side**: the blue-side advantage;
 //! - **team strategy**: each strategy choice (early jungle, minion wave, closing out...), and how
-//!   much better or worse it works with each champion on the team (strongly shrunk).
+//!   much better or worse it works with each champion on the team (strongly shrunk);
+//! - **composition**: what a team loses for each gap in its line-up - no frontline, no engage,
+//!   one damage type, little crowd control, little damage, carries nobody protects - from the
+//!   League champions' built-in profiles (`knowledge`). A handful of parameters every game
+//!   speaks to, so they settle long before the pairs do.
 //!
 //! Besides the fit, the average gold lead at the end of the lane phase of every pair of direct
 //! lane opponents is counted.
 //!
-//! Every parameter has a Gaussian prior around 0, so anything seen in few games stays close to
-//! "average". A champion's displayed win rate is `sigmoid(strength)`: how often a team with it
+//! Every parameter has a Gaussian prior, around 0 or - for the League champions, times
+//! `lol_prior` - around what League says (`knowledge`: the champion's competitive tier, the
+//! known combos and counters, what each composition gap costs), so anything seen in few games
+//! stays close to that. A champion's displayed win rate is `sigmoid(strength)`: how often a team with it
 //! and four average champions (and average players) beats an average team.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::glm::{self, logit, sigmoid, Problem, Row};
 use crate::history::{Game, Names, Role};
+use crate::knowledge::{self, Profile, Sums, COMP_FEATURES};
 use crate::patchnotes::PatchNote;
 use crate::records::compare_versions;
 
@@ -50,6 +57,10 @@ pub struct Settings {
     pub side_sd: f32,
     pub tactic_sd: f32,
     pub tactic_champ_sd: f32,
+    /// How much of League's knowledge the priors start from (0 = none, 1 = as built in).
+    pub lol_prior: f32,
+    /// Prior spread of what a composition gap costs.
+    pub comp_sd: f32,
 }
 
 impl Default for Settings {
@@ -69,6 +80,8 @@ impl Default for Settings {
             side_sd: 0.3,
             tactic_sd: 0.15,
             tactic_champ_sd: 0.08,
+            lol_prior: 1.0,
+            comp_sd: 0.08,
         }
     }
 }
@@ -88,6 +101,8 @@ pub enum Key {
     Tactic(u16),
     /// A strategy choice with a champion on the team.
     TacticChamp(u16, u16),
+    /// A composition gap (`knowledge::COMP_FEATURES`).
+    Comp(u8),
 }
 
 /// Ordered pair key and the sign for "a with/against b".
@@ -210,6 +225,14 @@ pub struct Meta {
     pub solo_matches: u32,
     /// The average champion's presence this patch (picks + bans per match), for ban weights.
     pub typical_presence: f32,
+    /// League profile of each champion id (`None`: not a League champion).
+    pub profiles: Vec<Option<Profile>>,
+    /// League lanes of each champion id as prior shares (`None`: not a League champion).
+    pub lane_priors: Vec<Option<[f32; 5]>>,
+    /// What an open slot is expected to bring (the average League profile).
+    pub open_slot: Option<Profile>,
+    /// What each composition gap costs a team (log-odds per full gap).
+    pub comp: [Effect; COMP_FEATURES],
     /// Fitted parameters, for a warm start next time.
     pub keys: Vec<Key>,
     pub beta: Vec<f32>,
@@ -268,6 +291,32 @@ impl Meta {
         self.mastery.get(&(athlete, champ)).copied().unwrap_or_default()
     }
 
+    pub fn profile(&self, champ: u16) -> Option<&Profile> {
+        self.profiles.get(champ as usize).and_then(Option::as_ref)
+    }
+
+    /// A team's traits, its open slots (out of five) counted as average champions. `None` when
+    /// no profiles are known.
+    pub fn team_sums(&self, picks: &[u16]) -> Option<Sums> {
+        let avg = self.open_slot.as_ref()?;
+        let mut s = Sums::default();
+        for c in picks.iter().take(5) {
+            s.add(self.profile(*c).unwrap_or(avg), 1.0);
+        }
+        s.add(avg, 5.0 - s.n);
+        Some(s)
+    }
+
+    /// What a team's composition is worth (log-odds, 0 = no gaps), and each gap's share.
+    pub fn comp_score(&self, picks: &[u16]) -> (f32, [f32; COMP_FEATURES]) {
+        let mut parts = [0.0; COMP_FEATURES];
+        let Some(s) = self.team_sums(picks) else { return (0.0, parts) };
+        for (i, f) in s.features().iter().enumerate() {
+            parts[i] = f * self.comp[i].value;
+        }
+        (parts.iter().sum(), parts)
+    }
+
     /// The lane an athlete played most in the kept competition matches.
     pub fn usual_lane(&self, athlete: u32) -> Option<Role> {
         let games = self.athlete_lanes.get(&athlete)?;
@@ -318,8 +367,26 @@ pub fn kept_versions(games: &[Game], current: &str, max: usize) -> Vec<String> {
 }
 
 /// One game as model terms: (key, coefficient) from blue's point of view.
-fn game_terms(game: &Game, version: u16, out: &mut Vec<(Key, f32)>) {
+/// The composition gaps of one side of a game (an unknown champion counts as average).
+fn side_features(slots: &[crate::history::Slot], profiles: &[Option<Profile>], avg: &Profile) -> [f32; COMP_FEATURES] {
+    let mut s = Sums::default();
+    for slot in slots.iter().take(5) {
+        s.add(profiles.get(slot.champ as usize).and_then(Option::as_ref).unwrap_or(avg), 1.0);
+    }
+    s.add(avg, 5.0 - s.n);
+    s.features()
+}
+
+fn game_terms(game: &Game, version: u16, comp: Option<(&[Option<Profile>], &Profile)>, out: &mut Vec<(Key, f32)>) {
     out.push((Key::Side, 1.0));
+    if let Some((profiles, avg)) = comp {
+        let (b, r) = (side_features(&game.sides[0], profiles, avg), side_features(&game.sides[1], profiles, avg));
+        for f in 0..COMP_FEATURES {
+            if b[f] != r[f] {
+                out.push((Key::Comp(f as u8), b[f] - r[f]));
+            }
+        }
+    }
     for (side, sign) in [(0usize, 1.0f32), (1, -1.0)] {
         let slots = &game.sides[side];
         for (i, s) in slots.iter().enumerate() {
@@ -366,6 +433,12 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         names.id(c);
     }
     let champ_count = names.len() as u16;
+    let k = knowledge::get();
+    let profiles: Vec<Option<Profile>> = (0..champ_count).map(|c| k.profiles.get(names.name(c)).cloned()).collect();
+    let lane_priors: Vec<Option<[f32; 5]>> =
+        (0..champ_count).map(|c| k.positions.get(names.name(c)).map(|r| knowledge::lane_prior(r))).collect();
+    let open_slot = profiles.iter().any(Option::is_some).then(|| knowledge::average(profiles.iter().flatten()));
+    let comp_inputs = open_slot.as_ref().map(|avg| (profiles.as_slice(), avg));
 
     let mut reg = Registry { keys: Vec::new(), index: HashMap::new() };
     // the previous fit's numbering first, so the warm start lines up
@@ -380,6 +453,32 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     for c in 0..champ_count {
         for v in 0..versions.len() as u16 {
             reg.id(Key::Champ(c, v));
+        }
+    }
+    if comp_inputs.is_some() {
+        for f in 0..COMP_FEATURES {
+            reg.id(Key::Comp(f as u8));
+        }
+    }
+    // League's known combos and counters: prior means, there whether or not a game had them
+    let mut pair_means: HashMap<Key, f32> = HashMap::new();
+    if set.lol_prior != 0.0 {
+        for (a, b, n) in &k.synergy {
+            if let (Some(x), Some(y)) = (names.get(a), names.get(b)) {
+                let ((x, y), _) = pair(x, y);
+                pair_means.insert(Key::Synergy(x, y), knowledge::pair_prior(*n) * set.lol_prior);
+            }
+        }
+        for (a, b, n) in &k.counters {
+            if let (Some(x), Some(y)) = (names.get(a), names.get(b)) {
+                let ((x, y), sign) = pair(x, y);
+                pair_means.insert(Key::Counter(x, y), sign * knowledge::pair_prior(*n) * set.lol_prior);
+            }
+        }
+        let mut keys: Vec<Key> = pair_means.keys().copied().collect();
+        keys.sort();
+        for key in keys {
+            reg.id(key);
         }
     }
 
@@ -399,7 +498,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             continue;
         }
         terms.clear();
-        game_terms(game, vi, &mut terms);
+        game_terms(game, vi, comp_inputs, &mut terms);
         let row_terms: Vec<(u32, f32)> = terms.iter().map(|(k, a)| (reg.id(*k), *a)).collect();
         rows.push(Row {
             y: if game.blue_win { 1.0 } else { 0.0 },
@@ -481,7 +580,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let mut last_change: HashMap<u16, (String, i32)> = HashMap::new();
     for c in 0..champ_count {
         let name = names.name(c).to_string();
-        problem.prior(reg.id(Key::Champ(c, 0)), 0.0, set.first_sd);
+        let tier = profiles[c as usize].as_ref().map_or(0.0, |p| knowledge::tier_prior(p.tier));
+        problem.prior(reg.id(Key::Champ(c, 0)), tier * set.lol_prior, set.first_sd);
         for v in 1..versions.len() as u16 {
             let note = inp.notes.iter().rev().find(|n| n.is_for(&versions[v as usize]));
             let dir = note.map_or(0, |n| n.direction(&name));
@@ -501,8 +601,12 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         }
     }
     for (i, key) in reg.keys.iter().enumerate() {
+        if let Key::Comp(f) = key {
+            problem.prior(i as u32, knowledge::COMP_PRIOR[*f as usize] * set.lol_prior, set.comp_sd);
+            continue;
+        }
         let sd = match key {
-            Key::Side | Key::Champ(..) => continue,
+            Key::Side | Key::Champ(..) | Key::Comp(_) => continue,
             Key::Role(..) => set.role_sd,
             Key::Athlete(_) => set.athlete_sd,
             Key::Mastery(..) => set.mastery_sd,
@@ -510,7 +614,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::Tactic(_) => set.tactic_sd,
             Key::TacticChamp(..) => set.tactic_champ_sd,
         };
-        problem.prior(i as u32, 0.0, sd);
+        problem.prior(i as u32, pair_means.get(key).copied().unwrap_or(0.0), sd);
     }
     // keys of a previous fit that no game uses any more still get a prior (they stay at 0)
     problem.params = reg.keys.len();
@@ -610,10 +714,16 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::TacticChamp(t, c) => {
                 out.tactic_champ.insert((t, c), effect(*key));
             }
+            Key::Comp(f) => {
+                out.comp[f as usize] = effect(*key);
+            }
             _ => {}
         }
     }
     out.lane_gold = lane_gold;
+    out.profiles = profiles;
+    out.lane_priors = lane_priors;
+    out.open_slot = open_slot;
     out.athlete_lanes = athlete_lanes;
     out.names = names;
     out.keys = reg.keys;
@@ -658,7 +768,7 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
         terms.clear();
         // a patch the training games never saw is rated as the newest one they did
         let vi = version_index.get(game.version.as_str()).copied().unwrap_or(newest);
-        game_terms(game, vi, &mut terms);
+        game_terms(game, vi, fitted.open_slot.as_ref().map(|a| (fitted.profiles.as_slice(), a)), &mut terms);
         let row: Vec<(u32, f32)> =
             terms.iter().filter_map(|(k, a)| index.get(k).map(|i| (*i, *a))).collect();
         let p = glm::predict(&row, &fitted.beta);

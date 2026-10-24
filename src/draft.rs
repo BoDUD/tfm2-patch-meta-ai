@@ -3,7 +3,9 @@
 //!
 //! - **pick**: its strength in the best lane still open, its synergy with the picks already on
 //!   the team, its matchups against the enemy's picks, and a cost for one-sided damage;
-//! - **ban**: what it would be worth to the enemy, weighted by how often it is played or banned;
+//! - **ban**: how much worse the enemy's draft gets without it (`advisor::ban_board`: their
+//!   best option in each lane they still have to fill, with and without it - an equally good
+//!   substitute makes a ban worth little), less what it would take from our own options;
 //! - **players** (game 0.6.4+, ABI level 10, which hands both line-ups over - athlete ids in
 //!   lane-slot order): a pick also counts the mastery of the team's player in the lane the
 //!   champion would play, a ban that of the enemy's player there (the whole line-up's average
@@ -35,6 +37,7 @@
 //! was added to the game's score.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -192,6 +195,43 @@ pub struct Draft<'a> {
     pub lineups: &'a Lineups,
 }
 
+/// A ban's value is what it takes from the enemy's best option - a difference between options,
+/// smaller than a pick's own value: this brings it to the same scale before `edge_scale`.
+pub const BAN_SCALE: f32 = 2.0;
+
+thread_local! {
+    /// The ban board of the decision in progress: the game asks about every candidate of one
+    /// decision in a row, with the same draft.
+    static BOARD: RefCell<Option<(u64, Board)>> = const { RefCell::new(None) };
+}
+
+/// A ban board by champion.
+type Board = Arc<HashMap<u16, advisor::BanValue>>;
+
+/// The deciding team's ban board for this draft (worked out once per decision).
+fn board(snapshot: &Snapshot, draft: &Draft<'_>, mastery: advisor::Mastery) -> Board {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (snapshot as *const Snapshot as usize, draft.ally, draft.enemy, draft.offer, &draft.lineups.ally, &draft.lineups.enemy).hash(&mut h);
+    mastery.weight.to_bits().hash(&mut h);
+    let key = h.finish();
+    BOARD.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((k, board)) = cache.as_ref() {
+            if *k == key {
+                return board.clone();
+            }
+        }
+        let damage = |c: u16| snapshot.damage_of(c);
+        let us = advisor::Team { picks: draft.ally, players: &draft.lineups.ally };
+        let them = advisor::Team { picks: draft.enemy, players: &draft.lineups.enemy };
+        // the AI's side is not handed over: who picks first is known only from the pick counts
+        let list = advisor::ban_board(&snapshot.meta, us, them, mastery, &damage, draft.offer, None);
+        let board = Arc::new(list.into_iter().map(|b| (b.champ, b)).collect::<HashMap<_, _>>());
+        *cache = Some((key, board.clone()));
+        board
+    })
+}
+
 /// A fielded player's mastery counts up to this much (log-odds, about 12 win-rate points)
 /// before `player_mastery` weighs it: at the default 0.5 the players' part of a value stays
 /// within +-0.25 (about 6 points), whatever the model makes of a few lopsided games.
@@ -206,6 +246,10 @@ pub fn value_with(snapshot: &Snapshot, cand: u16, draft: &Draft<'_>, ban: bool, 
     let (ally, enemy) = (draft.ally, draft.enemy);
     let mastery = advisor::Mastery { weight: player_weight, cap: PLAYER_CAP };
     if ban {
+        if let Some(b) = board(snapshot, draft, mastery).get(&cand) {
+            return PickValue { total: b.total * BAN_SCALE, ..b.threat.clone() };
+        }
+        // not on offer (the game asked anyway): as the enemy's pick, weighted by presence
         let open = open_lanes(snapshot, enemy);
         let v = advisor::ban_value_weighted(meta, cand, ally, enemy, &draft.lineups.enemy, mastery, &damage, &open);
         advisor::with_exposure(meta, v, 5usize.saturating_sub(ally.len()), draft.offer)
@@ -544,7 +588,8 @@ mod tests {
         let b = with(&theirs, true, 0.5);
         assert_eq!(b.player, Some(501));
         assert!(b.total > plain(true), "{b:?} vs {}", plain(true));
-        assert_eq!(with(&ours, true, 0.5).total, plain(true), "our own player does not make it a ban");
+        // ... and our own player on it makes it a worse one: we would rather take it ourselves
+        assert!(with(&ours, true, 0.5).total <= plain(true), "our own player does not make it a ban");
 
         // a line-up whose lanes are not known: the line-up as a whole
         let three = Lineups { ally: vec![(501, None), (902, None), (903, None)], enemy: Vec::new() };
