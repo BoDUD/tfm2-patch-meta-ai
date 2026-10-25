@@ -336,6 +336,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
             crate::ui::forget_save();
             diag::reset_once();
             diag::log(&format!("save open: team #{} {:?}", identity.0, identity.1));
+            shared::set_player_team(Some(identity.0));
             // this save's matches from earlier sessions, if any (checked against the save later)
             let file = cache_on().then(|| crate::cache::path(identity.0, &identity.1));
             if let Some(Ok(text)) = file.map(std::fs::read_to_string) {
@@ -623,6 +624,8 @@ struct Teams {
     rosters: HashMap<String, Vec<(u32, Option<crate::history::Role>)>>,
     labels: HashMap<String, String>,
     picks: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Matches the `picks` lists count, per team.
+    matches: HashMap<String, u32>,
     last_opponent: Option<String>,
 }
 
@@ -678,6 +681,7 @@ fn teams(st: &mut State, game: &mut impl Game, own: usize) -> Teams {
             out.rosters.insert(key.clone(), players);
         }
         out.picks.insert(key.clone(), picks);
+        out.matches.insert(key.clone(), list.len().min(RECENT_PER_TEAM) as u32);
         out.labels.insert(key, label);
     }
     for a in wanted_athletes {
@@ -859,6 +863,7 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         rosters: teams.rosters,
         team_labels: teams.labels,
         team_picks: teams.picks,
+        team_matches: teams.matches,
         athletes: st.labels.athletes.clone(),
         last_opponent: teams.last_opponent,
         backtest: st.backtest,

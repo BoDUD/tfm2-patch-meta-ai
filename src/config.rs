@@ -49,6 +49,9 @@ impl Switch {
 pub struct Config {
     // [features]
     pub ban_pick: Switch,
+    /// The player's own team's draft when the game's coach drafts for it (coach delegation)
+    /// follows the model, even with `ban_pick` off.
+    pub coach: bool,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -63,6 +66,8 @@ pub struct Config {
     pub solo_weight: f32,
     /// How much of League's built-in knowledge the priors start from (0 = none, 1 = as built in).
     pub lol_prior: f32,
+    /// ... or chosen by the save's own matches (`auto`, the default).
+    pub lol_prior_auto: bool,
     /// Champion ids reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
     /// Prior spreads (log-odds) of the lane, player, mastery and pair effects: how far the data
@@ -110,6 +115,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ban_pick: Switch::Auto,
+            coach: true,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -117,6 +123,7 @@ impl Default for Config {
             patch_shift: 0.02,
             solo_weight: 0.5,
             lol_prior: 1.0,
+            lol_prior_auto: true,
             reworked: Vec::new(),
             roles: 0.3,
             players: 0.35,
@@ -162,6 +169,7 @@ impl Config {
             pair_sd: self.pairs,
             solo_weight: self.solo_weight,
             lol_prior: self.lol_prior,
+            lol_prior_auto: self.lol_prior_auto,
             ..crate::meta::Settings::default()
         }
     }
@@ -225,6 +233,7 @@ fn number(v: &str) -> Result<f32, String> {
 fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
         "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
+        "coach" => cfg.coach = flag(value)?,
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
@@ -238,7 +247,11 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "change" => cfg.change = number(value)?,
         "patch_shift" => cfg.patch_shift = number(value)?,
         "solo_weight" => cfg.solo_weight = number(value)?,
-        "lol_prior" => cfg.lol_prior = number(value)?,
+        "lol_prior" if value.trim().eq_ignore_ascii_case("auto") => cfg.lol_prior_auto = true,
+        "lol_prior" => {
+            cfg.lol_prior = number(value)?;
+            cfg.lol_prior_auto = false;
+        }
         "roles" => cfg.roles = number(value)?,
         "players" => cfg.players = number(value)?,
         "mastery" => cfg.mastery = number(value)?,
@@ -421,17 +434,18 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+        "ban_pick={} coach={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
+        if c.coach { "on" } else { "off" },
         c.tier_list.as_str(),
         c.patches,
         c.drift,
         c.change,
         c.patch_shift,
         c.solo_weight,
-        c.lol_prior,
+        if c.lol_prior_auto { "auto".to_string() } else { c.lol_prior.to_string() },
         c.reworked.join(","),
         c.roles,
         c.players,
@@ -473,6 +487,12 @@ pub const TEMPLATE: &str = r#"; ================================================
 ; auto = 默认开启；若已启用其他做同样事情的 Mod（Drafter's Toolbox 写梯队、Terminator Draft AI
 ;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关
 ban_pick=auto
+; coach : when you let the game's coach draft for you (coach delegation), your team bans and
+;         picks the way the advice says (at twice the AI's strength), even with ban_pick=off.
+;         Other teams are not touched by this switch.
+; coach : 选人时交给游戏的教练托管时，你自己的队伍按本 Mod 的建议禁用和选人（力度是 AI 的两倍），
+;         即使 ban_pick=off 也生效；不影响其他队伍。
+coach=on
 tier_list=auto
 
 [model]
@@ -501,11 +521,12 @@ solo_weight=0.5
 ; League champions start from what League says (built in): their competitive tier, known combos
 ; and counters, and what a composition without frontline / engage / both damage types / crowd
 ; control / damage / protection for its carries loses. The save's matches move all of it.
-; 0 = start every champion at "average", 1 = as built in, up to 3.
+; auto = choose 0 / 0.5 / 1 / 2 by which predicts the save's newest matches best (once there are
+; enough matches; 1 until then); 0 = start every champion at "average", 1 = as built in, up to 3.
 ; 英雄联盟英雄从英雄联盟的经验出发（内置）：职业赛场梯队、知名的配合和克制、阵容缺前排 / 开团 /
 ; 双伤害类型 / 控制 / 输出 / 保护C位时的损失。存档里的比赛会修正这些。0 = 一律从"平均"出发，
-; 1 = 按内置，最大 3。
-lol_prior=1
+; 1 = 按内置，最大 3。auto = 用存档里最新的比赛检验 0 / 0.5 / 1 / 2 哪个最准，自动选（比赛够多之前按 1）。
+lol_prior=auto
 ; champion ids reworked this patch (history barely counts), comma separated
 ; 本版本重做的英雄 id（历史数据几乎不计），逗号分隔，例如 reworked=fighter, demon
 reworked=

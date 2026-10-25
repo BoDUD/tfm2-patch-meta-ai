@@ -25,7 +25,7 @@ use crate::shared::Snapshot;
 
 pub const HOTKEY: &str = "F8";
 const NODE: &str = "pma_panel";
-const PAGES: usize = 4;
+const PAGES: usize = 5;
 const ROWS: usize = 24;
 const HEAL_EVERY: u64 = 20;
 
@@ -194,7 +194,76 @@ pub fn build(index: usize, snapshot: &Snapshot, context: &Context, opponent: Opt
         0 => tier_page(&snapshot.meta),
         1 => scouting_page(snapshot, context, opponent),
         2 => players_page(&snapshot.meta, context),
-        _ => model_page(&snapshot.meta, context),
+        3 => model_page(&snapshot.meta, context),
+        _ => review_page(super::draft_screen::last_review()),
+    }
+}
+
+/// The last ban/pick screen, pick by pick: who acted, what it was worth to us then, what was
+/// advised then, and our win chance after each pick.
+fn review_page(review: Option<super::draft_screen::Review>) -> Page {
+    let columns = vec![
+        ("#", 0, 40, false),
+        ("Side 方", 50, 90, false),
+        ("Action 动作", 150, 110, false),
+        ("Champion 英雄", 270, 220, false),
+        ("Value 价值", 500, 110, true),
+        ("Advised 当时建议", 640, 220, false),
+        ("Its value 建议价值", 870, 140, true),
+        ("Win after 之后胜率", 1040, 160, true),
+    ];
+    let Some(review) = review else {
+        return Page {
+            title: "BP review 复盘".into(),
+            columns: vec![],
+            rows: vec![],
+            note: "No draft seen yet in this game session: play a ban/pick screen. 本次启动还没有看到过选人：打完一次 BP 后再看。".into(),
+        };
+    };
+    let mut rows = Vec::new();
+    let (mut ours, mut followed) = (0, 0);
+    for (i, r) in review.rows.iter().enumerate() {
+        let (side, tone_of) = match r.ours {
+            Some(true) => ("我方 us", ACCENT),
+            Some(false) => ("对方 them", BAD),
+            None => ("?", DIM),
+        };
+        let as_advised = r.advised.as_ref().is_some_and(|(c, _)| *c == r.champ);
+        if r.ours == Some(true) {
+            ours += 1;
+            followed += as_advised as u32;
+        }
+        let mut row: Vec<Cell> = vec![
+            ((i + 1).to_string(), DIM),
+            (side.into(), tone_of),
+            ((if r.ban { "禁 ban" } else { "选 pick" }).into(), TEXT),
+            (name_ref(&r.champ), TEXT),
+            (r.value.map_or(String::new(), |v| signed(pts(v))), r.value.map_or(DIM, |v| tone(pts(v)))),
+        ];
+        match &r.advised {
+            Some((c, v)) if !as_advised => {
+                row.push((name_ref(c), DIM));
+                row.push((signed(pts(*v)), DIM));
+            }
+            Some(_) => {
+                row.push(("= 照建议 as advised".into(), GOOD));
+                row.push((String::new(), DIM));
+            }
+            None => {
+                row.push((String::new(), DIM));
+                row.push((String::new(), DIM));
+            }
+        }
+        row.push((r.win_after.map_or(String::new(), |w| format!("{:.0}%", w * 100.0)), TEXT));
+        rows.push(row);
+    }
+    Page {
+        title: format!("BP review 复盘 · {} vs {}", review.team.trim(), review.enemy.trim()),
+        columns,
+        rows,
+        note: format!(
+            "Ours {ours}, as advised {followed}. Value = win-rate points to us when it was made (a ban: what it took from their draft).              我方 {ours} 手，照建议 {followed} 手。价值 = 当时对我方的胜率点（禁用 = 对方阵容因此损失多少）。"
+        ),
     }
 }
 
@@ -379,7 +448,27 @@ fn model_page(meta: &Meta, context: &Context) -> Page {
             (format!("{} this patch, {} kept, {} solo rank", meta.current_matches, meta.matches, meta.solo_matches), TEXT),
         ],
         vec![("Blue side 蓝方".into(), DIM), (format!("{} win-rate points", signed(pts(meta.side))), TEXT)],
+        vec![
+            ("League 英雄联盟经验".into(), DIM),
+            (
+                format!(
+                    "weight {} {}",
+                    meta.lol_prior,
+                    if meta.lol_prior_chosen { "(auto: predicts the newest matches best / 自动：对最新比赛最准)" } else { "" }
+                ),
+                TEXT,
+            ),
+        ],
     ];
+    let gaps: Vec<String> = meta
+        .comp
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("{} {}", crate::knowledge::COMP_NAMES_ZH[i], signed(pts(e.value))))
+        .collect();
+    if meta.open_slot.is_some() {
+        rows.push(vec![("Composition 阵容缺口".into(), DIM), (gaps.join(" · "), TEXT)]);
+    }
     match &context.backtest {
         Some(bt) => {
             rows.push(vec![
@@ -449,7 +538,7 @@ mod tests {
         for frame in 2..PAGES as u64 + 1 {
             press(&mut ui, &mut panel, frame * 10);
         }
-        assert!(ui.spawned.last().unwrap().1.contains("Model"));
+        assert!(ui.spawned.last().unwrap().1.contains("BP review"), "the review is the last page");
         // rebuilt by the game: back after a moment
         ui.remove("main.pma_panel");
         let k = ui.keys.clone();

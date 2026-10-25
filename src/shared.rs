@@ -3,6 +3,7 @@
 //! the management server, the opponent in your own matches) and only reads it.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::advisor::Damage;
@@ -40,4 +41,15 @@ pub fn clear() {
 
 pub fn get() -> Option<Arc<Snapshot>> {
     SNAPSHOT.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// The player's team id in the open save (`usize::MAX`: none), for the coach delegation.
+static PLAYER_TEAM: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn set_player_team(team: Option<usize>) {
+    PLAYER_TEAM.store(team.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+pub fn player_team() -> Option<usize> {
+    Some(PLAYER_TEAM.load(Ordering::Relaxed)).filter(|t| *t != usize::MAX)
 }

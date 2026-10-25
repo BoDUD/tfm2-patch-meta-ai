@@ -25,7 +25,14 @@
 //! best option in those lanes loses - nothing when an equally good substitute is left, a lot for
 //! the one champion nothing else replaces, and more for a flex pick that threatens several lanes.
 //! What the same ban takes from our own options is subtracted, more when we would get the
-//! champion first.
+//! champion first. A team's habits (the champions it played lately) make it likelier to take
+//! them, so they weigh more in its options.
+//!
+//! **Lookahead** ([`simulate`]): the rest of a standard 3+2 draft played out from an action -
+//! each side taking its best ban and pick in turn from the strongest champions on offer - and
+//! the line-ups it ends in rated, so an action is judged by the draft it leads to.
+
+use std::collections::HashMap;
 
 use crate::history::Role;
 use crate::meta::Meta;
@@ -238,6 +245,10 @@ pub struct PickValue {
     pub player: Option<u32>,
     /// What the other team's remaining picks could take from it by countering it.
     pub exposure: f32,
+    /// What taking it keeps from the other team (part of what banning it would).
+    pub contest: f32,
+    /// What spending it now costs the rest of a Fearless series.
+    pub conserve: f32,
     pub total: f32,
 }
 
@@ -332,6 +343,8 @@ pub fn pick_value_weighted(
         mastery,
         player,
         exposure: 0.0,
+        contest: 0.0,
+        conserve: 0.0,
         total: strength + synergy + counter - balance + comp + mastery,
     }
 }
@@ -461,12 +474,31 @@ pub fn ban_value_weighted(
     v
 }
 
-/// One side of a draft: its picks so far and its fielded players.
+/// One side of a draft: its picks so far, its fielded players and its habits.
 #[derive(Clone, Copy)]
 pub struct Team<'a> {
     pub picks: &'a [u16],
     pub players: &'a Roster,
+    /// Share of its recent matches it played each champion in (scouting); `None`: not known.
+    pub habits: Option<&'a HashMap<u16, f32>>,
 }
+
+impl<'a> Team<'a> {
+    pub fn new(picks: &'a [u16], players: &'a Roster) -> Self {
+        Team { picks, players, habits: None }
+    }
+
+    /// How much likelier the team is to take `champ` because it plays it a lot (log-odds).
+    pub fn habit(&self, champ: u16) -> f32 {
+        let share = self.habits.and_then(|h| h.get(&champ)).copied().unwrap_or(0.0);
+        HABIT_WEIGHT * (1.0 + HABIT_SCALE * share.clamp(0.0, 1.0)).ln()
+    }
+}
+
+/// A champion a team plays in every match is likelier by `HABIT_WEIGHT * ln(1 + HABIT_SCALE)`
+/// (log-odds; about 0.19 = 5 win-rate points of "it would take it").
+const HABIT_WEIGHT: f32 = 0.12;
+const HABIT_SCALE: f32 = 4.0;
 
 /// A ban candidate valued on the [`ban_board`] (log-odds).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -483,6 +515,8 @@ pub struct BanValue {
     pub lanes: u8,
     /// Nothing else on offer comes close to it there (the ban takes most of what it is worth).
     pub irreplaceable: bool,
+    /// How much likelier the enemy is to take it because they play it a lot (log-odds).
+    pub habit: f32,
     pub total: f32,
 }
 
@@ -586,10 +620,7 @@ pub fn ban_board(
     offer: &[u16],
     blue: Option<bool>,
 ) -> Vec<BanValue> {
-    let likely = |c: u16| {
-        let presence = meta.by_id(c).map_or(0.0, |c| c.presence());
-        PRESENCE_WEIGHT * crate::model::presence_factor(presence, meta.typical_presence).ln() / 2f32.ln()
-    };
+    let likely = |c: u16| presence_bonus(meta, c) + them.habit(c);
     let theirs = lane_options(meta, them, us.picks, mastery, damage, offer, &likely);
     let ours = lane_options(meta, us, them.picks, mastery, damage, offer, &|_| 0.0);
     // a champion we would get first costs us more to ban
@@ -606,11 +637,131 @@ pub fn ban_board(
             let threat = threat.unwrap_or_else(|| {
                 pick_value_weighted(meta, *c, them.picks, us.picks, them.players, mastery, damage, &open_lanes(meta, them.picks))
             });
-            BanValue { champ: *c, deny, own, threat, lanes, irreplaceable, total: deny - own_weight * own }
+            BanValue { champ: *c, deny, own, threat, lanes, irreplaceable, habit: them.habit(*c), total: deny - own_weight * own }
         })
         .collect();
     board.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
     board
+}
+
+/// How much likelier any team is to take a champion that is picked or banned a lot this patch
+/// (log-odds, at most `PRESENCE_WEIGHT` either way).
+fn presence_bonus(meta: &Meta, c: u16) -> f32 {
+    let presence = meta.by_id(c).map_or(0.0, |c| c.presence());
+    PRESENCE_WEIGHT * crate::model::presence_factor(presence, meta.typical_presence).ln() / 2f32.ln()
+}
+
+/// What `them` most likely picks next: their best option in each open lane (their habits
+/// counted), best first, each champion once.
+pub fn likely_picks(
+    meta: &Meta,
+    them: Team<'_>,
+    us: &[u16],
+    mastery: Mastery,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+    offer: &[u16],
+) -> Vec<PickValue> {
+    let likely = |c: u16| presence_bonus(meta, c) + them.habit(c);
+    let mut all: Vec<PickValue> = lane_options(meta, them, us, mastery, damage, offer, &likely).into_iter().flatten().collect();
+    all.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen = Vec::new();
+    all.retain(|v| {
+        let fresh = !seen.contains(&v.champ);
+        seen.push(v.champ);
+        fresh
+    });
+    all
+}
+
+// ------------------------------------------------------------------------------- lookahead
+
+/// One step of a draft: the blue side acts (else red), a ban (else a pick).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub blue: bool,
+    pub ban: bool,
+}
+
+const fn step(blue: bool, ban: bool) -> Step {
+    Step { blue, ban }
+}
+
+/// The standard 3+2 order: three bans each, picks B R R B B R, two bans each (red first), picks
+/// R B B R.
+pub const ORDER_3_2: [Step; 20] = [
+    step(true, true), step(false, true), step(true, true), step(false, true), step(true, true), step(false, true),
+    step(true, false), step(false, false), step(false, false), step(true, false), step(true, false), step(false, false),
+    step(false, true), step(true, true), step(false, true), step(true, true),
+    step(false, false), step(true, false), step(true, false), step(false, false),
+];
+
+/// Where a draft with `bans` bans in all and these picks stands in [`ORDER_3_2`]: the next
+/// step's index. `None` when the counts do not fit that order (another format) or it is over.
+pub fn order_position(bans: usize, blue_picks: usize, red_picks: usize) -> Option<usize> {
+    let (mut b, mut bp, mut rp) = (0, 0, 0);
+    for (i, s) in ORDER_3_2.iter().enumerate() {
+        if (b, bp, rp) == (bans, blue_picks, red_picks) {
+            return Some(i);
+        }
+        match (s.ban, s.blue) {
+            (true, _) => b += 1,
+            (false, true) => bp += 1,
+            (false, false) => rp += 1,
+        }
+    }
+    None
+}
+
+/// The champions the lookahead plays with: the `n` strongest on offer (strength in their best
+/// lane), which is where every sensible ban and pick comes from.
+pub fn lookahead_pool(meta: &Meta, offer: &[u16], n: usize) -> Vec<u16> {
+    let best = |c: u16| Role::ALL.iter().map(|r| strength_in(meta, c, *r)).fold(f32::NEG_INFINITY, f32::max);
+    let mut pool: Vec<(u16, f32)> = offer.iter().map(|c| (*c, best(*c))).collect();
+    pool.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pool.into_iter().take(n).map(|(c, _)| c).collect()
+}
+
+/// Plays out the rest of a 3+2 draft from step `at` of [`ORDER_3_2`], where `first` is the
+/// acting side's choice; afterwards each side bans the top of its ban board and picks its best
+/// pick from `pool`. Returns the blue side's win chance with the line-ups it ends in.
+pub fn simulate(
+    meta: &Meta,
+    blue: Team<'_>,
+    red: Team<'_>,
+    pool: &[u16],
+    at: usize,
+    first: u16,
+    damage: &dyn Fn(u16) -> Option<Damage>,
+) -> f32 {
+    let (mut bp, mut rp) = (blue.picks.to_vec(), red.picks.to_vec());
+    let mut offer: Vec<u16> = pool.iter().copied().filter(|c| *c != first).collect();
+    let none = Mastery { weight: 0.0, cap: 0.0 };
+    for (i, s) in ORDER_3_2.iter().enumerate().skip(at) {
+        let (own, other) = if s.blue { (&mut bp, &rp) } else { (&mut rp, &bp) };
+        let (own_team, other_team) = if s.blue { (blue, red) } else { (red, blue) };
+        let choice = if i == at {
+            Some(first)
+        } else if s.ban {
+            let us = Team { picks: own, ..own_team };
+            let them = Team { picks: other, ..other_team };
+            ban_board(meta, us, them, none, damage, &offer, Some(s.blue)).first().map(|b| b.champ)
+        } else if own.len() < 5 {
+            let open = open_lanes(meta, own);
+            offer
+                .iter()
+                .map(|c| (*c, pick_value_weighted(meta, *c, own, other, own_team.players, none, damage, &open).total + own_team.habit(*c)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(c, _)| c)
+        } else {
+            None
+        };
+        let Some(c) = choice else { continue };
+        offer.retain(|x| *x != c);
+        if !s.ban && own.len() < 5 {
+            own.push(c);
+        }
+    }
+    win_probability(meta, &bp, &rp)
 }
 
 #[cfg(test)]
@@ -766,8 +917,8 @@ mod tests {
         let m = meta();
         let none = |_: u16| None;
         let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
-        let us = Team { picks: &[], players: &[] };
-        let them = Team { picks: &[], players: &[] };
+        let us = Team::new(&[], &[]);
+        let them = Team::new(&[], &[]);
         let board = ban_board(&m, us, them, Mastery::FULL, &none, &offer, Some(false));
         assert_eq!(board.len(), offer.len());
         // c is the strong one in the simulation; l the weak one
@@ -780,8 +931,50 @@ mod tests {
         // nothing left to deny once they have picked five
         let five: Vec<u16> = (0..5).collect();
         let offer_rest: Vec<u16> = (5..NAMES.len() as u16).collect();
-        let late = ban_board(&m, us, Team { picks: &five, players: &[] }, Mastery::FULL, &none, &offer_rest, None);
+        let late = ban_board(&m, us, Team::new(&five, &[]), Mastery::FULL, &none, &offer_rest, None);
         assert!(late.iter().all(|b| b.deny == 0.0));
+    }
+
+    #[test]
+    fn the_3_2_order_and_its_lookahead() {
+        assert_eq!(order_position(0, 0, 0), Some(0));
+        assert_eq!(order_position(6, 0, 0), Some(6), "first pick");
+        assert_eq!(order_position(6, 3, 3), Some(12), "the second ban phase");
+        assert_eq!(order_position(10, 3, 3), Some(16));
+        assert_eq!(order_position(10, 5, 5), None, "over");
+        assert_eq!(order_position(4, 2, 0), None, "not this format");
+        assert_eq!(ORDER_3_2.iter().filter(|s| s.ban).count(), 10);
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
+        let pool = lookahead_pool(&m, &offer, 10);
+        assert_eq!(pool.len(), 10);
+        let (c, l) = (m.names.get("c").unwrap(), m.names.get("l").unwrap());
+        assert!(pool.contains(&c) && !pool.contains(&l), "the strongest are in the pool");
+        // blue's first pick: the strong champion leads to a better draft than the weak one
+        let blue = Team::new(&[], &[]);
+        let red = Team::new(&[], &[]);
+        let with_c = super::simulate(&m, blue, red, &pool, 6, c, &none);
+        let with_l = super::simulate(&m, blue, red, &[pool.clone(), vec![l]].concat(), 6, l, &none);
+        assert!(with_c > with_l, "{with_c} vs {with_l}");
+        assert!((0.0..=1.0).contains(&with_c));
+    }
+
+    #[test]
+    fn habits_make_a_champion_likelier() {
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
+        let e = m.names.get("e").unwrap();
+        let mut habits = HashMap::new();
+        habits.insert(e, 1.0);
+        let plain = Team::new(&[], &[]);
+        let fond = Team { habits: Some(&habits), ..plain };
+        assert!(fond.habit(e) > 0.15 && plain.habit(e) == 0.0);
+        let rank = |them: Team<'_>| likely_picks(&m, them, &[], Mastery::FULL, &none, &offer).iter().position(|v| v.champ == e).unwrap();
+        assert!(rank(fond) < rank(plain), "a team that always plays e is likelier to take it");
+        let board = ban_board(&m, plain, fond, Mastery::FULL, &none, &offer, None);
+        assert!(board.iter().find(|b| b.champ == e).unwrap().habit > 0.15);
     }
 
     #[test]

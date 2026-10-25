@@ -39,8 +39,8 @@ fn board_on_a_save() {
         let offer: Vec<u16> = (0..meta.names.len() as u16).filter(|c| !taken.contains(c) && meta.profile(*c).is_some()).collect();
         let board = advisor::ban_board(
             &meta,
-            Team { picks: ally, players: &[] },
-            Team { picks: enemy, players: &[] },
+            Team::new(ally, &[]),
+            Team::new(enemy, &[]),
             Mastery::FULL,
             &none,
             &offer,
@@ -61,4 +61,24 @@ fn board_on_a_save() {
     let red = [id("swain"), id("jax"), id("zeri")];
     show("phase 2, blue (ziggs sejuani caitlyn) bans vs red (swain jax zeri)", &blue, &red, true);
     show("phase 2, red bans", &red, &blue, false);
+
+    // the lookahead as the screen runs it: five candidates played out from blue's first ban
+    let offer: Vec<u16> = (0..meta.names.len() as u16).filter(|c| meta.profile(*c).is_some()).collect();
+    let started = std::time::Instant::now();
+    let pool = advisor::lookahead_pool(&meta, &offer, 28);
+    let board = advisor::ban_board(&meta, Team::new(&[], &[]), Team::new(&[], &[]), Mastery::FULL, &none, &offer, Some(true));
+    for b in board.iter().take(5) {
+        let w = advisor::simulate(&meta, Team::new(&[], &[]), Team::new(&[], &[]), &pool, 0, b.champ, &none);
+        eprintln!("  ban {:<14} -> blue {:.1}%", name(b.champ), w * 100.0);
+    }
+    eprintln!("lookahead, 5 candidates from the first ban: {:?}", started.elapsed());
+
+    // which weight of League's knowledge predicts the newest matches best
+    for w in [0.0, 0.5, 1.0, 2.0] {
+        let set = Settings { lol_prior: w, ..Settings::default() };
+        let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None };
+        if let Some(bt) = patch_meta_ai::meta::backtest(&inputs, &set, (games.len() / 10).clamp(50, 300)) {
+            eprintln!("lol_prior {w}: log-loss {:.4}, favourite won {:.1}% of {}", bt.log_loss / bt.games as f32, bt.accuracy * 100.0, bt.games);
+        }
+    }
 }

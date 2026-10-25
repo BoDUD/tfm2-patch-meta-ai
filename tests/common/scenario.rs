@@ -402,7 +402,8 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
             fielded.ally_athletes_len = ally.len();
             fielded.enemy_athletes_ptr = enemy.as_ptr();
             fielded.enemy_athletes_len = enemy.len();
-            fielded.ally_team = 7;
+            // an AI team (7 is the save's own team: its draft is the coach delegation's)
+            fielded.ally_team = 17;
             fielded.enemy_team = 8;
             let mut out = 0.0f32;
             let code = (f.unwrap())(hook.userdata, &fielded, c, 1.0, &mut out);
@@ -417,6 +418,13 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         assert!(fielded_alpha > alpha, "alpha with his player {fielded_alpha} vs {alpha}");
         let (_, banned_alpha) = with_lineups(hv.score_ban, 0, &strangers, &alpha_player);
         assert!(banned_alpha > alpha_ban, "alpha against his player {banned_alpha} vs {alpha_ban}");
+        // the save's own team (coach delegation, coach=on by default): the model counts twice
+        let mut own: DraftCtxV1 = std::ptr::read(&ctx);
+        own.ally_team = 7;
+        let mut doubled = 0.0f32;
+        (hv.score_pick.unwrap())(hook.userdata, &own, 0, 1.0, &mut doubled);
+        let (_, plain) = score(hv.score_pick, 0);
+        assert!((doubled - 2.0 * plain).abs() < 1e-4, "coach delegation {doubled} vs AI {plain}");
         let (_, own_player) = with_lineups(hv.score_ban, 0, &alpha_player, &strangers);
         // the banning team's own player on it: a worse ban (they would rather pick it)
         assert!(own_player <= alpha_ban, "own player {own_player} vs {alpha_ban}");
