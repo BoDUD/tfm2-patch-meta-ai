@@ -59,6 +59,8 @@ pub struct Settings {
     pub tactic_champ_sd: f32,
     /// How much of League's knowledge the priors start from (0 = none, 1 = as built in).
     pub lol_prior: f32,
+    /// Choose `lol_prior` by how well each candidate predicts held-out matches (`worker`).
+    pub lol_prior_auto: bool,
     /// Prior spread of what a composition gap costs.
     pub comp_sd: f32,
 }
@@ -81,6 +83,7 @@ impl Default for Settings {
             tactic_sd: 0.15,
             tactic_champ_sd: 0.08,
             lol_prior: 1.0,
+            lol_prior_auto: false,
             comp_sd: 0.08,
         }
     }
@@ -233,6 +236,10 @@ pub struct Meta {
     pub open_slot: Option<Profile>,
     /// What each composition gap costs a team (log-odds per full gap).
     pub comp: [Effect; COMP_FEATURES],
+    /// The weight of League's knowledge it was fitted with, and whether it was chosen by the
+    /// held-out matches.
+    pub lol_prior: f32,
+    pub lol_prior_chosen: bool,
     /// Fitted parameters, for a warm start next time.
     pub keys: Vec<Key>,
     pub beta: Vec<f32>,
@@ -722,6 +729,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     }
     out.lane_gold = lane_gold;
     out.profiles = profiles;
+    out.lol_prior = set.lol_prior;
     out.lane_priors = lane_priors;
     out.open_slot = open_slot;
     out.athlete_lanes = athlete_lanes;

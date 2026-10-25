@@ -336,6 +336,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
             crate::ui::forget_save();
             diag::reset_once();
             diag::log(&format!("save open: team #{} {:?}", identity.0, identity.1));
+            shared::set_player_team(Some(identity.0));
             // this save's matches from earlier sessions, if any (checked against the save later)
             let file = cache_on().then(|| crate::cache::path(identity.0, &identity.1));
             if let Some(Ok(text)) = file.map(std::fs::read_to_string) {

@@ -108,10 +108,32 @@ fn lineup(athletes: &[usize], slot_lanes: &[LaneV1]) -> Lineup {
     athletes.iter().zip(lanes).filter_map(|(a, lane)| Some((u32::try_from(*a).ok()?, lane))).collect()
 }
 
+/// The player's own team's draft under coach delegation counts the model this many times as
+/// strongly as an AI team's.
+pub const COACH_STRENGTH: f32 = 2.0;
+
+/// Whether the hook acts on a team's decision, and how strongly (a factor on `pick_strength` /
+/// `ban_strength`): every AI team with `ban_pick` on; the player's own team (it only drafts
+/// through the hooks when the game's coach drafts for it) with `coach` on, at
+/// [`COACH_STRENGTH`] - whether or not `ban_pick` is on.
+pub fn acting_strength(ban_pick: bool, coach: bool, team: Option<usize>, player_team: Option<usize>) -> Option<f32> {
+    let own = team.is_some() && team == player_team;
+    if own && coach {
+        Some(COACH_STRENGTH)
+    } else if ban_pick {
+        Some(1.0)
+    } else {
+        None
+    }
+}
+
 fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDraftDecision {
     let cfg = config::get();
-    if !cfg.ban_pick_on() {
+    let Some(factor) = acting_strength(cfg.ban_pick_on(), cfg.coach, ctx.ally_team(), shared::player_team()) else {
         return StableDraftDecision::Pass;
+    };
+    if factor > 1.0 {
+        diag::log_once("draft-coach", "[draft] coach delegation: the player's team drafts by the model (coach=on)");
     }
     let Some(snapshot) = shared::get() else {
         diag::log_once(
@@ -136,7 +158,7 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
     };
     let draft = Draft { ally: &ally, enemy: &enemy, offer: &offer, lineups: &lineups };
     let v = value_with(&snapshot, cand, &draft, ban, cfg.player_mastery);
-    let strength = if ban { cfg.ban_strength } else { cfg.pick_strength };
+    let strength = if ban { cfg.ban_strength } else { cfg.pick_strength } * factor;
     let add = amount(v.total, cfg.edge_scale, strength);
     note(ctx, &snapshot, &lineups, ban, &v, add, cfg.player_mastery);
     decision(add)
@@ -496,6 +518,18 @@ mod tests {
     use crate::meta::tests::{simulate, NAMES};
     use crate::meta::{build, Effect, Inputs, Settings, Tally};
     use std::collections::HashMap;
+
+    #[test]
+    fn coach_delegation_drafts_for_the_player_only() {
+        // ban_pick off: only the player's own team (coach delegation)
+        assert_eq!(acting_strength(false, true, Some(19), Some(19)), Some(COACH_STRENGTH));
+        assert_eq!(acting_strength(false, true, Some(3), Some(19)), None, "other teams untouched");
+        assert_eq!(acting_strength(false, false, Some(19), Some(19)), None, "coach=off");
+        assert_eq!(acting_strength(false, true, None, None), None, "teams not known");
+        // ban_pick on: every team, the player's at the coach strength
+        assert_eq!(acting_strength(true, true, Some(3), Some(19)), Some(1.0));
+        assert_eq!(acting_strength(true, false, Some(19), Some(19)), Some(1.0));
+    }
 
     #[test]
     fn amounts_are_bounded() {
