@@ -222,8 +222,8 @@ fn board(snapshot: &Snapshot, draft: &Draft<'_>, mastery: advisor::Mastery) -> B
             }
         }
         let damage = |c: u16| snapshot.damage_of(c);
-        let us = advisor::Team { picks: draft.ally, players: &draft.lineups.ally };
-        let them = advisor::Team { picks: draft.enemy, players: &draft.lineups.enemy };
+        let us = advisor::Team::new(draft.ally, &draft.lineups.ally);
+        let them = advisor::Team::new(draft.enemy, &draft.lineups.enemy);
         // the AI's side is not handed over: who picks first is known only from the pick counts
         let list = advisor::ban_board(&snapshot.meta, us, them, mastery, &damage, draft.offer, None);
         let board = Arc::new(list.into_iter().map(|b| (b.champ, b)).collect::<HashMap<_, _>>());

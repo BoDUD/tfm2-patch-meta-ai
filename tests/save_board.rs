@@ -39,8 +39,8 @@ fn board_on_a_save() {
         let offer: Vec<u16> = (0..meta.names.len() as u16).filter(|c| !taken.contains(c) && meta.profile(*c).is_some()).collect();
         let board = advisor::ban_board(
             &meta,
-            Team { picks: ally, players: &[] },
-            Team { picks: enemy, players: &[] },
+            Team::new(ally, &[]),
+            Team::new(enemy, &[]),
             Mastery::FULL,
             &none,
             &offer,

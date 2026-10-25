@@ -12,6 +12,18 @@
 //!   coloured green / red / grey; in a ban phase what banning it is worth (禁);
 //! - **enemy lanes**: on each enemy pick, the lane icon it most likely plays and a five-step bar
 //!   of how sure that is - from the champions' lane history, so it works in every language;
+//! - **composition**: under the win chance, each side's style (engage, poke, dive, protect the
+//!   carry, tanky) and its worst gap (no frontline, one damage type...);
+//! - **scouting**: the enemy team's habits (its most played champions lately) make it likelier
+//!   to take them - in its likely picks (the advice panel's fourth row), and in the bans;
+//! - **lookahead**: on our turn in a 3+2 draft, the best few candidates are played out to the end
+//!   of the draft (`advisor::simulate`) and ranked by the line-ups they lead to (推演 %);
+//! - **Fearless series**: with games left, spending a champion nothing replaces costs a little
+//!   (留后局);
+//! - **breakdown**: while the game shows a champion's info panel (hover or click a card), a line
+//!   above it says what its pick and ban values are made of;
+//! - **review**: every pick and ban of the draft with what it was worth and what was advised,
+//!   kept for the F8 panel's review page ([`last_review`]);
 //! - **swap phase**: the best way to seat the team's five champions on its players
 //!   (`plan::best_seating`) in place of the advice, with what it is worth over the usual lanes;
 //! - **Fearless**: how many champions the series has locked, next to the win chance;
@@ -66,6 +78,13 @@ const SWAP: &str = "main.swap";
 /// The phase label (`banpick.ban_phase` / `banpick.pick_phase`) and the arrow on the side whose
 /// turn it is.
 const STEP: &str = "main.header.step";
+/// The game's champion info panel (shown for the hovered / selected card) and its name label.
+const INFO: &str = "main.champion_info";
+const INFO_NAME: &str = "main.champion_info.stat.name";
+/// Our breakdown line above it.
+const BREAKDOWN: &str = "main.pma_info";
+/// "Bo3" / "Bo5".
+const SERIES: &str = "main.bottom.need_win";
 const TURN_ARROWS: [&str; 2] = ["main.header.desc.blue_arrow", "main.header.desc.red_arrow"];
 const SWAP_TABLES: [&str; 2] = ["main.swap.blue_table", "main.swap.red_table"];
 
@@ -74,6 +93,10 @@ pub struct View<'a> {
     pub team_name: &'a str,
     /// Each team's players and lanes, by [`team_key`].
     pub rosters: &'a HashMap<String, Vec<(u32, Option<Role>)>>,
+    /// Each team's most played champions lately (champion id, games, wins) and the matches
+    /// counted, by [`team_key`].
+    pub team_picks: &'a HashMap<String, Vec<(String, u32, u32)>>,
+    pub team_matches: &'a HashMap<String, u32>,
     pub grid_values: bool,
     pub lane_tags: bool,
 }
@@ -130,6 +153,108 @@ pub struct DraftScreen {
     drawn: Option<u64>,
     tagged: HashMap<String, bool>,
     reported: bool,
+    /// The values of the last drawing, for the breakdown line and the review.
+    last: Option<Drawn>,
+    /// The champion the breakdown line was written for, and the drawing it came from.
+    shown_info: Option<(String, Option<u64>)>,
+    /// The draft is being followed for the review (the first read only notes what is there).
+    tracking: bool,
+    /// The draft as last read (champion, blue pick, red pick, banned), the side acting then, and
+    /// the review so far.
+    seen: HashMap<String, (Option<u32>, Option<u32>, bool)>,
+    seen_acting: Option<usize>,
+    review: Review,
+}
+
+/// What the last drawing worked out.
+#[derive(Clone, Default)]
+struct Drawn {
+    picks: HashMap<u16, PickValue>,
+    bans: HashMap<u16, advisor::BanValue>,
+    /// The best pick and ban for us then.
+    best_pick: Option<(u16, f32)>,
+    best_ban: Option<(u16, f32)>,
+}
+
+/// One pick or ban of a draft as the review shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewRow {
+    /// Our team (`Some(true)`), theirs, or not known (a ban when no turn arrow was seen).
+    pub ours: Option<bool>,
+    pub ban: bool,
+    pub champ: String,
+    /// Its value to us then (a pick's or a ban's, log-odds), when it was ours.
+    pub value: Option<f32>,
+    /// What was advised then and its value.
+    pub advised: Option<(String, f32)>,
+    /// Our win chance after it (picks).
+    pub win_after: Option<f32>,
+}
+
+/// A draft's review.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Review {
+    pub team: String,
+    pub enemy: String,
+    pub rows: Vec<ReviewRow>,
+}
+
+static LAST_REVIEW: std::sync::Mutex<Option<Review>> = std::sync::Mutex::new(None);
+
+/// The review of the last ban/pick screen (for the F8 panel).
+pub fn last_review() -> Option<Review> {
+    LAST_REVIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// Spending a champion nothing replaces in a Fearless series costs this share of what it is
+/// worth over the next option, times the share of the series still to come.
+const CONSERVE: f32 = 0.4;
+/// Candidates the lookahead plays out, and the champions it plays with.
+const LOOKAHEAD: usize = 5;
+const LOOKAHEAD_POOL: usize = 28;
+
+/// A team's style and worst gap, in a few words (its open slots counted as average champions).
+fn comp_text(meta: &crate::meta::Meta, picks: &[u16]) -> String {
+    use crate::knowledge::COMP_NAMES_ZH;
+    let (Some(avg), false) = (meta.open_slot.as_ref(), picks.is_empty()) else { return String::new() };
+    let mut have = crate::knowledge::Sums::default();
+    for c in picks {
+        have.add(meta.profile(*c).unwrap_or(avg), 1.0);
+    }
+    let n = have.n;
+    // the trait the line-up has most above an average one
+    let styles = [
+        ("开团", have.engage - avg.engage * n),
+        ("消耗", have.poke - avg.poke * n),
+        ("突进", have.dive - avg.dive * n),
+        ("保C", (have.peel + have.carry) - (avg.peel + avg.carry) * n),
+        ("坦克", have.front - avg.front * n),
+    ];
+    let mut parts = Vec::new();
+    if let Some((name, _)) = styles.iter().filter(|s| s.1 >= 1.0).max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)) {
+        parts.push(name.to_string());
+    }
+    let (_, gaps) = meta.comp_score(picks);
+    if let Some((i, _)) = gaps
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| points(**g) <= -1.0)
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        parts.push(if i == 2 { "伤害单一".to_string() } else { format!("缺{}", COMP_NAMES_ZH[i]) });
+    }
+    parts.join(" · ")
+}
+
+/// Games left after this one in a Fearless series, and the series length: from "Bo3" / "Bo5"
+/// and the champions locked so far (ten a game).
+fn series_left(label: &str, locked: usize) -> Option<(usize, usize)> {
+    let n: usize = label.trim().strip_prefix("Bo")?.parse().ok()?;
+    if locked == 0 || n < 2 {
+        return None;
+    }
+    let played = locked.div_ceil(10);
+    Some((n.saturating_sub(1 + played), n))
 }
 
 fn visible(ui: &impl Ui, path: &str) -> bool {
@@ -205,11 +330,13 @@ fn label(id: &str, x: u32, y: u32, w: u32, h: u32, size: u32, c: u32, align: &st
 
 /// Advice rows: what (pick / ban), the champion's name, its value, why.
 const ADVICE_ROWS: usize = 3;
+/// The likely picks of the enemy shown on the fourth row.
+const LIKELY: usize = 3;
 
 fn overlay_source() -> String {
     let panel = |id: &str, x: u32, inner: String| {
         format!(
-            "#{id}:color {{ x: {x}px; y: 988px; width: 460px; height: 84px; color: {}; ignore_event: true; \
+            "#{id}:color {{ x: {x}px; y: 960px; width: 460px; height: 112px; color: {}; ignore_event: true; \
              rounding: Uniform {{ rounding: 10; }} {inner}}} ",
             color(PANEL)
         )
@@ -220,10 +347,10 @@ fn overlay_source() -> String {
          rounding: Uniform {{ rounding: 4; }} }} }} ",
         label("title", 12, 4, 300, 22, 13, DIM, "Left"),
         label("value", 12, 26, 200, 34, 26, TEXT, "Left"),
-        label("detail", 200, 30, 248, 26, 13, DIM, "Right"),
+        label("detail", 150, 30, 298, 26, 13, DIM, "Right"),
         color(RED),
         color(BLUE)
-    );
+    ) + &label("enemy", 12, 78, 436, 26, 13, DIM, "Right");
     // the swap phase's seating, in the advice panel's place
     let mut seating = label("title", 12, 4, 436, 22, 13, 0xe8e8e8ff, "Left");
     for k in 0..5u32 {
@@ -243,10 +370,25 @@ fn overlay_source() -> String {
         advice.push_str(&label(&format!("v{r}"), 182, y, 50, 24, 14, GOOD, "Right"));
         advice.push_str(&label(&format!("w{r}"), 240, y, 214, 24, 12, DIM, "Left"));
     }
+    // the enemy's likely picks
+    advice.push_str(&label("k3", 12, 82, 46, 24, 13, DIM, "Left"));
+    for i in 0..LIKELY {
+        advice.push_str(&label(&format!("n{i}"), 58 + i as u32 * 132, 82, 128, 24, 13, TEXT, "Left"));
+    }
     format!(
         "pma:empty {{ width: 100%; height: 100%; ignore_event: true; {}{}}}",
         panel("win", 20, win),
         panel("advice", 1440, advice)
+    )
+}
+
+/// The breakdown line above the game's champion info panel.
+fn breakdown_source() -> String {
+    format!(
+        "pma_info:color {{ x: 310px; y: 646px; width: 1300px; height: 34px; color: {}; visible: false; ignore_event: true; \
+         rounding: Uniform {{ rounding: 8; }} {}}}",
+        color(PANEL),
+        label("text", 14, 4, 1272, 26, 14, TEXT, "Left")
     )
 }
 
@@ -321,6 +463,12 @@ fn why(v: &PickValue) -> String {
     if v.exposure >= 0.02 {
         parts.push(format!("counterable {}", signed(-points(v.exposure))));
     }
+    if v.contest >= 0.02 {
+        parts.push(format!("抢 {}", signed(points(v.contest))));
+    }
+    if v.conserve >= 0.02 {
+        parts.push(format!("留后局 {}", signed(-points(v.conserve))));
+    }
     if v.balance > 0.0 {
         parts.push("one-sided".to_string());
     }
@@ -338,6 +486,9 @@ fn why_ban(b: &advisor::BanValue) -> String {
     }
     if b.lanes >= 2 {
         parts.push(format!("{}路摇摆", b.lanes));
+    }
+    if b.habit >= 0.05 {
+        parts.push("对方常用".to_string());
     }
     if t.counter >= 0.02 {
         parts.push(format!("克我方 {}", signed(points(t.counter))));
@@ -358,6 +509,41 @@ fn why_ban(b: &advisor::BanValue) -> String {
     parts.join(" · ")
 }
 
+/// What a champion's pick and ban values are made of, in win-rate points.
+fn breakdown_text(d: &Drawn, champ: u16) -> Option<String> {
+    let mut out = Vec::new();
+    let part = |name: &str, v: f32| (points(v).abs() >= 0.1).then(|| format!("{name} {}", signed(points(v))));
+    if let Some(v) = d.picks.get(&champ) {
+        let mut parts = vec![format!("{} {}", v.role.map_or("", |r| r.name()), signed(points(v.strength)))];
+        parts.extend(
+            [
+                part("配合", v.synergy),
+                part("克制", v.counter),
+                part("阵容", v.comp - v.balance),
+                part("选手", v.mastery),
+                part("抢", v.contest),
+                part("被克", -v.exposure),
+                part("留后局", -v.conserve),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        out.push(format!("选 {} = {}", signed(points(v.total)), parts.join(" · ")));
+    }
+    if let Some(b) = d.bans.get(&champ) {
+        let mut parts = vec![format!("对方损失 {}", signed(points(b.deny)))];
+        parts.extend(part("我方损失", -b.own));
+        if b.irreplaceable {
+            parts.push("无替代".to_string());
+        }
+        if b.habit >= 0.05 {
+            parts.push("对方常用".to_string());
+        }
+        out.push(format!("禁 {} = {}", signed(points(b.total)), parts.join(" · ")));
+    }
+    (!out.is_empty()).then(|| out.join("    |    "))
+}
+
 /// A pick of ours also keeps the champion from the enemy: this share of what banning it would
 /// take from them counts.
 const CONTEST: f32 = 0.5;
@@ -370,6 +556,7 @@ impl DraftScreen {
                 self.on = false;
                 self.drawn = None;
                 self.tagged.clear();
+                self.finish_review();
                 crate::draft::set_live(false);
             }
             return;
@@ -429,6 +616,12 @@ impl DraftScreen {
         // the seating needs to know which team is the player's
         let side_known = side.is_some();
         let side = side.unwrap_or(0);
+        if self.review.team.is_empty() {
+            let names = [ui.text(BLUE_NAME).unwrap_or_default(), ui.text(RED_NAME).unwrap_or_default()];
+            self.review.team = names[side].clone();
+            self.review.enemy = names[1 - side].clone();
+        }
+        self.track(&cards, side_known.then_some(side), meta, acting);
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -444,6 +637,7 @@ impl DraftScreen {
             && (!view.grid_values
                 || [tagged.first(), tagged.last()].into_iter().flatten().all(|c| ui.exists(&format!("{}.{TAG}", c.path))));
         if self.drawn == Some(key) && healthy {
+            self.breakdown(ui, meta);
             return;
         }
         if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source()) {
@@ -458,6 +652,126 @@ impl DraftScreen {
         let rosters = [roster_of(BLUE_NAME), roster_of(RED_NAME)];
         let turn = Turn { side, side_known, swapping: swap_phase && side_known, banning, acting };
         self.draw(ui, snapshot, &cards, turn, &rosters, view);
+        self.breakdown(ui, meta);
+    }
+
+    /// Notes every pick and ban since the last read for the review: who made it (a pick by its
+    /// badge, a ban by the turn arrow seen before it), what it was worth to us and what was
+    /// advised then (the last drawing's values), and our win chance after it.
+    fn track(&mut self, cards: &[Card], side: Option<usize>, meta: &crate::meta::Meta, acting: Option<usize>) {
+        let first = !self.tracking;
+        self.tracking = true;
+        let mut events = Vec::new();
+        for c in cards {
+            let Some(name) = &c.champ else { continue };
+            let now = (c.blue, c.red, c.banned);
+            let before = self.seen.get(name).copied().unwrap_or((None, None, false));
+            if before == now {
+                continue;
+            }
+            self.seen.insert(name.clone(), now);
+            if first {
+                continue;
+            }
+            let picked_by = if now.0.is_some() && before.0.is_none() {
+                Some(0)
+            } else if now.1.is_some() && before.1.is_none() {
+                Some(1)
+            } else {
+                None
+            };
+            let ban = now.2 && !before.2;
+            if picked_by.is_none() && !ban {
+                continue;
+            }
+            let actor = picked_by.or(self.seen_acting);
+            events.push((name.clone(), ban, side.and_then(|s| actor.map(|a| a == s))));
+        }
+        self.seen_acting = acting;
+        if events.is_empty() {
+            return;
+        }
+        // our picks and theirs now, for the win chance after
+        let ids = |blue: bool| -> Vec<u16> {
+            let mut list: Vec<(u32, u16)> = cards
+                .iter()
+                .filter_map(|c| Some((if blue { c.blue? } else { c.red? }, meta.names.get(c.champ.as_deref()?)?)))
+                .collect();
+            list.sort();
+            list.into_iter().map(|(_, c)| c).collect()
+        };
+        let (blue, red) = (ids(true), ids(false));
+        let win = side.map(|s| {
+            let (ally, enemy) = if s == 0 { (&blue, &red) } else { (&red, &blue) };
+            advisor::win_probability(meta, ally, enemy)
+        });
+        for (name, ban, ours) in events {
+            let id = meta.names.get(&name);
+            let last = self.last.as_ref();
+            let (value, advised) = match (ours, last, id) {
+                (Some(true), Some(l), Some(id)) if ban => (l.bans.get(&id).map(|b| b.total), l.best_ban),
+                (Some(true), Some(l), Some(id)) => (l.picks.get(&id).map(|v| v.total), l.best_pick),
+                _ => (None, None),
+            };
+            self.review.rows.push(ReviewRow {
+                ours,
+                ban,
+                champ: name,
+                value,
+                advised: advised.map(|(c, v)| (meta.names.name(c).to_string(), v)),
+                win_after: if ban { None } else { win },
+            });
+        }
+    }
+
+    /// The ban/pick screen closed: its review is kept for the F8 panel and summed up in diag.log.
+    fn finish_review(&mut self) {
+        let review = std::mem::take(&mut self.review);
+        self.seen.clear();
+        self.tracking = false;
+        self.seen_acting = None;
+        self.last = None;
+        self.shown_info = None;
+        if review.rows.is_empty() {
+            return;
+        }
+        let ours: Vec<&ReviewRow> = review.rows.iter().filter(|r| r.ours == Some(true)).collect();
+        let followed = ours.iter().filter(|r| r.advised.as_ref().is_some_and(|(c, _)| *c == r.champ)).count();
+        diag::log(&format!(
+            "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised), win chance at the end {}",
+            review.team,
+            review.enemy,
+            review.rows.len(),
+            ours.len(),
+            followed,
+            review.rows.iter().rev().find_map(|r| r.win_after).map_or("-".to_string(), |w| format!("{:.0}%", w * 100.0))
+        ));
+        *LAST_REVIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(review);
+    }
+
+    /// The breakdown line above the game's champion info panel: what the shown champion's pick
+    /// and ban values are made of (hidden when it is not on offer or no values are known).
+    fn breakdown(&mut self, ui: &mut impl Ui, meta: &crate::meta::Meta) {
+        let champ = if visible(ui, INFO) {
+            ui.text(INFO_NAME).and_then(|t| {
+                t.strip_prefix("#asset/base/text/champion?description.").and_then(|r| r.strip_suffix(".name")).map(str::to_string)
+            })
+        } else {
+            None
+        };
+        let key = champ.clone().map(|c| (c, self.drawn));
+        if key == self.shown_info && ui.exists(BREAKDOWN) {
+            return;
+        }
+        if !ui.exists(BREAKDOWN) && !ui.spawn("main", &breakdown_source()) {
+            return;
+        }
+        self.shown_info = key;
+        let text = champ.as_deref().and_then(|c| meta.names.get(c)).and_then(|id| breakdown_text(self.last.as_ref()?, id));
+        ui.set_visible(BREAKDOWN, text.is_some());
+        if let Some(t) = text {
+            ui.set_text(&format!("{BREAKDOWN}.text"), &t);
+        }
     }
 
     /// The best seating of the team's champions in the swap phase, written into the advice
@@ -524,39 +838,61 @@ impl DraftScreen {
         // the champions the player's team may pick: open, and not held by a position lock
         let pickable: Vec<u16> = cards.iter().filter(|c| c.open() && !c.held).filter_map(&id).collect();
 
-        // win chance
+        // win chance, and each side's composition
         let p = advisor::win_probability(meta, &ally, &enemy);
         let (mine, theirs) = if side == 0 { (BLUE, RED) } else { (RED, BLUE) };
-        ui.set_text(&format!("{OVERLAY}.win.title"), &format!("Win chance 胜率 · {} vs {}", ally.len(), enemy.len()));
+        let fearless = cards.iter().filter(|c| c.locked).count();
+        let title = if fearless > 0 {
+            format!("胜率 Win · {} vs {} · Fearless {fearless}", ally.len(), enemy.len())
+        } else {
+            format!("胜率 Win · {} vs {} · {} 场", ally.len(), enemy.len(), meta.current_matches)
+        };
+        ui.set_text(&format!("{OVERLAY}.win.title"), &title);
         ui.set_text(&format!("{OVERLAY}.win.value"), &format!("{:.0}%", p * 100.0));
         ui.set_properties(&format!("{OVERLAY}.win.value"), &format!("color: {};", color(mine)));
-        let fearless = cards.iter().filter(|c| c.locked).count();
-        let detail = if fearless > 0 {
-            format!("patch {} · Fearless {fearless} locked", meta.current)
-        } else {
-            format!("patch {} · {} matches", meta.current, meta.current_matches)
+        let comp = |label: &str, picks: &[u16]| {
+            let t = comp_text(meta, picks);
+            if t.is_empty() { String::new() } else { format!("{label} {t}") }
         };
-        ui.set_text(&format!("{OVERLAY}.win.detail"), &detail);
+        ui.set_text(&format!("{OVERLAY}.win.detail"), &comp("我方", &ally));
+        ui.set_text(&format!("{OVERLAY}.win.enemy"), &comp("敌方", &enemy));
         ui.set_properties(&format!("{OVERLAY}.win.back"), &format!("color: {};", color(theirs)));
         ui.set_properties(
             &format!("{OVERLAY}.win.back.fill"),
             &format!("width: {:.1}%; color: {};", (p * 100.0).clamp(2.0, 98.0), color(mine)),
         );
 
-        // advice: the two best picks and the best ban
+        // each team's habits (scouting): the share of its recent matches it played a champion in
+        let habits_of = |team: Option<&str>| -> Option<HashMap<u16, f32>> {
+            let team = team?;
+            let list = view.team_picks.get(team)?;
+            let matches = view.team_matches.get(team).copied().unwrap_or(0).max(1) as f32;
+            Some(list.iter().filter_map(|(c, g, _)| Some((meta.names.get(c)?, *g as f32 / matches))).collect())
+        };
+        let their_habits = habits_of(self.enemy_team.as_deref());
+        let our_habits = habits_of(Some(team_key(view.team_name).as_str()));
+
+        // advice
         let ally_open = advisor::open_lanes(meta, &ally);
         let their_left = 5usize.saturating_sub(enemy.len());
-        let (us, them) = (advisor::Team { picks: &ally, players }, advisor::Team { picks: &enemy, players: enemy_players });
+        let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref() };
+        let them = advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref() };
         let blue = turn.side_known.then_some(side == 0);
         // our bans, valued by what they take from the enemy's draft
-        let board = advisor::ban_board(meta, us, them, advisor::Mastery::FULL, &damage, &open, blue);
-        let deny: HashMap<u16, f32> = board.iter().map(|b| (b.champ, b.deny)).collect();
+        let mut board = advisor::ban_board(meta, us, them, advisor::Mastery::FULL, &damage, &open, blue);
+        let by_ban: HashMap<u16, advisor::BanValue> = board.iter().map(|b| (b.champ, b.clone())).collect();
+        // a Fearless series with games left: spending what nothing replaces costs a little
+        let series = series_left(&ui.text(SERIES).unwrap_or_default(), fearless);
+        let conserve_share = series.map_or(0.0, |(left, n)| CONSERVE * left as f32 / (n - 1).max(1) as f32);
         let mut pick_values: Vec<PickValue> = pickable
             .iter()
             .map(|c| {
                 let mut v = advisor::with_exposure(meta, advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open), their_left, &open);
+                let b = by_ban.get(c);
                 // taking it also keeps it from them
-                v.total += CONTEST * deny.get(c).copied().unwrap_or(0.0);
+                v.contest = CONTEST * b.map_or(0.0, |b| b.deny);
+                v.conserve = conserve_share * b.map_or(0.0, |b| b.own);
+                v.total += v.contest - v.conserve;
                 v
             })
             .collect();
@@ -568,6 +904,40 @@ impl DraftScreen {
         } else {
             Vec::new()
         };
+
+        // lookahead: on our turn of a 3+2 draft, the best few played out to the end
+        let banned = cards.iter().filter(|c| c.banned).count();
+        let (blue_picks, red_picks) = if side == 0 { (ally.len(), enemy.len()) } else { (enemy.len(), ally.len()) };
+        let at = advisor::order_position(banned, blue_picks, red_picks)
+            .filter(|i| turn.side_known && advisor::ORDER_3_2[*i].blue == (side == 0) && advisor::ORDER_3_2[*i].ban == turn.banning)
+            .filter(|_| !their_turn && !turn.swapping);
+        let mut outlook: HashMap<u16, f32> = HashMap::new();
+        if let Some(at) = at {
+            let candidates: Vec<u16> = if turn.banning {
+                board.iter().take(LOOKAHEAD).map(|b| b.champ).collect()
+            } else {
+                pick_values.iter().take(LOOKAHEAD).map(|v| v.champ).collect()
+            };
+            let mut pool = advisor::lookahead_pool(meta, &open, LOOKAHEAD_POOL);
+            for c in &candidates {
+                if !pool.contains(c) {
+                    pool.push(*c);
+                }
+            }
+            let (blue_team, red_team) = if side == 0 { (us, them) } else { (them, us) };
+            for c in candidates {
+                let blue_wins = advisor::simulate(meta, blue_team, red_team, &pool, at, c, &damage);
+                outlook.insert(c, if side == 0 { blue_wins } else { 1.0 - blue_wins });
+            }
+            // the candidates played out lead, in the order of the draft they lead to
+            let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0);
+            if turn.banning {
+                board.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                pick_values.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
         // the swap phase: the best seating instead of picks and bans
         let seating = if turn.swapping { self.seating(ui, snapshot, &ally, side, players) } else { None };
         ui.set_visible(&format!("{OVERLAY}.advice.seating"), seating.is_some());
@@ -599,6 +969,10 @@ impl DraftScreen {
                     let pts = points(total);
                     ui.set_text(&row("v"), &signed(pts));
                     ui.set_properties(&row("v"), &format!("color: {};", color(if pts >= 0.0 { GOOD } else { BAD })));
+                    let reason = match outlook.get(&champ) {
+                        Some(w) => format!("推演 {:.0}% · {reason}", w * 100.0),
+                        None => reason,
+                    };
                     ui.set_text(&row("w"), &reason);
                 }
                 None => {
@@ -608,6 +982,25 @@ impl DraftScreen {
                 }
             }
         }
+
+        // the enemy's likely next picks (scouting: their habits count)
+        let likely = if seating.is_none() && their_left > 0 {
+            advisor::likely_picks(meta, them, &ally, advisor::Mastery::FULL, &damage, &open)
+        } else {
+            Vec::new()
+        };
+        ui.set_text(&format!("{OVERLAY}.advice.k3"), if likely.is_empty() { "" } else { "敌可能" });
+        for i in 0..LIKELY {
+            let text = likely.get(i).map(|v| name_ref(meta.names.name(v.champ))).unwrap_or_default();
+            ui.set_text(&format!("{OVERLAY}.advice.n{i}"), &text);
+        }
+
+        self.last = Some(Drawn {
+            best_pick: pick_values.first().map(|v| (v.champ, v.total)),
+            best_ban: board.first().map(|b| (b.champ, b.total)),
+            picks: pick_values.iter().map(|v| (v.champ, v.clone())).collect(),
+            bans: by_ban,
+        });
 
         // grid values
         if view.grid_values {
@@ -737,6 +1130,66 @@ mod tests {
     }
 
     #[test]
+    fn coach_features_ban_phase_scouting_breakdown_review() {
+        let snapshot = snapshot(2000);
+        let book = NameBook::default();
+        let mut ui = screen();
+        // blue's first ban of a 3+2 draft: the phase label and blue's turn arrow
+        ui.add(STEP, "label").text = Some("#asset/base/text/ui?banpick.ban_phase".into());
+        ui.add(TURN_ARROWS[0], "image");
+        ui.add(TURN_ARROWS[1], "image").visible = false;
+        // the game's info panel shows "d"
+        ui.add(INFO, "empty");
+        ui.add(INFO_NAME, "label").text = Some("#asset/base/text/champion?description.d.name".into());
+        let rosters = HashMap::new();
+        // the rivals played "e" in every one of their last ten matches
+        let team_picks: HashMap<String, Vec<(String, u32, u32)>> = [("rivals".to_string(), vec![("e".to_string(), 10, 6)])].into();
+        let team_matches: HashMap<String, u32> = [("rivals".to_string(), 10)].into();
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &team_picks, team_matches: &team_matches, grid_values: true, lane_tags: true };
+        let mut screen = DraftScreen::default();
+        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
+        let text = |ui: &FakeUi, p: &str| ui.text(p).unwrap_or_default();
+
+        assert_eq!(text(&ui, "main.pma.advice.k0"), "禁 1");
+        assert!(text(&ui, "main.pma.advice.w0").starts_with("推演 "), "played out: {}", text(&ui, "main.pma.advice.w0"));
+        assert_eq!(text(&ui, "main.pma.advice.k3"), "敌可能");
+        let likely: Vec<String> = (0..LIKELY).map(|i| text(&ui, &format!("main.pma.advice.n{i}"))).collect();
+        assert!(likely.contains(&name_ref("e")), "their favourite is among their likely picks: {likely:?}");
+        // the breakdown of the champion in the info panel
+        assert_eq!(ui.visible(BREAKDOWN), Some(true));
+        let line = text(&ui, &format!("{BREAKDOWN}.text"));
+        assert!(line.starts_with("选 ") && line.contains("禁 "), "{line}");
+        // ban cards show 禁
+        assert!(text(&ui, &format!("{GRID}.d.{TAG}.text")).starts_with('禁'));
+
+        // blue bans "c" as advised or not, then picks "d"; the screen closes: the review has both
+        let advised_ban = text(&ui, "main.pma.advice.c0");
+        ui.nodes.get_mut(&format!("{GRID}.c.ban")).unwrap().visible = true;
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        ui.nodes.get_mut(STEP).unwrap().text = Some("#asset/base/text/ui?banpick.pick_phase".into());
+        pick(&mut ui, "d", "blue", 1);
+        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
+        ui.remove(GRID);
+        screen.tick(&mut ui, 3 * READ_EVERY, Some(&snapshot), &book, &view);
+        let review = last_review().expect("a review");
+        assert_eq!(review.enemy, "Rivals\r #10");
+        assert_eq!(review.rows.len(), 2, "{review:?}");
+        let (ban, pick_row) = (&review.rows[0], &review.rows[1]);
+        assert!(ban.ban && ban.champ == "c" && ban.ours == Some(true) && ban.value.is_some());
+        assert_eq!(ban.advised.as_ref().map(|(c, _)| name_ref(c)), Some(advised_ban));
+        assert!(!pick_row.ban && pick_row.champ == "d" && pick_row.ours == Some(true) && pick_row.win_after.is_some());
+    }
+
+    #[test]
+    fn series_and_composition_words() {
+        assert_eq!(series_left("Bo3", 10), Some((1, 3)), "one game played, one more possible");
+        assert_eq!(series_left("Bo5", 20), Some((2, 5)));
+        assert_eq!(series_left("Bo3", 0), None, "not Fearless (or its first game)");
+        assert_eq!(series_left("Bo1", 10), None);
+        assert_eq!(series_left("", 10), None);
+    }
+
+    #[test]
     fn reads_the_draft_and_draws_the_overlay() {
         let snapshot = snapshot(2000);
         let book = NameBook::default();
@@ -750,7 +1203,8 @@ mod tests {
         ui.add(&format!("{GRID}.c.{POSITION_LOCK}"), "color_icon_button");
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
@@ -812,7 +1266,8 @@ mod tests {
         let snapshot = snapshot(1500);
         let book = NameBook::default();
         let rosters = HashMap::new();
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
         let mut ui = screen();
         for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             pick(&mut ui, n, "blue", i as u32 + 1);
@@ -845,7 +1300,8 @@ mod tests {
     fn says_so_when_there_is_too_little_data() {
         let book = NameBook::default();
         let rosters = HashMap::new();
-        let view = View { team_name: "Mods FC", rosters: &rosters, grid_values: true, lane_tags: true };
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
         for snapshot in [None, Some(snapshot(5))] {
             let mut ui = screen();
             let mut screen = DraftScreen::default();

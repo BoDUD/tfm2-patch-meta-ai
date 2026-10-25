@@ -164,6 +164,8 @@ pub struct Context {
     pub team_labels: HashMap<String, String>,
     /// Each team's most played champions lately: (champion id, games, wins), most first.
     pub team_picks: HashMap<String, Vec<(String, u32, u32)>>,
+    /// The matches those lists count, per team.
+    pub team_matches: HashMap<String, u32>,
     pub athletes: HashMap<u32, String>,
     /// The player's opponent in their newest competition match (lower case).
     pub last_opponent: Option<String>,
@@ -271,6 +273,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         let view = draft_screen::View {
             team_name: &st.context.team_name,
             rosters: &st.context.rosters,
+            team_picks: &st.context.team_picks,
+            team_matches: &st.context.team_matches,
             grid_values: cfg.grid_values,
             lane_tags: cfg.lane_tags,
         };
