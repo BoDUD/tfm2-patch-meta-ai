@@ -30,7 +30,7 @@ fi
 out=dist/patch_meta_ai
 rm -rf "$out"
 mkdir -p "$out"
-cp "$dll" package/mod.mod_info package/mod.override_info package/thumbnail.png "$out/"
+cp "$dll" package/mod.mod_info package/mod.override_info package/thumbnail.png package/README.txt "$out/"
 # the page's texts, merged into the game's ui text (mod.override_info)
 mkdir -p "$out/text"
 cp package/text/ui.i18n "$out/text/"
