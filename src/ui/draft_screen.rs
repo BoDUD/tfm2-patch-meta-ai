@@ -164,6 +164,10 @@ pub struct DraftScreen {
     seen: HashMap<String, (Option<u32>, Option<u32>, bool)>,
     seen_acting: Option<usize>,
     review: Review,
+    /// Hell Draft AI's set-up, read when the screen opens (`None` inside: not enabled or not
+    /// drafting for the AI teams), and its lean for the model it was worked out for.
+    hell: Option<Option<crate::hell::Hell>>,
+    hell_lean: Option<(usize, Arc<HashMap<u16, f32>>)>,
 }
 
 /// What the last drawing worked out.
@@ -558,6 +562,9 @@ impl DraftScreen {
                 self.tagged.clear();
                 self.finish_review();
                 crate::draft::set_live(false);
+                crate::shared::set_coach_plan(None);
+                self.hell = None;
+                self.hell_lean = None;
             }
             return;
         }
@@ -566,6 +573,7 @@ impl DraftScreen {
             diag::log("[ui] ban/pick screen");
             // the AI's decisions from now on are the player's own match (diag.log)
             crate::draft::set_live(true);
+            crate::shared::take_coach_choices();
         }
         if frame < self.next_read {
             return;
@@ -737,8 +745,24 @@ impl DraftScreen {
         }
         let ours: Vec<&ReviewRow> = review.rows.iter().filter(|r| r.ours == Some(true)).collect();
         let followed = ours.iter().filter(|r| r.advised.as_ref().is_some_and(|(c, _)| *c == r.champ)).count();
+        // the coach override's choices: each one that is not among our picks and bans was
+        // overridden by another mod
+        let coach = crate::shared::take_coach_choices();
+        let coach_note = if coach.is_empty() {
+            String::new()
+        } else {
+            let names = crate::shared::get().map(|s| s.meta.names.clone());
+            let taken = coach
+                .iter()
+                .filter(|(ban, c)| {
+                    let name = names.as_ref().map(|n| n.name(*c).to_string()).unwrap_or_default();
+                    ours.iter().any(|r| r.ban == *ban && r.champ == name)
+                })
+                .count();
+            format!(", coach override {} decided, {taken} of them made", coach.len())
+        };
         diag::log(&format!(
-            "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised), win chance at the end {}",
+            "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised){coach_note}, win chance at the end {}",
             review.team,
             review.enemy,
             review.rows.len(),
@@ -871,12 +895,32 @@ impl DraftScreen {
         };
         let their_habits = habits_of(self.enemy_team.as_deref());
         let our_habits = habits_of(Some(team_key(view.team_name).as_str()));
+        // Hell Draft AI drafts for the other team: it takes what it rates, not what we value
+        let hell = self
+            .hell
+            .get_or_insert_with(|| {
+                let on = crate::compat::get().hell();
+                on.then(|| crate::hell::dir().as_deref().and_then(crate::hell::read)).flatten().filter(|h| h.enemy)
+            })
+            .clone();
+        let their_lean = hell.map(|h| {
+            let model = snapshot as *const Snapshot as usize;
+            match &self.hell_lean {
+                Some((m, lean)) if *m == model => lean.clone(),
+                _ => {
+                    let lean = Arc::new(crate::hell::lean(meta, &h));
+                    self.hell_lean = Some((model, lean.clone()));
+                    lean
+                }
+            }
+        });
 
         // advice
         let ally_open = advisor::open_lanes(meta, &ally);
         let their_left = 5usize.saturating_sub(enemy.len());
-        let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref() };
-        let them = advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref() };
+        let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref(), lean: None };
+        let them =
+            advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref(), lean: their_lean.as_deref() };
         let blue = turn.side_known.then_some(side == 0);
         // our bans, valued by what they take from the enemy's draft
         let mut board = advisor::ban_board(meta, us, them, advisor::Mastery::FULL, &damage, &open, blue);
@@ -899,11 +943,16 @@ impl DraftScreen {
         pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
         // the enemy's turn to ban: what they would most want to take from us
         let their_turn = turn.acting.is_some_and(|a| a != side);
-        let their_bans = if turn.banning && their_turn {
+        let mut their_bans = if turn.banning && their_turn {
             advisor::ban_board(meta, them, us, advisor::Mastery::FULL, &damage, &open, blue.map(|b| !b))
         } else {
             Vec::new()
         };
+        // Hell Draft AI bans what it rates highest, whatever it takes from us
+        if them.lean.is_some() {
+            let rating = |c: u16| them.hell_rating(meta, c).unwrap_or(f32::NEG_INFINITY);
+            their_bans.sort_by(|a, b| rating(b.champ).partial_cmp(&rating(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
+        }
 
         // lookahead: on our turn of a 3+2 draft, the best few played out to the end
         let banned = cards.iter().filter(|c| c.banned).count();
@@ -936,6 +985,16 @@ impl DraftScreen {
             } else {
                 pick_values.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
             }
+        }
+
+        // the coach override follows this ranking when the game's coach drafts for us
+        if !their_turn && !turn.swapping {
+            let (mut a, mut e) = (ally.clone(), enemy.clone());
+            a.sort_unstable();
+            e.sort_unstable();
+            let ranked = if turn.banning { board.iter().map(|b| b.champ).collect() } else { pick_values.iter().map(|v| v.champ).collect() };
+            let held = cards.iter().filter(|c| c.held).filter_map(&id).collect();
+            crate::shared::set_coach_plan(Some(crate::shared::CoachPlan { ally: a, enemy: e, bans: banned, ban: turn.banning, ranked, held }));
         }
 
         // the swap phase: the best seating instead of picks and bans
@@ -1123,7 +1182,7 @@ mod tests {
         }, 4);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         Arc::new(Snapshot::new(meta, HashMap::new()))

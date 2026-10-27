@@ -460,6 +460,32 @@ fn model_page(meta: &Meta, context: &Context) -> Page {
             ),
         ],
     ];
+    if meta.stat_prior {
+        // the stats worth the most either way
+        let mut weights: Vec<(usize, f32)> = meta.stat_weights.iter().map(|e| e.value).enumerate().collect();
+        weights.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        let top: Vec<String> =
+            weights.iter().take(4).map(|(k, v)| format!("{} {}", crate::stats::feature_name(*k), signed(pts(*v)))).collect();
+        rows.push(vec![
+            ("Stats 属性".into(), DIM),
+            (
+                format!(
+                    "on{} · per sd: {}",
+                    if meta.stat_prior_chosen { " (auto)" } else { "" },
+                    top.join(" · ")
+                ),
+                TEXT,
+            ),
+        ]);
+    } else if meta.stat_prior_chosen {
+        rows.push(vec![("Stats 属性".into(), DIM), ("off (auto: the matches do better without / 自动：不用更准)".into(), TEXT)]);
+    }
+    if let Some(scale) = meta.calibration {
+        rows.push(vec![
+            ("Calibration 校准".into(), DIM),
+            (format!("win chances x{scale:.2} (log-odds; below 1 = the model was too sure / 小于 1 = 模型偏自信)"), TEXT),
+        ]);
+    }
     let gaps: Vec<String> = meta
         .comp
         .iter()
@@ -504,7 +530,7 @@ mod tests {
         let (names, games) = simulate(1500, "1.1", |n| if n == "c" { 0.5 } else { 0.0 }, 8);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = fit(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         let snapshot = Snapshot::new(meta, HashMap::new());

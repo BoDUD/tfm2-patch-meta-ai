@@ -25,6 +25,7 @@ pub mod config;
 mod diag;
 pub mod draft;
 pub mod glm;
+pub mod hell;
 pub mod history;
 pub mod knowledge;
 pub mod meta;
@@ -36,6 +37,7 @@ pub mod plan;
 pub mod records;
 pub mod report;
 pub mod scan;
+pub mod stats;
 pub mod server;
 mod shared;
 pub mod ui;
@@ -68,6 +70,7 @@ fn init(host: &StableHost) -> StableMod {
     decl.set_extension(client::ClientExt);
     decl.set_server_extension(server::ServerExt);
     decl.add_draft_score_hook(draft::MetaDraftHook);
+    decl.add_draft_score_hook(draft::CoachHook);
     decl
 }
 

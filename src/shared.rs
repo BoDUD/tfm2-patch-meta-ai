@@ -53,3 +53,46 @@ pub fn set_player_team(team: Option<usize>) {
 pub fn player_team() -> Option<usize> {
     Some(PLAYER_TEAM.load(Ordering::Relaxed)).filter(|t| *t != usize::MAX)
 }
+
+/// The draft screen's ranking for the player's team's turn now (the panel's 禁 1 / 选 order, the
+/// lookahead included), for the coach override (`draft::CoachHook`). Champions are the model's
+/// ids; the picks are sorted, so the hook can tell whether the plan is for the draft it is asked
+/// about.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CoachPlan {
+    pub ally: Vec<u16>,
+    pub enemy: Vec<u16>,
+    /// Bans made so far, both sides.
+    pub bans: usize,
+    pub ban: bool,
+    /// Best first.
+    pub ranked: Vec<u16>,
+    /// Cards a position lock holds (the team may not pick them now).
+    pub held: Vec<u16>,
+}
+
+static COACH_PLAN: RwLock<Option<Arc<CoachPlan>>> = RwLock::new(None);
+
+pub fn set_coach_plan(plan: Option<CoachPlan>) {
+    *COACH_PLAN.write().unwrap_or_else(PoisonError::into_inner) = plan.map(Arc::new);
+}
+
+pub fn coach_plan() -> Option<Arc<CoachPlan>> {
+    COACH_PLAN.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// What the coach override chose in the player's own draft (model ids, in order), for the
+/// review: a choice that does not show up on the screen was overridden by another mod.
+static COACH_CHOICES: RwLock<Vec<(bool, u16)>> = RwLock::new(Vec::new());
+
+pub fn note_coach_choice(ban: bool, champ: u16) {
+    let mut list = COACH_CHOICES.write().unwrap_or_else(PoisonError::into_inner);
+    if list.last() != Some(&(ban, champ)) {
+        list.push((ban, champ));
+    }
+}
+
+/// The coach override's choices since the last call (and forgets them).
+pub fn take_coach_choices() -> Vec<(bool, u16)> {
+    std::mem::take(&mut *COACH_CHOICES.write().unwrap_or_else(PoisonError::into_inner))
+}

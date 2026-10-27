@@ -1,15 +1,24 @@
 //! Fitting the model off the game's frame loop. A fit takes tens of milliseconds on a big
 //! save - several frames - so the client hands the games to one background thread and picks
 //! the result up on a later frame. Only the newest job matters: jobs that queued up behind a
-//! running fit are skipped. If the thread cannot be started the fit runs in the frame instead.
+//! running fit are skipped (a backtest one of them asked for is done with the newest). If the
+//! thread cannot be started the fit runs in the frame instead.
+//!
+//! Before the fit, the model's choices are checked against the newest matches it was not fitted
+//! on (`calibrate`): League's weight (`lol_prior=auto`), whether stats start the champions'
+//! strength (`stats=auto`), and how sure of itself the model may be (the scale its win chances
+//! are shown with).
 
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
+use std::collections::HashMap;
+
 use crate::history::{Game, Names};
 use crate::meta::{self, Backtest, Inputs, Meta, Settings};
 use crate::patchnotes::PatchNote;
+use crate::stats::Stats;
 
 pub struct Job {
     /// Which rebuild this is (results of older ones are dropped).
@@ -18,6 +27,8 @@ pub struct Job {
     pub games: Vec<std::sync::Arc<Game>>,
     pub names: Names,
     pub champions: Vec<String>,
+    /// Every champion's stats (empty: not known).
+    pub stats: Arc<HashMap<String, Stats>>,
     pub notes: Vec<PatchNote>,
     pub current: String,
     pub settings: Settings,
@@ -42,30 +53,53 @@ const LOL_PRIOR_CHOICES: [f32; 4] = [0.0, 0.5, 1.0, 2.0];
 /// ... again once the matches grew by this share.
 const RECALIBRATE_GROWTH: f32 = 1.2;
 
-/// The last choice of `lol_prior = auto`: the matches it was made with, and the weight.
-pub type Calibration = Option<(usize, f32)>;
+/// What the held-out matches chose last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Choice {
+    /// The matches it was made with.
+    pub games: usize,
+    pub lol_prior: f32,
+    pub stat_prior: bool,
+    /// The scale on the log-odds for win chances.
+    pub scale: f32,
+}
 
-/// `lol_prior = auto`: the weight whose model predicts the newest matches it was not fitted on
-/// best (log-loss), worked out again once the matches grew by a fifth. `None` while there are
-/// too few matches for a backtest.
-fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -> Option<f32> {
+pub type Calibration = Option<Choice>;
+
+/// The settings whose model predicts the newest matches it was not fitted on best (log-loss):
+/// League's weight (with `lol_prior=auto`), stats or not (with `stats=auto`), the rest as set -
+/// and the scale its win chances are best shown with. Worked out again once the matches grew
+/// by a fifth; `None` while there are too few matches for a backtest.
+fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -> Option<Choice> {
     let games = inputs.games.len();
-    if let Some((n, w)) = *last {
-        if (games as f32) < n as f32 * RECALIBRATE_GROWTH {
-            return Some(w);
+    if let Some(c) = *last {
+        if (games as f32) < c.games as f32 * RECALIBRATE_GROWTH {
+            return Some(c);
         }
     }
-    let scored: Vec<(f32, f32)> = LOL_PRIOR_CHOICES
-        .iter()
-        .filter_map(|w| {
-            let set = Settings { lol_prior: *w, ..settings.clone() };
-            meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)).map(|bt| (*w, bt.log_loss))
-        })
-        .collect();
-    let (best, _) = scored.into_iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
-    crate::diag::log(&format!("[model] lol_prior=auto: {best} predicts the held-out matches best ({games} matches)"));
-    *last = Some((games, best));
-    Some(best)
+    let lol: Vec<f32> = if settings.lol_prior_auto { LOL_PRIOR_CHOICES.to_vec() } else { vec![settings.lol_prior] };
+    let stats: Vec<bool> = if settings.stat_prior_auto { vec![false, true] } else { vec![settings.stat_prior] };
+    let mut best: Option<(Choice, f32)> = None;
+    for w in &lol {
+        for s in &stats {
+            let set = Settings { lol_prior: *w, stat_prior: *s, ..settings.clone() };
+            let Some(bt) = meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)) else { continue };
+            if best.as_ref().is_none_or(|(_, loss)| bt.log_loss < *loss) {
+                best = Some((Choice { games, lol_prior: *w, stat_prior: *s, scale: bt.scale }, bt.log_loss));
+            }
+        }
+    }
+    let (choice, _) = best?;
+    crate::diag::log(&format!(
+        "[model] held-out check ({games} matches): lol_prior {}{}, stats {}{}, win chances scaled by {:.2}",
+        choice.lol_prior,
+        if settings.lol_prior_auto { " (auto)" } else { "" },
+        if choice.stat_prior { "on" } else { "off" },
+        if settings.stat_prior_auto { " (auto)" } else { "" },
+        choice.scale
+    ));
+    *last = Some(choice);
+    Some(choice)
 }
 
 fn run(job: Job, warm: Option<&Meta>, calibration: &mut Calibration) -> Done {
@@ -78,14 +112,18 @@ fn run(job: Job, warm: Option<&Meta>, calibration: &mut Calibration) -> Done {
         notes: &job.notes,
         current: &job.current,
         warm,
+        stats: (!job.stats.is_empty()).then_some(job.stats.as_ref()),
     };
     let mut settings = job.settings.clone();
-    let chosen = if settings.lol_prior_auto { calibrate(&inputs, &settings, calibration) } else { None };
-    if let Some(w) = chosen {
-        settings.lol_prior = w;
+    let chosen = calibrate(&inputs, &settings, calibration);
+    if let Some(c) = chosen {
+        settings.lol_prior = c.lol_prior;
+        settings.stat_prior = c.stat_prior;
     }
     let mut meta = meta::build(&inputs, &settings);
-    meta.lol_prior_chosen = chosen.is_some();
+    meta.lol_prior_chosen = chosen.is_some() && job.settings.lol_prior_auto;
+    meta.stat_prior_chosen = chosen.is_some() && job.settings.stat_prior_auto;
+    meta.calibration = chosen.map(|c| c.scale);
     let backtest = if job.backtest {
         meta::backtest(&Inputs { warm: None, ..inputs }, &settings, holdout(job.games.len()))
     } else {
@@ -146,8 +184,9 @@ fn work(receiver: Receiver<Job>, done: Arc<Mutex<Option<Done>>>) {
     let mut warm: Option<Meta> = None;
     let mut calibration: Calibration = None;
     while let Ok(mut job) = receiver.recv() {
-        // only the newest waiting job
-        while let Ok(newer) = receiver.try_recv() {
+        // only the newest waiting job (with a backtest one of the skipped ones asked for)
+        while let Ok(mut newer) = receiver.try_recv() {
+            newer.backtest |= job.backtest;
             job = newer;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(job, warm.as_ref(), &mut calibration)));
@@ -169,6 +208,7 @@ mod tests {
             games: games.into_iter().map(std::sync::Arc::new).collect(),
             names,
             champions: NAMES.iter().map(|s| s.to_string()).collect(),
+            stats: Arc::new(HashMap::new()),
             notes: Vec::new(),
             current: "1.1".into(),
             settings: Settings::default(),
@@ -210,6 +250,8 @@ mod tests {
         inline.submit(j);
         let done = inline.take().unwrap();
         assert!(done.meta.lol_prior_chosen && LOL_PRIOR_CHOICES.contains(&done.meta.lol_prior), "{}", done.meta.lol_prior);
+        let scale = done.meta.calibration.expect("the win chances' scale is checked with it");
+        assert!((0.2..=1.2).contains(&scale), "{scale}");
         // the same matches again: the choice is kept, not worked out again
         let kept = inline.inline_calibration;
         let mut j = job(2);

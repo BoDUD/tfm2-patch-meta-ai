@@ -143,7 +143,7 @@ mod tests {
             }
         }
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
-        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());
+        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None }, &Settings::default());
         let snapshot = Snapshot::new(meta, HashMap::new());
         let team: Vec<u16> = (0..5).collect();
         let mut ui = FakeUi::default();

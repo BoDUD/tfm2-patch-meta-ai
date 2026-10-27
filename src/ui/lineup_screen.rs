@@ -158,7 +158,7 @@ mod tests {
         crate::ui::reset();
         let (names, games) = simulate(1500, "1.1", |_| 0.0, 12);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
-        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());
+        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None }, &Settings::default());
         let snapshot = Snapshot::new(meta, HashMap::new());
         let mut ui = FakeUi::default();
         ui.add("main", "lineup_ui");

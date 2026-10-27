@@ -95,11 +95,15 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
 
 pub fn backtest_line(bt: &Backtest) -> String {
     format!(
-        "model check on the {} newest matches it was not fitted on: favourite won {:.0}%, Brier {:.3} (coin flip {:.3})",
+        "model check on the {} newest matches it was not fitted on: favourite won {:.0}%, Brier {:.3} (coin flip {:.3}), \
+         log-loss {:.3} ({:.3} with the log-odds x{:.2})",
         bt.games,
         bt.accuracy * 100.0,
         bt.brier,
-        bt.coin_brier
+        bt.coin_brier,
+        bt.log_loss,
+        bt.scaled_log_loss,
+        bt.scale
     )
 }
 
@@ -285,7 +289,7 @@ mod tests {
         let (names, games) = simulate(600, "1.1", |n| if n == "c" { 0.5 } else { 0.0 }, 2);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         let tiers: HashMap<String, Tier> = crate::meta::tiers(&meta, 10.0, [10.0, 20.0, 40.0, 20.0]).into_iter().collect();
@@ -294,7 +298,7 @@ mod tests {
         let text = table(&meta, &tiers, &labels, "summary", None);
         let first = text.lines().skip_while(|l| !l.starts_with("champion ")).nth(1).unwrap();
         assert!(first.starts_with("Champion </script> C"), "the strongest first, by display name: {text}");
-        let page = html(&meta, &tiers, &labels, Some(&Backtest { games: 10, accuracy: 0.6, brier: 0.2, log_loss: 0.6, coin_brier: 0.25 }));
+        let page = html(&meta, &tiers, &labels, Some(&Backtest { games: 10, accuracy: 0.6, brier: 0.2, log_loss: 0.6, coin_brier: 0.25, scale: 0.8, scaled_log_loss: 0.59 }));
         assert!(!page.contains("/*DATA*/null"));
         assert_eq!(page.matches("</script>").count(), 1, "names cannot close the script");
         assert!(page.contains("\"team\":\"Mods FC\""));

@@ -266,7 +266,12 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         let ex = &*entry(&host);
         assert_eq!(text(ex.mod_id_ptr, ex.mod_id_len), "patch_meta_ai");
         assert!(!ex.extension.is_null() && !ex.server_ext.is_null());
-        assert_eq!(ex.draft_hooks_len, 1);
+        // the score hook, and the coach override that decides last
+        assert_eq!(ex.draft_hooks_len, 2);
+        let coach = *ex.draft_hooks_ptr.add(1);
+        let cv = &*coach.vtable;
+        assert_eq!((cv.priority.unwrap())(coach.userdata), i32::MAX);
+        assert!(cv.decide_pick.is_some() && cv.decide_ban.is_some());
         let ext = &*ex.extension.vtable;
         let srv = &*ex.server_ext.vtable;
         let hook = *ex.draft_hooks_ptr;
