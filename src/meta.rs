@@ -20,6 +20,10 @@
 //! Besides the fit, the average gold lead at the end of the lane phase of every pair of direct
 //! lane opponents is counted.
 //!
+//! - **stats**: what each of a champion's stats is worth (`stats`): a champion's strength starts
+//!   from its stats, standardised within its category, times weights every champion shares;
+//!   so a champion seen in few games is rated by what champions with stats like its own did.
+//!
 //! Every parameter has a Gaussian prior, around 0 or - for the League champions, times
 //! `lol_prior` - around what League says (`knowledge`: the champion's competitive tier, the
 //! known combos and counters, what each composition gap costs), so anything seen in few games
@@ -28,11 +32,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::glm::{self, logit, sigmoid, Problem, Row};
+use crate::glm::{self, logit, sigmoid, Link, Problem, Row};
 use crate::history::{Game, Names, Role};
 use crate::knowledge::{self, Profile, Sums, COMP_FEATURES};
 use crate::patchnotes::PatchNote;
 use crate::records::compare_versions;
+use crate::stats::{self, Stats, FEATURES};
 
 /// Model settings (from `settings.ini`).
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +68,13 @@ pub struct Settings {
     pub lol_prior_auto: bool,
     /// Prior spread of what a composition gap costs.
     pub comp_sd: f32,
+    /// Champions' strength starts from their stats (`stats`).
+    pub stat_prior: bool,
+    /// Choose `stat_prior` by how well each predicts held-out matches (`worker`).
+    pub stat_prior_auto: bool,
+    /// Prior spread of what one standard deviation of a stat is worth, and of a category.
+    pub stat_sd: f32,
+    pub group_sd: f32,
 }
 
 impl Default for Settings {
@@ -85,6 +97,10 @@ impl Default for Settings {
             lol_prior: 1.0,
             lol_prior_auto: false,
             comp_sd: 0.08,
+            stat_prior: true,
+            stat_prior_auto: false,
+            stat_sd: 0.06,
+            group_sd: 0.1,
         }
     }
 }
@@ -106,6 +122,10 @@ pub enum Key {
     TacticChamp(u16, u16),
     /// A composition gap (`knowledge::COMP_FEATURES`).
     Comp(u8),
+    /// What a standard deviation of a stat is worth (`stats::FEATURES`).
+    StatW(u8),
+    /// A category's offset (`stats::POOL`: champions compared with the whole pool).
+    Group(u8),
 }
 
 /// Ordered pair key and the sign for "a with/against b".
@@ -167,6 +187,8 @@ pub struct Champion {
     /// This patch: share of matches it was picked / banned in.
     pub pick_rate: f32,
     pub ban_rate: f32,
+    /// Where its stats start its strength (log-odds; `None`: stats not used or not known).
+    pub from_stats: Option<f32>,
 }
 
 impl Champion {
@@ -240,6 +262,14 @@ pub struct Meta {
     /// held-out matches.
     pub lol_prior: f32,
     pub lol_prior_chosen: bool,
+    /// What a standard deviation of each stat is worth, whether stats were used, and whether
+    /// that was chosen by the held-out matches.
+    pub stat_weights: [Effect; FEATURES],
+    pub stat_prior: bool,
+    pub stat_prior_chosen: bool,
+    /// How much the model's log-odds are scaled for win chances: below 1 when the held-out
+    /// matches show it too sure of itself (`None`: not checked, 1).
+    pub calibration: Option<f32>,
     /// Fitted parameters, for a warm start next time.
     pub keys: Vec<Key>,
     pub beta: Vec<f32>,
@@ -343,6 +373,8 @@ pub struct Inputs<'a> {
     pub current: &'a str,
     /// The previous fit, for a warm start.
     pub warm: Option<&'a Meta>,
+    /// Every champion's stats (`None`: not known).
+    pub stats: Option<&'a HashMap<String, Stats>>,
 }
 
 struct Registry {
@@ -446,6 +478,10 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         (0..champ_count).map(|c| k.positions.get(names.name(c)).map(|r| knowledge::lane_prior(r))).collect();
     let open_slot = profiles.iter().any(Option::is_some).then(|| knowledge::average(profiles.iter().flatten()));
     let comp_inputs = open_slot.as_ref().map(|avg| (profiles.as_slice(), avg));
+    let features: Vec<Option<(u8, [f32; FEATURES])>> = match inp.stats.filter(|_| set.stat_prior) {
+        Some(s) => stats::features(&names, champ_count, s),
+        None => vec![None; champ_count as usize],
+    };
 
     let mut reg = Registry { keys: Vec::new(), index: HashMap::new() };
     // the previous fit's numbering first, so the warm start lines up
@@ -465,6 +501,14 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     if comp_inputs.is_some() {
         for f in 0..COMP_FEATURES {
             reg.id(Key::Comp(f as u8));
+        }
+    }
+    if features.iter().any(Option::is_some) {
+        for k in 0..FEATURES {
+            reg.id(Key::StatW(k as u8));
+        }
+        for (g, _) in features.iter().flatten() {
+            reg.id(Key::Group(*g));
         }
     }
     // League's known combos and counters: prior means, there whether or not a game had them
@@ -588,7 +632,19 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     for c in 0..champ_count {
         let name = names.name(c).to_string();
         let tier = profiles[c as usize].as_ref().map_or(0.0, |p| knowledge::tier_prior(p.tier));
-        problem.prior(reg.id(Key::Champ(c, 0)), tier * set.lol_prior, set.first_sd);
+        let first = reg.id(Key::Champ(c, 0));
+        match &features[c as usize] {
+            // strength - what its stats say ~ N(tier, first_sd)
+            Some((group, z)) => {
+                let mut terms = vec![(first, 1.0)];
+                for (k, v) in z.iter().enumerate().filter(|(_, v)| **v != 0.0) {
+                    terms.push((reg.id(Key::StatW(k as u8)), -v));
+                }
+                terms.push((reg.id(Key::Group(*group)), -1.0));
+                problem.links.push(Link { precision: 1.0 / (set.first_sd * set.first_sd), target: tier * set.lol_prior, terms });
+            }
+            None => problem.prior(first, tier * set.lol_prior, set.first_sd),
+        }
         for v in 1..versions.len() as u16 {
             let note = inp.notes.iter().rev().find(|n| n.is_for(&versions[v as usize]));
             let dir = note.map_or(0, |n| n.direction(&name));
@@ -614,6 +670,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         }
         let sd = match key {
             Key::Side | Key::Champ(..) | Key::Comp(_) => continue,
+            Key::StatW(_) => set.stat_sd,
+            Key::Group(_) => set.group_sd,
             Key::Role(..) => set.role_sd,
             Key::Athlete(_) => set.athlete_sd,
             Key::Mastery(..) => set.mastery_sd,
@@ -680,6 +738,9 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             patch_dir: note.map_or(0, |n| n.direction(&name)),
             pick_rate: per_match(picks.get(&c).copied().unwrap_or(0)),
             ban_rate: per_match(bans.get(&c).copied().unwrap_or(0)),
+            from_stats: features[c as usize].as_ref().map(|(g, z)| {
+                z.iter().enumerate().map(|(k, v)| v * effect(Key::StatW(k as u8)).value).sum::<f32>() + effect(Key::Group(*g)).value
+            }),
             name,
         });
     }
@@ -724,12 +785,16 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::Comp(f) => {
                 out.comp[f as usize] = effect(*key);
             }
+            Key::StatW(k) => {
+                out.stat_weights[k as usize] = effect(*key);
+            }
             _ => {}
         }
     }
     out.lane_gold = lane_gold;
     out.profiles = profiles;
     out.lol_prior = set.lol_prior;
+    out.stat_prior = features.iter().any(Option::is_some);
     out.lane_priors = lane_priors;
     out.open_slot = open_slot;
     out.athlete_lanes = athlete_lanes;
@@ -750,6 +815,25 @@ pub struct Backtest {
     pub log_loss: f32,
     /// Brier score of always saying 50%.
     pub coin_brier: f32,
+    /// The scale on the model's log-odds that predicts these games best (below 1: the model is
+    /// too sure of itself), and the log-loss with it.
+    pub scale: f32,
+    pub scaled_log_loss: f32,
+}
+
+/// The scale on the log-odds (0.2 to 1.2) with the least log-loss over (log-odds, blue won).
+pub fn best_scale(predictions: &[(f32, bool)]) -> (f32, f32) {
+    let loss = |s: f32| -> f32 {
+        let total: f32 = predictions
+            .iter()
+            .map(|(eta, won)| {
+                let p = sigmoid(s * eta);
+                -(if *won { p } else { 1.0 - p }).max(1e-4).ln()
+            })
+            .sum();
+        total / predictions.len().max(1) as f32
+    };
+    (4..=24).map(|i| i as f32 * 0.05).map(|s| (s, loss(s))).fold((1.0, f32::INFINITY), |a, b| if b.1 < a.1 { b } else { a })
 }
 
 pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Backtest> {
@@ -763,7 +847,7 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
     let test = &comp[split..];
     let newest_train = train.iter().map(|g| g.version.clone()).max_by(|a, b| compare_versions(a, b))?;
     let fitted = build(
-        &Inputs { games: &train, names: inp.names, champions: inp.champions, notes: inp.notes, current: &newest_train, warm: None },
+        &Inputs { games: &train, current: &newest_train, warm: None, ..*inp },
         set,
     );
     let mut bt = Backtest::default();
@@ -772,6 +856,7 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
     let version_index: HashMap<&str, u16> =
         fitted.versions.iter().enumerate().map(|(i, v)| (v.as_str(), i as u16)).collect();
     let newest = (fitted.versions.len() - 1) as u16;
+    let mut predictions = Vec::with_capacity(test.len());
     for game in test {
         terms.clear();
         // a patch the training games never saw is rated as the newest one they did
@@ -780,6 +865,7 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
         let row: Vec<(u32, f32)> =
             terms.iter().filter_map(|(k, a)| index.get(k).map(|i| (*i, *a))).collect();
         let p = glm::predict(&row, &fitted.beta);
+        predictions.push((logit(p), game.blue_win));
         let y = if game.blue_win { 1.0 } else { 0.0 };
         bt.games += 1;
         bt.accuracy += ((p >= 0.5) == game.blue_win) as u32 as f32;
@@ -792,6 +878,7 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
     bt.brier /= n;
     bt.log_loss /= n;
     bt.coin_brier /= n;
+    (bt.scale, bt.scaled_log_loss) = best_scale(&predictions);
     Some(bt)
 }
 
@@ -886,7 +973,7 @@ pub(crate) mod tests {
         let (names, games) = simulate(3000, "1.1", strength, 11);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         let wr = |n: &str| meta.champion(n).unwrap().win_rate();
@@ -922,7 +1009,7 @@ pub(crate) mod tests {
             changes: [("c".to_string(), -2)].into_iter().collect(),
         };
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[note], current: "1.2", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[note], current: "1.2", warm: None, stats: None },
             &Settings::default(),
         );
         let c = meta.champion("c").unwrap();
@@ -939,7 +1026,7 @@ pub(crate) mod tests {
         assert!(c.current.games + l.current.games > 0);
         // warm start reuses the fit
         let again = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.2", warm: Some(&meta) },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.2", warm: Some(&meta), stats: None },
             &Settings::default(),
         );
         assert!(again.sweeps < meta.sweeps, "{} vs {}", again.sweeps, meta.sweeps);
@@ -950,7 +1037,7 @@ pub(crate) mod tests {
         let (names, games) = simulate(2500, "1.1", strength, 21);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let bt = backtest(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
             500,
         )
@@ -982,7 +1069,7 @@ pub(crate) mod tests {
         }
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         let (g, b) = (meta.tactics[&good].value, meta.tactics[&bad].value);
@@ -1039,7 +1126,7 @@ pub(crate) mod tests {
             });
         }
         let started = std::time::Instant::now();
-        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.11", warm: None };
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.11", warm: None, stats: None };
         let meta = build(&inp, &Settings::default());
         let cold = started.elapsed();
         let mut more = games.clone();
@@ -1072,5 +1159,42 @@ pub(crate) mod tests {
         let games = [g("1.9"), g("1.10"), g("1.8"), g("2.0")];
         assert_eq!(kept_versions(&games, "1.10", 2), ["1.9", "1.10"]);
         assert_eq!(kept_versions(&games, "1.11", 3), ["1.9", "1.10", "1.11"]);
+    }
+
+    #[test]
+    fn stats_rate_champions_never_seen() {
+        // strength rises with attack; "m" has the most attack and no games
+        let attack = |n: &str| NAMES.iter().position(|x| *x == n).map_or(170.0, |i| 50.0 + 10.0 * i as f32);
+        let (names, games) = simulate(3000, "1.1", |n| (attack(n) - 105.0) / 120.0, 21);
+        let mut champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        champions.push("m".into());
+        let stats: HashMap<String, Stats> = champions
+            .iter()
+            .map(|n| (n.clone(), Stats { category: Some(0), base: [attack(n), 0.0, 900.0, 20.0, 20.0, 900.0], growth: [0.0; 6] }))
+            .collect();
+        let set = Settings { stat_sd: 0.3, ..Settings::default() };
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: Some(&stats) };
+        let with = build(&inp, &set);
+        assert!(with.stat_prior && with.stat_weights[0].value > 0.05, "{:?}", with.stat_weights[0]);
+        let m = with.champion("m").unwrap();
+        assert_eq!(m.current.games, 0);
+        assert!(m.strength > 0.1 && m.from_stats.unwrap() > 0.1, "{m:?}");
+        // without stats a champion never seen is average
+        let without = build(&Inputs { stats: None, ..inp }, &set);
+        assert!(!without.stat_prior && without.champion("m").unwrap().strength.abs() < 1e-3);
+        let off = build(&inp, &Settings { stat_prior: false, ..set });
+        assert!(!off.stat_prior && off.champion("m").unwrap().from_stats.is_none());
+    }
+
+    #[test]
+    fn the_scale_that_fits_held_out_games() {
+        // sure of 88% where 60% came true: scaled well down
+        let sure: Vec<(f32, bool)> = (0..10).map(|i| (2.0, i < 6)).collect();
+        let (s, loss) = best_scale(&sure);
+        assert!(s <= 0.3, "{s}");
+        assert!(loss < 0.68);
+        // right as it is: kept
+        let right: Vec<(f32, bool)> = (0..10).map(|i| (logit(0.8), i < 8)).collect();
+        assert!((best_scale(&right).0 - 1.0).abs() <= 0.1);
     }
 }

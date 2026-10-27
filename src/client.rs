@@ -43,6 +43,10 @@ pub trait Game: Source {
     fn champion_damage(&mut self, _name: &str) -> Option<Damage> {
         None
     }
+    /// The champion's category and stat block.
+    fn champion_stats(&mut self, _name: &str) -> Option<crate::stats::Stats> {
+        None
+    }
     /// The champion's display name.
     fn champion_label(&mut self, _name: &str) -> Option<String> {
         None
@@ -111,6 +115,11 @@ impl Game for ClientGame<'_, '_> {
             (false, true) => Damage::Magic,
             _ => Damage::Mixed,
         })
+    }
+    fn champion_stats(&mut self, name: &str) -> Option<crate::stats::Stats> {
+        let brief = self.ctx.champion_brief(name)?;
+        let category = brief.category.map(|c| c.code() as u8);
+        Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth))
     }
     fn champion_label(&mut self, name: &str) -> Option<String> {
         let key = format!("#asset/base/text/champion?description.{name}.name");
@@ -204,6 +213,8 @@ struct State {
     backtest_done: bool,
     labels: Labels,
     damage: HashMap<u16, Damage>,
+    /// Every champion's stats (read with the champion list).
+    stats: Arc<HashMap<String, crate::stats::Stats>>,
     champions: Vec<String>,
     /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
     /// the file is this save's; whether that was settled; when the file was last written and
@@ -252,6 +263,7 @@ impl State {
             backtest_done: false,
             labels: Labels::default(),
             damage: HashMap::new(),
+            stats: Arc::new(HashMap::new()),
             champions: Vec::new(),
             cache_pending: None,
             cache_checked: false,
@@ -788,16 +800,22 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
             champions.sort();
             champions.dedup();
         }
+        let mut stats = HashMap::new();
         for name in &champions {
             let id = st.names.id(name);
             if let Some(d) = game.champion_damage(name) {
                 st.damage.insert(id, d);
+            }
+            if let Some(s) = game.champion_stats(name) {
+                stats.insert(name.clone(), s);
             }
             if let Some(label) = game.champion_label(name) {
                 st.labels.champions.insert(name.clone(), label);
             }
         }
         st.labels.team_name = game.team_name(team).unwrap_or_default();
+        diag::log(&format!("[probe] stats read for {} of {} champions", stats.len(), champions.len()));
+        st.stats = Arc::new(stats);
         st.champions = champions;
     }
     let unknown: Vec<&str> = (0..st.names.len() as u16)
@@ -890,6 +908,7 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         games,
         names: st.names.clone(),
         champions: st.champions.clone(),
+        stats: st.stats.clone(),
         notes: st.notes.clone(),
         current,
         settings: cfg.model(),

@@ -35,6 +35,14 @@
 //! `diag.log` gets the first decisions of a game session (`[draft]` lines): the line-ups the
 //! game handed over, and for the best candidates their value, the players' part of it and what
 //! was added to the game's score.
+//!
+//! **Coach override** ([`CoachHook`], `coach=on`): when the game's coach drafts for the player's
+//! own team, a score nudge is not enough - another mod that decides the team's bans and picks
+//! outright (Hell Draft AI with its `ally_draft_ai` on) wins over any score. So for the player's
+//! team the coach hook decides outright too: the draft screen's own ranking when it was drawn
+//! for this very draft (the panel's 禁 1 / 选, lookahead and position locks included,
+//! `shared::CoachPlan`), else the best by the model's values among the champions that fit an
+//! open lane. It runs at the highest priority, so of several deciding hooks it is the last.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -72,6 +80,119 @@ impl StableDraftHook for MetaDraftHook {
     fn score_pick(&self, ctx: &StableDraftContext<'_>, candidate: usize, _base: f32) -> StableDraftDecision {
         score(ctx, candidate, false)
     }
+}
+
+/// The coach override: decides the player's own team's bans and picks outright (see the module
+/// notes). A hook of its own, apart from [`MetaDraftHook`], so its priority can be the highest
+/// while the score hook stays below the position lock's.
+pub struct CoachHook;
+
+/// Of several hooks that decide, the last one wins: this one goes last.
+pub const COACH_PRIORITY: i32 = i32::MAX;
+
+impl StableDraftHook for CoachHook {
+    fn id(&self) -> String {
+        format!("{}:coach", crate::MOD_ID)
+    }
+
+    fn priority(&self) -> i32 {
+        COACH_PRIORITY
+    }
+
+    fn decide_ban(&self, ctx: &StableDraftContext<'_>) -> Option<usize> {
+        coach_decide(ctx, true)
+    }
+
+    fn decide_pick(&self, ctx: &StableDraftContext<'_>) -> Option<usize> {
+        coach_decide(ctx, false)
+    }
+}
+
+/// Where a coach decision came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoachSource {
+    /// The draft screen's ranking for this draft.
+    Panel,
+    /// The model's values, worked out in the hook.
+    Model,
+}
+
+/// The coach override's choice for the player's own team (the game's id), `None` for every
+/// other team, with `coach=off`, before the first fit, or with nothing on offer.
+pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
+    let cfg = config::get();
+    if !cfg.coach || ctx.ally_team().is_none() || ctx.ally_team() != shared::player_team() {
+        return None;
+    }
+    let snapshot = shared::get()?;
+    let model_id = |g: usize| ctx.champion_name(g).and_then(|n| snapshot.meta.names.get(n));
+    let ids = |list: &[usize]| -> Vec<u16> { list.iter().filter_map(|g| model_id(*g)).collect() };
+    let available: Vec<(usize, u16)> =
+        ctx.available_champions().iter().filter_map(|g| Some((*g, model_id(*g)?))).collect();
+    if available.is_empty() {
+        return None;
+    }
+    let (ally, enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
+    let bans = ctx.ally_bans().len() + ctx.enemy_bans().len();
+    let lineups = if cfg.player_mastery > 0.0 {
+        Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes())
+    } else {
+        Lineups::default()
+    };
+    let (champ, source) = coach_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, cfg.player_mastery)?;
+    let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
+    shared::note_coach_choice(ban, champ);
+    diag::log_once("coach-decides", "[coach] the coach override decides the player's team's bans and picks (coach=on)");
+    diag::log(&format!(
+        "[coach] {} {} {}: {} ({})",
+        team(&snapshot, ctx.ally_team()),
+        if ban { "ban" } else { "pick" },
+        if ban { ctx.ally_bans().len() } else { ctx.ally_picks().len() } + 1,
+        snapshot.meta.names.name(champ),
+        match source {
+            CoachSource::Panel => "as on the panel",
+            CoachSource::Model => "the model's best",
+        }
+    ));
+    Some(game_id)
+}
+
+/// The coach's choice among `available` (game id, model id): the panel's ranking when it was
+/// drawn for this draft (sorted picks, ban count and phase alike), else the model's best value -
+/// for a pick among the champions that fit a lane the team still has open and that no position
+/// lock holds.
+#[allow(clippy::too_many_arguments)]
+pub fn coach_choice(
+    snapshot: &Snapshot,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    player_weight: f32,
+) -> Option<(u16, CoachSource)> {
+    let on_offer = |c: u16| available.iter().any(|(_, m)| *m == c);
+    let plan = shared::coach_plan();
+    let (mut a, mut e) = (ally.to_vec(), enemy.to_vec());
+    a.sort_unstable();
+    e.sort_unstable();
+    if let Some(p) = plan.as_ref().filter(|p| p.ban == ban && p.bans == bans && p.ally == a && p.enemy == e) {
+        if let Some(c) = p.ranked.iter().copied().find(|c| on_offer(*c)) {
+            return Some((c, CoachSource::Panel));
+        }
+    }
+    let held: &[u16] = plan.as_ref().map_or(&[], |p| p.held.as_slice());
+    let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
+    let draft = Draft { ally, enemy, offer: &offer, lineups };
+    let open = advisor::open_lanes(&snapshot.meta, ally);
+    offer
+        .iter()
+        .copied()
+        .filter(|c| ban || (!held.contains(c) && advisor::fits_lanes(&snapshot.meta, *c, &open)))
+        .map(|c| (c, value_with(snapshot, c, &draft, ban, player_weight).total))
+        .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(c, _)| (c, CoachSource::Model))
 }
 
 /// A team's fielded players and the lane each plays (`None`: not known).
@@ -575,7 +696,7 @@ mod tests {
         let (names, games) = simulate(2000, "1.1", |n| if n == "c" { 0.4 } else { 0.0 }, 5);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         );
         Snapshot::new(meta, HashMap::new())
@@ -749,5 +870,86 @@ mod tests {
         assert_eq!(log2.matches("line-ups on screen").count(), 1);
         crate::reset_for_tests();
         shared::clear();
+    }
+
+    #[test]
+    fn the_coach_follows_the_panel_else_the_model() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let s = snapshot();
+        let id = |n: &str| s.meta.names.get(n).unwrap();
+        let available: Vec<(usize, u16)> = (0..12u16).map(|c| (c as usize + 100, c)).collect();
+        let none = Lineups::default();
+        // no plan: the model's best pick, c
+        shared::set_coach_plan(None);
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, 0.5), Some((id("c"), CoachSource::Model)));
+        // the panel's ranking for this very draft (picks in any order)
+        let plan = shared::CoachPlan {
+            ally: vec![],
+            enemy: vec![],
+            bans: 6,
+            ban: false,
+            ranked: vec![id("e"), id("f")],
+            held: vec![id("c")],
+        };
+        shared::set_coach_plan(Some(plan.clone()));
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, 0.5), Some((id("e"), CoachSource::Panel)));
+        // its first choice taken meanwhile: the next one
+        let fewer: Vec<(usize, u16)> = available.iter().copied().filter(|(_, c)| *c != id("e")).collect();
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &fewer, &none, 0.5), Some((id("f"), CoachSource::Panel)));
+        // a plan for another moment of the draft: the model, never a card a position lock holds
+        let (choice, source) = coach_choice(&s, &[], &[], 7, false, &available, &none, 0.5).unwrap();
+        assert_eq!(source, CoachSource::Model);
+        assert_ne!(choice, id("c"), "held by the position lock");
+        // bans: the panel's when it was drawn for a ban, the model's else
+        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, 0.5).map(|c| c.1), Some(CoachSource::Model));
+        shared::set_coach_plan(Some(shared::CoachPlan { ban: true, ranked: vec![id("k")], ..plan }));
+        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, 0.5), Some((id("k"), CoachSource::Panel)));
+        shared::set_coach_plan(None);
+    }
+
+    /// The coach override through the hook: the player's team only, and its choice is noted.
+    #[test]
+    fn the_coach_decides_for_the_player_only() {
+        use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
+        let briefs: Vec<ChampionBriefV1> =
+            names.iter().map(|n| ChampionBriefV1 { name: StrV1::from_str(n), ..Default::default() }).collect();
+        let available: Vec<usize> = (0..names.len()).collect();
+        let ctx_for = |team: usize| {
+            // SAFETY: a plain C struct; every pointer set below outlives the calls
+            let mut raw: DraftCtxV1 = unsafe { std::mem::zeroed() };
+            raw.size = std::mem::size_of::<DraftCtxV1>();
+            raw.phase = DraftPhaseV1::Pick.code();
+            raw.available_ptr = available.as_ptr();
+            raw.available_len = available.len();
+            raw.champion_briefs_ptr = briefs.as_ptr();
+            raw.champion_briefs_len = briefs.len();
+            raw.ally_team = team;
+            raw.enemy_team = 60;
+            raw
+        };
+        let decide = |raw: &DraftCtxV1| {
+            // SAFETY: `raw` lives for the call
+            let ctx = unsafe { StableDraftContext::from_raw(raw) }.unwrap();
+            CoachHook.decide_pick(&ctx)
+        };
+        let ours = ctx_for(19);
+        assert_eq!(decide(&ours), None, "no model yet");
+        let s = snapshot();
+        let c = s.meta.names.get("c").unwrap();
+        shared::publish(s);
+        assert_eq!(decide(&ours), None, "no save open: no player team");
+        shared::set_player_team(Some(19));
+        shared::take_coach_choices();
+        assert_eq!(decide(&ours), Some(c as usize));
+        assert_eq!(decide(&ctx_for(12)), None, "another team");
+        assert_eq!(shared::take_coach_choices(), vec![(false, c)]);
+        assert_eq!(CoachHook.priority(), i32::MAX);
+        shared::set_player_team(None);
+        shared::clear();
+        crate::reset_for_tests();
     }
 }

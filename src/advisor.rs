@@ -194,6 +194,15 @@ pub fn lane_probabilities(meta: &Meta, picks: &[u16]) -> Vec<[f32; 5]> {
     out
 }
 
+/// Whether `champ` is a real option in one of `open` (not off-role there; a champion whose lanes
+/// are not known fits anywhere).
+pub fn fits_lanes(meta: &Meta, champ: u16, open: &[Role]) -> bool {
+    match lane_shares(meta, champ) {
+        Some(shares) => open.iter().any(|r| shares[r.index()] >= OFF_ROLE_SHARE),
+        None => true,
+    }
+}
+
 /// A champion's strength in a lane (log-odds), with the off-role cost.
 pub fn strength_in(meta: &Meta, champ: u16, role: Role) -> f32 {
     let Some(c) = meta.by_id(champ) else { return 0.0 };
@@ -214,7 +223,8 @@ pub fn team_strength(meta: &Meta, picks: &[u16]) -> f32 {
     total + meta.comp_score(picks).0
 }
 
-/// Probability that `ally` beats `enemy` (picks so far; missing picks count as average).
+/// Probability that `ally` beats `enemy` (picks so far; missing picks count as average), as
+/// sure of itself as the held-out matches allow (`Meta::calibration`).
 pub fn win_probability(meta: &Meta, ally: &[u16], enemy: &[u16]) -> f32 {
     let mut eta = team_strength(meta, ally) - team_strength(meta, enemy);
     for a in ally {
@@ -222,7 +232,7 @@ pub fn win_probability(meta: &Meta, ally: &[u16], enemy: &[u16]) -> f32 {
             eta += meta.counter(*a, *e).value;
         }
     }
-    crate::glm::sigmoid(eta)
+    crate::glm::sigmoid(eta * meta.calibration.unwrap_or(1.0))
 }
 
 /// What a candidate pick is worth and why (log-odds).
@@ -481,17 +491,38 @@ pub struct Team<'a> {
     pub players: &'a Roster,
     /// Share of its recent matches it played each champion in (scouting); `None`: not known.
     pub habits: Option<&'a HashMap<u16, f32>>,
+    /// Hell Draft AI drafts for this team: how much likelier it takes each champion than our
+    /// values say (log-odds, `hell::lean`). Its bans follow its ratings, not a ban board.
+    pub lean: Option<&'a HashMap<u16, f32>>,
 }
 
 impl<'a> Team<'a> {
     pub fn new(picks: &'a [u16], players: &'a Roster) -> Self {
-        Team { picks, players, habits: None }
+        Team { picks, players, habits: None, lean: None }
     }
 
     /// How much likelier the team is to take `champ` because it plays it a lot (log-odds).
     pub fn habit(&self, champ: u16) -> f32 {
         let share = self.habits.and_then(|h| h.get(&champ)).copied().unwrap_or(0.0);
-        HABIT_WEIGHT * (1.0 + HABIT_SCALE * share.clamp(0.0, 1.0)).ln()
+        let lean = self.lean.and_then(|l| l.get(&champ)).copied().unwrap_or(0.0);
+        HABIT_WEIGHT * (1.0 + HABIT_SCALE * share.clamp(0.0, 1.0)).ln() + lean
+    }
+
+    /// How Hell Draft AI rates a champion for its bans when it drafts for this team: its
+    /// strength in its best lane and the lean (`None` when it does not draft for the team).
+    pub fn hell_rating(&self, meta: &Meta, champ: u16) -> Option<f32> {
+        let lean = self.lean?;
+        let best = Role::ALL.iter().map(|r| strength_in(meta, champ, *r)).fold(f32::NEG_INFINITY, f32::max);
+        Some(best + lean.get(&champ).copied().unwrap_or(0.0))
+    }
+
+    /// What Hell Draft AI bans for this team next: the best on offer by [`Team::hell_rating`].
+    pub fn hell_ban(&self, meta: &Meta, offer: &[u16]) -> Option<u16> {
+        offer
+            .iter()
+            .filter_map(|c| Some((*c, self.hell_rating(meta, *c)?)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(c, _)| c)
     }
 }
 
@@ -723,7 +754,7 @@ pub fn lookahead_pool(meta: &Meta, offer: &[u16], n: usize) -> Vec<u16> {
 
 /// Plays out the rest of a 3+2 draft from step `at` of [`ORDER_3_2`], where `first` is the
 /// acting side's choice; afterwards each side bans the top of its ban board and picks its best
-/// pick from `pool`. Returns the blue side's win chance with the line-ups it ends in.
+/// pick from `pool` - a side Hell Draft AI drafts for its way ([`Team::lean`]). Returns the blue side's win chance with the line-ups it ends in.
 pub fn simulate(
     meta: &Meta,
     blue: Team<'_>,
@@ -741,6 +772,8 @@ pub fn simulate(
         let (own_team, other_team) = if s.blue { (blue, red) } else { (red, blue) };
         let choice = if i == at {
             Some(first)
+        } else if s.ban && own_team.lean.is_some() {
+            own_team.hell_ban(meta, &offer)
         } else if s.ban {
             let us = Team { picks: own, ..own_team };
             let them = Team { picks: other, ..other_team };
@@ -778,7 +811,7 @@ mod tests {
         }, 11);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
             &Settings::default(),
         )
     }
@@ -891,7 +924,7 @@ mod tests {
                 Game { record: id, solo: false, version: "1.1".into(), blue_win: rng.next() < 0.5, teams: [None, None], sides, bans: [vec![], vec![]], length: None, tactics: Default::default() }
             })
             .collect();
-        let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None }, &Settings::default());
+        let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None }, &Settings::default());
         let (ally, enemy) = ([3u16, 40, 77], [10u16, 55]);
         let none = |_: u16| None;
         let started = std::time::Instant::now();
@@ -995,5 +1028,22 @@ mod tests {
         assert_eq!(balance_cost(4, &[0, 1, 2], &damage), ONE_SIDED_COST);
         assert_eq!(balance_cost(7, &[0, 1, 2], &damage), 0.0);
         assert_eq!(balance_cost(4, &[0, 1], &|_| None), 0.0);
+    }
+
+    #[test]
+    fn hell_bans_what_it_rates() {
+        let m = meta();
+        let id = |n: &str| m.names.get(n).unwrap();
+        let offer: Vec<u16> = (0..12).collect();
+        let plain = Team::new(&[], &[]);
+        assert_eq!(plain.hell_ban(&m, &offer), None, "not drafted by Hell Draft AI");
+        // c is the strongest; a lean on l outweighs it
+        let mut lean = HashMap::new();
+        let hell = Team { lean: Some(&lean), ..plain };
+        assert_eq!(hell.hell_ban(&m, &offer), Some(id("c")));
+        lean.insert(id("l"), 2.0);
+        let hell = Team { lean: Some(&lean), ..plain };
+        assert_eq!(hell.hell_ban(&m, &offer), Some(id("l")));
+        assert!(hell.habit(id("l")) >= 2.0, "its picks lean the same way");
     }
 }

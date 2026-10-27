@@ -35,9 +35,10 @@ const POSITION_LOCKS: [(&str, &str); 2] =
 
 /// Mods that drive the AI's bans and picks. Matched as a substring: the Terminator's mod id
 /// is not published.
-const DRAFT_DRIVERS: [(&str, &str); 2] = [
+const DRAFT_DRIVERS: [(&str, &str); 3] = [
     ("terminator", "Bows' Terminator Draft AI"),
     ("draft_winrate_penalty", "Win-Rate Ban/Pick AI + Champion Tiers"),
+    (crate::hell::MOD_ID, "Hell Draft AI"),
 ];
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -81,6 +82,11 @@ impl Others {
         self.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == "drafters_toolkit"))
     }
 
+    /// JIN's Hell Draft AI is enabled (`hell`).
+    pub fn hell(&self) -> bool {
+        self.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == crate::hell::MOD_ID))
+    }
+
     /// An enabled mod that locks champions to positions.
     pub fn position_lock(&self) -> Option<&'static str> {
         self.find(&POSITION_LOCKS, false)
@@ -118,6 +124,16 @@ pub fn load() {
     }
     if let Some(name) = others.draft_driver() {
         diag::log(&format!("\"{name}\" also drives the AI's bans and picks: ban_pick=auto leaves it to that mod"));
+    }
+    if others.hell() {
+        match crate::hell::dir().as_deref().and_then(crate::hell::read) {
+            Some(h) if h.ally => diag::log(
+                "\"Hell Draft AI\" also drafts for the player's coach (its ally_draft_ai=on): with coach=on this mod \
+                 decides last; if the review says the coach override was overridden, turn its own-side AI off (F7)",
+            ),
+            Some(_) => diag::log("\"Hell Draft AI\" drafts for the AI teams: the advice expects its bans and picks"),
+            None => diag::log("\"Hell Draft AI\" is enabled but its settings were not found: both sides assumed"),
+        }
     }
     if let Some(name) = others.position_lock() {
         diag::log(&format!("\"{name}\" locks positions: its locks hold the AI's picks, and the advice skips cards it locked"));
@@ -158,6 +174,9 @@ mod tests {
         assert!(o.tier_writer().is_none() && o.draft_driver().is_none());
         let o = Others::from_mods_json(r#"{"enabled_mods":["smart_position_lock"]}"#);
         assert_eq!(o.position_lock(), Some("Smart Position Lock"));
+
+        let o = Others::from_mods_json(r#"{"enabled_mods":["patch_meta_ai","hell_draft_ai"]}"#);
+        assert!(o.hell() && o.draft_driver() == Some("Hell Draft AI"));
 
         let o = Others::from_mods_json(r#"{"enabled_mods":["draft_winrate_penalty"]}"#);
         assert!(o.tier_writer().is_some() && o.draft_driver().is_some());

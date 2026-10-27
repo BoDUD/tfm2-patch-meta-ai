@@ -68,6 +68,10 @@ pub struct Config {
     pub lol_prior: f32,
     /// ... or chosen by the save's own matches (`auto`, the default).
     pub lol_prior_auto: bool,
+    /// Champions' strength starts from their stats (`stats`)...
+    pub stat_prior: bool,
+    /// ... or the save's own matches decide (`auto`, the default).
+    pub stat_prior_auto: bool,
     /// Champion ids reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
     /// Prior spreads (log-odds) of the lane, player, mastery and pair effects: how far the data
@@ -124,6 +128,8 @@ impl Default for Config {
             solo_weight: 0.5,
             lol_prior: 1.0,
             lol_prior_auto: true,
+            stat_prior: true,
+            stat_prior_auto: true,
             reworked: Vec::new(),
             roles: 0.3,
             players: 0.35,
@@ -170,6 +176,8 @@ impl Config {
             solo_weight: self.solo_weight,
             lol_prior: self.lol_prior,
             lol_prior_auto: self.lol_prior_auto,
+            stat_prior: self.stat_prior,
+            stat_prior_auto: self.stat_prior_auto,
             ..crate::meta::Settings::default()
         }
     }
@@ -251,6 +259,14 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "lol_prior" => {
             cfg.lol_prior = number(value)?;
             cfg.lol_prior_auto = false;
+        }
+        "stats" if value.trim().eq_ignore_ascii_case("auto") => {
+            cfg.stat_prior = true;
+            cfg.stat_prior_auto = true;
+        }
+        "stats" => {
+            cfg.stat_prior = flag(value)?;
+            cfg.stat_prior_auto = false;
         }
         "roles" => cfg.roles = number(value)?,
         "players" => cfg.players = number(value)?,
@@ -435,7 +451,7 @@ fn reload(path: &PathBuf) {
 pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
-         lol_prior={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
+         lol_prior={} stats={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
@@ -446,6 +462,11 @@ pub fn summary(c: &Config) -> String {
         c.patch_shift,
         c.solo_weight,
         if c.lol_prior_auto { "auto".to_string() } else { c.lol_prior.to_string() },
+        match (c.stat_prior_auto, c.stat_prior) {
+            (true, _) => "auto",
+            (false, true) => "on",
+            (false, false) => "off",
+        },
         c.reworked.join(","),
         c.roles,
         c.players,
@@ -488,10 +509,10 @@ pub const TEMPLATE: &str = r#"; ================================================
 ;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关
 ban_pick=auto
 ; coach : when you let the game's coach draft for you (coach delegation), your team bans and
-;         picks the way the advice says (at twice the AI's strength), even with ban_pick=off.
-;         Other teams are not touched by this switch.
-; coach : 选人时交给游戏的教练托管时，你自己的队伍按本 Mod 的建议禁用和选人（力度是 AI 的两倍），
-;         即使 ban_pick=off 也生效；不影响其他队伍。
+;         picks exactly what the panel advises - it decides last, over other draft mods - even
+;         with ban_pick=off. Other teams are not touched by this switch.
+; coach : 选人时交给游戏的教练托管时，你自己的队伍完全照面板的建议禁用和选人（最后决定，别的 BP Mod
+;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。
 coach=on
 tier_list=auto
 
@@ -527,6 +548,13 @@ solo_weight=0.5
 ; 双伤害类型 / 控制 / 输出 / 保护C位时的损失。存档里的比赛会修正这些。0 = 一律从"平均"出发，
 ; 1 = 按内置，最大 3。auto = 用存档里最新的比赛检验 0 / 0.5 / 1 / 2 哪个最准，自动选（比赛够多之前按 1）。
 lol_prior=auto
+; Champions start from their stats (attack, magic power, health, armour, magic resistance, move
+; speed and their growth, compared within their category): the model learns from the matches
+; what each stat is worth, so a champion seen in few games is rated by what champions with
+; similar stats did. auto = on when that predicts the save's newest matches better; on / off.
+; 英雄从自己的属性出发（攻击、法强、生命、护甲、魔抗、移速及其成长，和同类英雄比）：模型从比赛里学
+; 每项属性值多少胜率，比赛少的英雄按属性相近的英雄的表现估计。auto = 用最新的比赛检验开 / 关哪个更准；on / off。
+stats=auto
 ; champion ids reworked this patch (history barely counts), comma separated
 ; 本版本重做的英雄 id（历史数据几乎不计），逗号分隔，例如 reworked=fighter, demon
 reworked=

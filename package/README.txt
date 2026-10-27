@@ -1,5 +1,5 @@
 ﻿======================================================================
- Patch Meta AI 2.4.0 —— 智能 BP 教练 + 自动梯队
+ Patch Meta AI 2.5.0 —— 智能 BP 教练 + 自动梯队
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -67,8 +67,15 @@
   · 用了 Smart Position Lock（智能位置锁定）时，被锁住的英雄不会出现在推荐里。
 
 ■ 教练托管
-  BP 时点游戏的"教练托管"，你自己的队伍会按这个 Mod 的建议来禁和选。
-  不影响其他队伍。不想要就在 settings.ini 里写 coach=off。
+  BP 时点游戏的"教练托管"，你自己的队伍会完全照右下角面板的建议来禁和选
+  （禁 1 / 选 那一行，推演和位置锁都算在内）。不影响其他队伍。
+  不想要就在 settings.ini 里写 coach=off。
+  F8 的 BP 复盘和 diag.log 的 [review] 行会写"教练托管决定了几手、实际照做了几手"；
+  如果实际照做的少，说明别的 Mod 盖掉了它（见下面"地狱人机"）。
+
+■ 胜率
+  显示的胜率按"没参与拟合的最新比赛"校准过：模型以前偏自信，现在会往 50% 收一收，
+  F8 模型页写着校准系数。
 
 ----------------------------------------------------------------------
 【其他界面】
@@ -84,7 +91,8 @@
   1. 梯队榜
   2. 对手侦察：下一个对手每名选手的拿手英雄、对方常用英雄、建议禁用
   3. 我的选手：每名选手当前最好的英雄
-  4. 模型：比赛数、准确度检验、英雄联盟经验的权重、各种阵容缺口值多少胜率
+  4. 模型：比赛数、准确度检验、英雄联盟经验的权重、属性先验（哪几项属性最值钱）、
+     胜率校准系数、各种阵容缺口值多少胜率
   5. BP 复盘：上一次 BP 的每一手 —— 哪一方、选还是禁、当时对我方的价值、
      当时的建议、之后的胜率，以及你照建议走了几手
 
@@ -101,6 +109,8 @@
   [model]
   lol_prior=auto     英雄联盟经验的分量：auto = 存档比赛够多后（约 150 场大会比赛）
                      自动检验 0 / 0.5 / 1 / 2 哪个最准；0 = 不用；也可以直接填 0～3
+  stats=auto         英雄从自身属性出发（攻击、法强、生命、护甲、魔抗、移速及成长）：
+                     auto = 用最新的比赛检验开 / 关哪个更准；on / off
 
   [screen]
   draft_overlay=on   选人界面的胜率和建议（以及战术、首发界面的推荐）
@@ -115,6 +125,12 @@
 · Smart Position Lock（智能位置锁定）：推荐自动跳过它锁住的英雄，可以一起用。
 · Bows' Drafter's Toolbox：可以一起用，梯队自动交给它。
 · Bows' Terminator Draft AI 等接管 AI 选人的 Mod：AI 的 BP 自动让给它，其他功能照常。
+· 地狱人机（Hell Draft AI）：可以一起用。
+    - AI 队伍的 BP 交给它；本 Mod 会按它的方式预测对方：敌可能、敌禁?、3+2 推演里
+      对方都按它的偏好（AI 队伍常选常禁的、它自己统计胜率高的）来选和禁。
+    - 它的"我方 AI"（ally_draft_ai）开着时，它也会接管你的教练托管。本 Mod 的教练托管
+      排在最后决定，正常会以本 Mod 为准；如果 BP 复盘显示"照做的少"，在地狱人机的
+      配置器（F7）里把我方 AI 关掉即可。
 
 【出问题时】
 把 Mod 文件夹里的 diag.log（以及 diag.prev.log）发给作者。
@@ -138,8 +154,10 @@ the enemy's draft gets without the champion), on theirs the bans they want again
 you, in the pick phase the best picks; a fourth row with the enemy's likely next picks.
 In a 3+2 draft the candidates are played out to the end of the draft ("推演 xx%").
 Cards show what banning / picking each champion is worth. Hover a card for a value
-breakdown above the info panel. Coach delegation drafts your team by the model
-(coach=on).
+breakdown above the info panel. Coach delegation bans and picks exactly what the panel
+advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
+bans and the lookahead follow how it drafts. Champions start from their stats
+(stats=auto) and win chances are calibrated on held-out matches.
 
 F8 anywhere: tier list, scouting, your players, the model, and a review of your last
 draft. Settings: settings.ini in the mod folder (hot-reloaded). Problems: send diag.log.
