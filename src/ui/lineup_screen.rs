@@ -230,9 +230,10 @@ mod tests {
         crate::ui::reset();
     }
 
-    /// The roster as the game lays it out: `rows` rows of `row_h` from `top` at `x`, `width` wide,
-    /// the position column at `position` (x, width) from a row's corner.
-    fn laid_out(ui: &mut FakeUi, x: f32, top: f32, width: f32, row_h: f32, rows: u32, position: (f32, f32), bottom: f32) {
+    /// The roster as the game lays it out: `rows` rows, the first at `first` (x, y, width, height) and the others
+    /// under it, the position column at `position` (x, width) from a row's corner, the roster ending at `bottom`.
+    fn laid_out(ui: &mut FakeUi, rows: u32, first: (f32, f32, f32, f32), position: (f32, f32), bottom: f32) {
+        let (x, top, width, row_h) = first;
         ui.add(ROSTER, "color").rect = (x, top - 56.0, width, bottom - top + 56.0);
         for (i, id) in (1..=rows).enumerate() {
             let y = top + row_h * i as f32;
@@ -262,7 +263,7 @@ mod tests {
 
         // PC (game 0.7.0): OVR before the position column, 664..848 on screen
         let mut ui = base();
-        laid_out(&mut ui, 24.0, 122.0, 1872.0, 56.0, 6, (640.0, 184.0), 832.0);
+        laid_out(&mut ui, 6, (24.0, 122.0, 1872.0, 56.0), (640.0, 184.0), 832.0);
         LineupScreen::default().tick(&mut ui, 0, Some(&snapshot));
         let chip = &ui.spawned.iter().find(|(p, _)| p.ends_with("athlete_1")).unwrap().1;
         assert!(chip.starts_with("pma_star:color { x: 726px; y: 14px;"), "{chip}");
@@ -270,7 +271,7 @@ mod tests {
 
         // console: taller rows, a smaller roster - no room for the panel
         let mut ui = base();
-        laid_out(&mut ui, 64.0, 168.0, 1792.0, 64.0, 6, (760.0, 210.0), 732.0);
+        laid_out(&mut ui, 6, (64.0, 168.0, 1792.0, 64.0), (760.0, 210.0), 732.0);
         let mut screen = LineupScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot));
         let chip = &ui.spawned.iter().find(|(p, _)| p.ends_with("athlete_1")).unwrap().1;
