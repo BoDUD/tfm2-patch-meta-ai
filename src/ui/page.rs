@@ -22,6 +22,13 @@
 //!
 //! The champion table's rows are spawned a batch per frame and filled in place on every sort or
 //! lane change, so a sort costs some text writes, not a rebuild.
+//!
+//! Game 0.7.0 has three looks of the management screen, told apart by their nodes: the classic one
+//! (the entry under the house); the new UI (light or dark), whose left menu is full to the bottom -
+//! the entry goes into the title bar at the top, left of the game's own buttons there, and the page
+//! starts under the bar; and the console layout for gamepads, whose menu is a bar of tabs and whose
+//! bottom shows the pad's buttons - no entry there (the F8 panel still opens). The new UI recolours
+//! the classic colours this page is written in for its light and dark themes.
 
 // `.ui` builders take a node's whole geometry and look; splitting that up reads worse
 #![allow(clippy::too_many_arguments)]
@@ -43,6 +50,20 @@ const BODY: &str = "main.pma_page.screen.body";
 const LIST: &str = "main.pma_page.screen.body.data.list.contents";
 const LEFT_MENU: &str = "main.top.left";
 const RIGHT: &str = "main.top.right";
+/// Only in the new UI's left menu (game 0.7.0).
+const NEW_MENU: &str = "main.top.left.team_header";
+/// Only in the console layout's (game 0.7.0).
+const CONSOLE_MENU: &str = "main.top.left.c_groups";
+/// The new UI's title bar: the screen's name on the left, the game's buttons from the right.
+const TITLE_BAR: &str = "main.bottom";
+/// The left-anchored nodes of the title bar; the others are the game's buttons.
+const TITLE_TEXTS: [&str; 2] = ["title", "subtitle"];
+/// The entry in the title bar, as high as the game's buttons there.
+const BAR_NAV_W: u32 = 176;
+const BAR_NAV_H: u32 = 40;
+const BAR_NAV_GAP: f32 = 16.0;
+/// The bottom of the new UI's title bar (y 16, 48 high), when its rectangle is not known.
+const TITLE_BOTTOM: i32 = 64;
 
 const ROW_H: u32 = 56;
 const ROW_PITCH: u32 = 61;
@@ -295,7 +316,52 @@ pub struct MetaPage {
     nav_seen: bool,
     /// The entry's look as last written.
     nav_lit: Option<bool>,
+    /// The look of the management screen the entry was made for, and where it was put in the
+    /// new UI's title bar.
+    menu: Menu,
+    nav_at: Option<(i32, i32)>,
+    next_place: u64,
     registered: HashSet<String>,
+}
+
+/// The management screen's look (game 0.7.0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Menu {
+    #[default]
+    Classic,
+    /// The new UI, light or dark.
+    New,
+    /// The console layout, for gamepads.
+    Console,
+}
+
+fn menu_style(ui: &impl Ui) -> Menu {
+    if ui.exists(CONSOLE_MENU) {
+        Menu::Console
+    } else if ui.exists(NEW_MENU) {
+        Menu::New
+    } else {
+        Menu::Classic
+    }
+}
+
+/// Where the entry goes in the new UI's title bar: left of the leftmost of the game's buttons shown
+/// there, which the game lays out as it goes (the advance button's text changes, undo / redo come
+/// and go). Hidden nodes have no rectangle.
+fn title_bar_slot(ui: &impl Ui) -> Option<(i32, i32)> {
+    let (bx, by, bw, bh) = ui.rect(TITLE_BAR).filter(|r| r.2 > 0.0 && r.3 > 0.0)?;
+    let left = ui
+        .children(TITLE_BAR)
+        .iter()
+        .filter(|c| !TITLE_TEXTS.contains(&c.as_str()))
+        .map(|c| format!("{TITLE_BAR}.{c}"))
+        .filter(|c| ui.visible(c) == Some(true))
+        .filter_map(|c| ui.rect(&c))
+        .filter(|&(x, _, w, _)| w > 0.0 && x >= bx)
+        .map(|(x, ..)| x)
+        .fold(bx + bw, f32::min);
+    let x = (left - BAR_NAV_GAP - BAR_NAV_W as f32).max(bx);
+    Some((x.round() as i32, (by + (bh - BAR_NAV_H as f32) / 2.0).round() as i32))
 }
 
 impl Default for MetaPage {
@@ -315,6 +381,9 @@ impl Default for MetaPage {
             next_heal: 0,
             nav_seen: false,
             nav_lit: None,
+            menu: Menu::Classic,
+            nav_at: None,
+            next_place: 0,
             registered: HashSet::new(),
         }
     }
@@ -352,12 +421,37 @@ impl MetaPage {
             }
             return;
         }
+        let menu = menu_style(ui);
+        if menu == Menu::Console {
+            // the gamepad's layout (Auto switches to it when a pad is used): nothing to click
+            if self.open {
+                self.close(ui);
+            }
+            if ui.exists(NAV) {
+                ui.remove(NAV);
+            }
+            return;
+        }
+        if menu != self.menu && ui.exists(NAV) {
+            // the other look under the same screen: its own entry
+            ui.remove(NAV);
+        }
+        self.menu = menu;
         if !ui.exists(NAV) {
             // a new management screen: everything registered before belonged to the old one
             self.registered.clear();
             let mut t = Texts::new(ui);
             let text = t.get("menu", "Meta Analysis");
-            if !ui.spawn("main", &nav_source(&text)) {
+            let source = if menu == Menu::New {
+                // the title bar is laid out a frame after the screen
+                let Some(at) = title_bar_slot(ui) else { return };
+                self.nav_at = Some(at);
+                self.next_place = frame + HEAL_EVERY;
+                bar_nav_source(&text, at)
+            } else {
+                nav_source(&text)
+            };
+            if !ui.spawn("main", &source) {
                 return;
             }
             self.nav_seen = true;
@@ -368,6 +462,12 @@ impl MetaPage {
             if self.open {
                 // the screen was rebuilt under an open page
                 self.drawn = None;
+            }
+        } else if menu == Menu::New && frame >= self.next_place {
+            self.next_place = frame + HEAL_EVERY;
+            if let Some(at) = title_bar_slot(ui).filter(|at| self.nav_at != Some(*at)) {
+                self.nav_at = Some(at);
+                ui.set_properties(NAV, &format!("x: {}px; y: {}px;", at.0, at.1));
             }
         }
 
@@ -388,7 +488,11 @@ impl MetaPage {
 
         // the page frame, put back when the game rebuilt the screen under it
         if !ui.exists(SCREEN) {
-            if !ui.spawn("main", &frame_source()) {
+            let top = match menu {
+                Menu::New => ui.rect(TITLE_BAR).filter(|r| r.3 > 0.0).map_or(TITLE_BOTTOM, |r| (r.1 + r.3).round() as i32),
+                _ => 0,
+            };
+            if !ui.spawn("main", &frame_source(top)) {
                 return;
             }
             self.drawn = None;
@@ -401,7 +505,7 @@ impl MetaPage {
             }
             if self.nav_lit != Some(true) {
                 self.nav_lit = Some(true);
-                ui.set_properties(&format!("{NAV}.button"), &nav_style(true));
+                ui.set_properties(&format!("{NAV}.button"), &self.nav_look(true));
             }
         }
         let Some(snapshot) = snapshot.filter(|s| s.meta.matches + s.meta.solo_matches > 0) else {
@@ -498,10 +602,17 @@ impl MetaPage {
         }
     }
 
+    fn nav_look(&self, lit: bool) -> String {
+        match self.menu {
+            Menu::New => bar_nav_style(lit),
+            _ => nav_style(lit),
+        }
+    }
+
     fn close(&mut self, ui: &mut impl Ui) {
         ui.remove(PAGE);
         ui.set_visible(RIGHT, true);
-        ui.set_properties(&format!("{NAV}.button"), &nav_style(false));
+        ui.set_properties(&format!("{NAV}.button"), &self.nav_look(false));
         self.nav_lit = Some(false);
         self.open = false;
         self.drawn = None;
@@ -714,12 +825,42 @@ fn nav_source(text: &str) -> String {
     )
 }
 
-/// The page: the screen background over the right-hand content, and the 1600x968 screen area
-/// in the place of the game's screens.
-fn frame_source() -> String {
+/// The entry in the new UI's title bar: an outlined button like the game's own there, in the
+/// colours the new UI's themes recolour (light and dark); filled while the page is open.
+fn bar_nav_style(lit: bool) -> String {
+    let (line, back) = if lit { (0x141922ff, 0xe9edf2ff) } else { (0x8a94a6ff, 0xfffffeff) };
     format!(
-        "pma_page:color {{ x: 264px; y: 0px; width: 1656px; height: 992px; color: {}; \
-         #screen:empty {{ x: 32px; y: 24px; width: 1600px; height: 968px; }} }}",
+        "btn: {{ rounding: Uniform {{ rounding: 8; }} stroke: 1; color: {}; back_color: {}; }} \
+         hover: {{ btn: {{ color: #141922ff; back_color: {}; }} }}",
+        color(line),
+        color(back),
+        color(if lit { 0xdce1e8ff } else { 0xf6f8faff })
+    )
+}
+
+fn bar_nav_source(text: &str, (x, y): (i32, i32)) -> String {
+    format!(
+        "pma_nav:empty {{ x: {x}px; y: {y}px; width: {BAR_NAV_W}px; height: {BAR_NAV_H}px; \
+         #button:color_icon_button {{ width: {BAR_NAV_W}px; height: {BAR_NAV_H}px; {} \
+         hover_sound: \"asset/base/sound/sfx/UI_mouse_hover\"; click_sound: \"asset/base/sound/sfx/UI_mouse_click\"; \
+         #icon:image {{ x: 12px; y: 10px; width: 20px; height: 20px; ignore_event: true; color: #141922ff; \
+         source: \"asset/base/ui/icons/chart\"; }} \
+         #text:label {{ @\"asset/base/style/main#bold_label\"; x: 40px; y: 10px; width: {}px; height: 20px; align_x: Left; \
+         align_y: Center; size: 18; fit_width: true; ignore_event: true; color: #141922ff; text: {}; }} }} }}",
+        bar_nav_style(false),
+        BAR_NAV_W - 52,
+        quote(text)
+    )
+}
+
+/// The page: the screen background over the right-hand content, and the 1600x968 screen area
+/// in the place of the game's screens. `top` is 0, or the bottom of the new UI's title bar (the
+/// entry is in it).
+fn frame_source(top: i32) -> String {
+    let (height, inset) = if top > 0 { (1080 - top, 16) } else { (992, 24) };
+    format!(
+        "pma_page:color {{ x: 264px; y: {top}px; width: 1656px; height: {height}px; color: {}; \
+         #screen:empty {{ x: 32px; y: {inset}px; width: 1600px; height: 968px; }} }}",
         color(BG)
     )
 }
@@ -1485,5 +1626,118 @@ mod tests {
         frame(&mut page, &mut ui, 19, &s, &context, "Main/Statistics");
         frame(&mut page, &mut ui, 20, &s, &context, "Main/Home");
         assert!(!page.is_open() && !ui.exists(PAGE));
+    }
+
+    /// The new UI's management screen (game 0.7.0): a left menu full to the bottom, the title bar
+    /// at the top with the game's buttons laid out from the right.
+    fn new_management() -> FakeUi {
+        let mut ui = management();
+        ui.add(NEW_MENU, "empty");
+        ui.add(TITLE_BAR, "empty").rect = (296.0, 16.0, 1600.0, 48.0);
+        ui.add(&format!("{TITLE_BAR}.title"), "label").rect = (296.0, 20.0, 600.0, 40.0);
+        ui.add(&format!("{TITLE_BAR}.subtitle"), "label").rect = (520.0, 20.0, 400.0, 40.0);
+        ui.add(&format!("{TITLE_BAR}.proceed"), "color_icon_button").rect = (1660.0, 20.0, 236.0, 40.0);
+        ui.add(&format!("{TITLE_BAR}.undo_scene"), "color_icon_button").rect = (1560.0, 20.0, 40.0, 40.0);
+        let help = ui.add(&format!("{TITLE_BAR}.help"), "button");
+        help.visible = false;
+        help.rect = (0.0, 0.0, 0.0, 0.0);
+        ui
+    }
+
+    #[test]
+    fn the_new_ui_has_the_entry_in_its_title_bar() {
+        let _serial = crate::tests::serial();
+        let _ = take_clicks();
+        let s = snapshot();
+        let context = Context { team_name: "Mods FC".into(), ..Default::default() };
+        let mut ui = new_management();
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        let (parent, nav) = ui.spawned[0].clone();
+        assert_eq!(parent, "main");
+        // left of undo (1560), the leftmost button shown; centred on the bar
+        assert!(nav.starts_with("pma_nav:empty { x: 1368px; y: 20px;"), "{nav}");
+        assert!(!nav.contains("y: 969px"), "not at the bottom of the left menu: the game's menu is there");
+        assert!(ui.exists(&format!("{NAV}.button.text")));
+
+        // the page starts under the bar, which stays usable
+        ui.click(&format!("{NAV}.button"));
+        frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
+        assert!(page.is_open() && ui.exists(SCREEN));
+        let frame_src = &ui.spawned.iter().find(|(_, src)| src.starts_with("pma_page")).unwrap().1;
+        assert!(frame_src.starts_with("pma_page:color { x: 264px; y: 64px; width: 1656px; height: 1016px;"), "{frame_src}");
+        assert_eq!(ui.visible(RIGHT), Some(false));
+        let lit = ui.nodes[&format!("{NAV}.button")].props.last().cloned().unwrap();
+        assert!(lit.contains("back_color: #e9edf2ff"), "lit while open: {lit}");
+
+        // the game moves its buttons (the advance button's text): the entry follows
+        ui.nodes.get_mut(&format!("{TITLE_BAR}.undo_scene")).unwrap().visible = false;
+        frame(&mut page, &mut ui, 3, &s, &context, "Main/Home");
+        assert!(ui.nodes[NAV].props.is_empty(), "not before the next look");
+        frame(&mut page, &mut ui, 1 + HEAL_EVERY, &s, &context, "Main/Home");
+        assert_eq!(ui.nodes[NAV].props, vec!["x: 1468px; y: 20px;".to_string()]);
+        frame(&mut page, &mut ui, 1 + 2 * HEAL_EVERY, &s, &context, "Main/Home");
+        assert_eq!(ui.nodes[NAV].props.len(), 1, "written only when it moves");
+
+        // the entry again closes it, back to the outlined look
+        ui.click(&format!("{NAV}.button"));
+        frame(&mut page, &mut ui, 30, &s, &context, "Main/Home");
+        assert!(!page.is_open() && !ui.exists(PAGE));
+        assert_eq!(ui.visible(RIGHT), Some(true));
+        let unlit = ui.nodes[&format!("{NAV}.button")].props.last().cloned().unwrap();
+        assert!(unlit.contains("back_color: #fffffeff"), "{unlit}");
+    }
+
+    #[test]
+    fn the_new_ui_waits_for_its_title_bar_and_the_classic_one_keeps_its_place() {
+        let _serial = crate::tests::serial();
+        let _ = take_clicks();
+        let s = snapshot();
+        let context = Context::default();
+        let mut ui = new_management();
+        ui.nodes.get_mut(TITLE_BAR).unwrap().rect = (0.0, 0.0, 0.0, 0.0);
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        assert!(!ui.exists(NAV), "no place yet");
+        ui.nodes.get_mut(TITLE_BAR).unwrap().rect = (296.0, 16.0, 1600.0, 48.0);
+        frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
+        assert!(ui.exists(NAV));
+
+        let mut ui = management();
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        assert!(ui.spawned[0].1.starts_with("pma_nav:empty { x: 0px; y: 969px; width: 264px; height: 52px;"));
+        ui.click(&format!("{NAV}.button"));
+        frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
+        let frame_src = &ui.spawned.iter().find(|(_, src)| src.starts_with("pma_page")).unwrap().1;
+        assert!(frame_src.starts_with("pma_page:color { x: 264px; y: 0px; width: 1656px; height: 992px;"), "{frame_src}");
+    }
+
+    #[test]
+    fn the_console_layout_has_no_entry_and_closes_the_page() {
+        let _serial = crate::tests::serial();
+        let _ = take_clicks();
+        let s = snapshot();
+        let context = Context::default();
+        let mut ui = new_management();
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        ui.click(&format!("{NAV}.button"));
+        frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
+        assert!(page.is_open());
+
+        // Auto switches to the console layout when a gamepad is used
+        ui.add(CONSOLE_MENU, "empty");
+        frame(&mut page, &mut ui, 3, &s, &context, "Main/Home");
+        assert!(!page.is_open() && !ui.exists(PAGE) && !ui.exists(NAV));
+        assert_eq!(ui.visible(RIGHT), Some(true));
+        let spawned = ui.spawned.len();
+        frame(&mut page, &mut ui, 4, &s, &context, "Main/Home");
+        assert_eq!(ui.spawned.len(), spawned, "nothing spawned in the console layout");
+
+        // and back to the mouse
+        ui.remove(CONSOLE_MENU);
+        frame(&mut page, &mut ui, 5, &s, &context, "Main/Home");
+        assert!(ui.exists(NAV) && !page.is_open());
     }
 }
