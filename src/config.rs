@@ -104,6 +104,9 @@ pub struct Config {
     pub grid_values: bool,
     /// ... the likely lane of each enemy pick.
     pub lane_tags: bool,
+    /// ... how opaque its panels' background is (percent); a third of it once the pick under a
+    /// panel (each pick column's fifth) is in, so it shows through.
+    pub panel_opacity: f32,
     /// The Meta Analysis page in the left menu.
     pub meta_page: bool,
     // [report]
@@ -148,6 +151,7 @@ impl Default for Config {
             draft_overlay: true,
             grid_values: true,
             lane_tags: true,
+            panel_opacity: 60.0,
             meta_page: true,
             report: true,
             verbose: false,
@@ -248,6 +252,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
+        "panel_opacity" => cfg.panel_opacity = number(value)?,
         "meta_page" => cfg.meta_page = flag(value)?,
         "explore" => cfg.explore = flag(value)?,
         "patches" => cfg.patches = number(value)?.round(),
@@ -332,6 +337,8 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     check("player_mastery", &mut cfg.player_mastery, (0.0..=2.0).contains(&v), d.player_mastery);
     let v = cfg.min_games;
     check("min_games", &mut cfg.min_games, v >= 0.0, d.min_games);
+    let v = cfg.panel_opacity;
+    check("panel_opacity", &mut cfg.panel_opacity, (0.0..=100.0).contains(&v), d.panel_opacity);
     for (name, value, fallback) in [
         ("drift", &mut cfg.drift, d.drift),
         ("change", &mut cfg.change, d.change),
@@ -452,7 +459,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} meta_page={} explore={}",
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         c.tier_list.as_str(),
@@ -486,6 +493,7 @@ pub fn summary(c: &Config) -> String {
         if c.draft_overlay { "on" } else { "off" },
         if c.grid_values { "on" } else { "off" },
         if c.lane_tags { "on" } else { "off" },
+        c.panel_opacity,
         if c.meta_page { "on" } else { "off" },
         if c.explore { "on" } else { "off" }
     )
@@ -613,11 +621,18 @@ unranked=keep
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
 ; lane_tags     : on each enemy pick, its most likely lane / 敌方每个已选英雄最可能的位置
+; panel_opacity : how opaque the two panels' background is, 0-100 (percent); once both teams
+;                 the panel sits on a pick column's fifth pick: once that pick is in (left panel:
+;                 blue's, right panel: red's) it drops to a third, so the pick shows through
+;                 (splash-art mods make the picks bigger)
+;                 两个面板背景的不透明度，0～100（百分比）；面板下面是两边第五个选人位，
+;                 那一边选满五个（左下角看蓝方、右下角看红方）后降到三分之一，让头像（包括原画 Mod 的大图）透出来
 ; meta_page     : a "Meta Analysis" page in the left menu (champions, duos, players, model)
 ;                 左侧菜单里的"版本分析"页面（英雄、组合、选手、模型）
 draft_overlay=on
 grid_values=on
 lane_tags=on
+panel_opacity=60
 meta_page=on
 
 [report]

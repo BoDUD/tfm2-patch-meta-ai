@@ -37,7 +37,8 @@
 //! earlier game of the series) - such a card is not offered as advice and gets no value. Team names sit in `main.bottom.<side>_side.name` with the
 //! league rank appended ("Samsung Galaxy #1"). Labels read back the raw text they were given,
 //! so champion names are written as the game's own name reference and the game shows them in
-//! its language. Both bottom corners of the screen are empty in the game's layout.
+//! its language. Both bottom corners of the screen - the bottom bar under the pick columns, up
+//! to the team names - are empty in the game's layout and in Ban/Pick View Plus's.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -70,7 +71,17 @@ const GOOD: u32 = 0x4cc38aff;
 const BAD: u32 = 0xef6471ff;
 const DIM: u32 = 0xa3a9b6ff;
 const TEXT: u32 = 0xe8e8e8ff;
+/// The panels' background (its alpha comes from `panel_opacity`).
 const PANEL: u32 = 0x161721f0;
+/// Once the pick column under a panel holds its fifth pick (win panel: blue's, advice panel:
+/// red's), the panel's background keeps this share of its opacity, so that pick shows through.
+const FADED: f32 = 1.0 / 3.0;
+
+/// The panels' background at `opacity` percent.
+fn panel_color(opacity: f32) -> u32 {
+    let alpha = (opacity.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u32;
+    (PANEL & 0xffff_ff00) | alpha
+}
 
 /// The layer Smart Position Lock puts over a card the player's team may not pick.
 const POSITION_LOCK: &str = "spl_lock";
@@ -99,6 +110,8 @@ pub struct View<'a> {
     pub team_matches: &'a HashMap<String, u32>,
     pub grid_values: bool,
     pub lane_tags: bool,
+    /// The panels' background opacity, percent (`panel_opacity`).
+    pub panel_opacity: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -168,6 +181,8 @@ pub struct DraftScreen {
     /// drafting for the AI teams), and its lean for the model it was worked out for.
     hell: Option<Option<crate::hell::Hell>>,
     hell_lean: Option<(usize, Arc<HashMap<u16, f32>>)>,
+    /// The panels' background as last drawn (the breakdown line is added later, in it).
+    back: Option<u32>,
 }
 
 /// What the last drawing worked out.
@@ -337,26 +352,32 @@ const ADVICE_ROWS: usize = 3;
 /// The likely picks of the enemy shown on the fourth row.
 const LIKELY: usize = 3;
 
-fn overlay_source() -> String {
+/// The panels sit in the bottom bar's corners, below both pick columns: the game's last pick
+/// slot ends at y 970 (Ban/Pick View Plus's splash cards at 986), and the bar's team names and
+/// bans start 500 px in from either edge.
+const PANEL_Y: u32 = 988;
+const PANEL_H: u32 = 92;
+
+fn overlay_source(back: u32) -> String {
     let panel = |id: &str, x: u32, inner: String| {
         format!(
-            "#{id}:color {{ x: {x}px; y: 960px; width: 460px; height: 112px; color: {}; ignore_event: true; \
+            "#{id}:color {{ x: {x}px; y: {PANEL_Y}px; width: 460px; height: {PANEL_H}px; color: {}; ignore_event: true; \
              rounding: Uniform {{ rounding: 10; }} {inner}}} ",
-            color(PANEL)
+            color(back)
         )
     };
     let win = format!(
-        "{}{}{}#back:color {{ x: 12px; y: 64px; width: 436px; height: 8px; color: {}; ignore_event: true; \
+        "{}{}{}#back:color {{ x: 12px; y: 54px; width: 436px; height: 7px; color: {}; ignore_event: true; \
          rounding: Uniform {{ rounding: 4; }} #fill:color {{ width: 50%; height: 100%; color: {}; ignore_event: true; \
          rounding: Uniform {{ rounding: 4; }} }} }} ",
-        label("title", 12, 4, 300, 22, 13, DIM, "Left"),
-        label("value", 12, 26, 200, 34, 26, TEXT, "Left"),
-        label("detail", 150, 30, 298, 26, 13, DIM, "Right"),
+        label("title", 12, 2, 300, 20, 13, DIM, "Left"),
+        label("value", 12, 20, 200, 32, 24, TEXT, "Left"),
+        label("detail", 150, 24, 298, 24, 13, DIM, "Right"),
         color(RED),
         color(BLUE)
-    ) + &label("enemy", 12, 78, 436, 26, 13, DIM, "Right");
+    ) + &label("enemy", 12, 64, 436, 24, 13, DIM, "Right");
     // the swap phase's seating, in the advice panel's place
-    let mut seating = label("title", 12, 4, 436, 22, 13, 0xe8e8e8ff, "Left");
+    let mut seating = label("title", 12, 2, 436, 22, 13, 0xe8e8e8ff, "Left");
     for k in 0..5u32 {
         let (x, y) = (12 + (k % 3) as i32 * 148, 30 + (k / 3) as i32 * 26);
         seating.push_str(&format!(
@@ -368,16 +389,16 @@ fn overlay_source() -> String {
     }
     let mut advice = format!("#seating:empty {{ width: 100%; height: 100%; visible: false; ignore_event: true; {seating}}} ");
     for r in 0..ADVICE_ROWS {
-        let y = 4 + r as u32 * 26;
-        advice.push_str(&label(&format!("k{r}"), 12, y, 46, 24, 13, DIM, "Left"));
-        advice.push_str(&label(&format!("c{r}"), 58, y, 124, 24, 14, TEXT, "Left"));
-        advice.push_str(&label(&format!("v{r}"), 182, y, 50, 24, 14, GOOD, "Right"));
-        advice.push_str(&label(&format!("w{r}"), 240, y, 214, 24, 12, DIM, "Left"));
+        let y = 2 + r as u32 * 22;
+        advice.push_str(&label(&format!("k{r}"), 12, y, 46, 22, 13, DIM, "Left"));
+        advice.push_str(&label(&format!("c{r}"), 58, y, 124, 22, 14, TEXT, "Left"));
+        advice.push_str(&label(&format!("v{r}"), 182, y, 50, 22, 14, GOOD, "Right"));
+        advice.push_str(&label(&format!("w{r}"), 240, y, 214, 22, 12, DIM, "Left"));
     }
     // the enemy's likely picks
-    advice.push_str(&label("k3", 12, 82, 46, 24, 13, DIM, "Left"));
+    advice.push_str(&label("k3", 12, 68, 46, 22, 13, DIM, "Left"));
     for i in 0..LIKELY {
-        advice.push_str(&label(&format!("n{i}"), 58 + i as u32 * 132, 82, 128, 24, 13, TEXT, "Left"));
+        advice.push_str(&label(&format!("n{i}"), 58 + i as u32 * 132, 68, 128, 22, 13, TEXT, "Left"));
     }
     format!(
         "pma:empty {{ width: 100%; height: 100%; ignore_event: true; {}{}}}",
@@ -387,11 +408,11 @@ fn overlay_source() -> String {
 }
 
 /// The breakdown line above the game's champion info panel.
-fn breakdown_source() -> String {
+fn breakdown_source(back: u32) -> String {
     format!(
         "pma_info:color {{ x: 310px; y: 646px; width: 1300px; height: 34px; color: {}; visible: false; ignore_event: true; \
          rounding: Uniform {{ rounding: 8; }} {}}}",
-        color(PANEL),
+        color(back),
         label("text", 14, 4, 1272, 26, 14, TEXT, "Left")
     )
 }
@@ -589,7 +610,7 @@ impl DraftScreen {
             if self.drawn == Some(matches as u64) && ui.exists(OVERLAY) {
                 return;
             }
-            if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source()) {
+            if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source(panel_color(view.panel_opacity))) {
                 return;
             }
             self.drawn = Some(matches as u64);
@@ -636,7 +657,7 @@ impl DraftScreen {
         for c in &cards {
             (&c.champ, c.blue, c.red, c.banned, c.locked, c.held).hash(&mut h);
         }
-        (side, Arc::as_ptr(snapshot) as usize, swap_phase, banning, acting).hash(&mut h);
+        (side, Arc::as_ptr(snapshot) as usize, swap_phase, banning, acting, view.panel_opacity.to_bits()).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -648,7 +669,7 @@ impl DraftScreen {
             self.breakdown(ui, meta);
             return;
         }
-        if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source()) {
+        if !ui.exists(OVERLAY) && !ui.spawn("main", &overlay_source(panel_color(view.panel_opacity))) {
             diag::log_once("ui-overlay", "[ui] could not add the overlay to the ban/pick screen");
             return;
         }
@@ -787,7 +808,7 @@ impl DraftScreen {
         if key == self.shown_info && ui.exists(BREAKDOWN) {
             return;
         }
-        if !ui.exists(BREAKDOWN) && !ui.spawn("main", &breakdown_source()) {
+        if !ui.exists(BREAKDOWN) && !ui.spawn("main", &breakdown_source(self.back.unwrap_or(PANEL))) {
             return;
         }
         self.shown_info = key;
@@ -854,6 +875,15 @@ impl DraftScreen {
             list.into_iter().map(|(_, c)| c).collect()
         };
         let (blue, red) = (picks(true), picks(false));
+        // the panels' background: each sits on the bottom slot of a pick column (win on blue's,
+        // advice on red's) and turns see-through once that slot holds a pick
+        let faded = |picked: usize| if picked >= 5 { view.panel_opacity * FADED } else { view.panel_opacity };
+        for (panel, picked) in [("win", blue.len()), ("advice", red.len())] {
+            ui.set_properties(&format!("{OVERLAY}.{panel}"), &format!("color: {};", color(panel_color(faded(picked)))));
+        }
+        let all_in = faded(blue.len().min(red.len()));
+        self.back = Some(panel_color(all_in));
+        ui.set_properties(BREAKDOWN, &format!("color: {};", color(panel_color(all_in))));
         let (ally, enemy) = if side == 0 { (blue, red) } else { (red, blue) };
         self.last_picks = Some((ally.clone(), enemy.clone()));
         let damage = |c: u16| snapshot.damage_of(c);
@@ -1204,7 +1234,7 @@ mod tests {
         // the rivals played "e" in every one of their last ten matches
         let team_picks: HashMap<String, Vec<(String, u32, u32)>> = [("rivals".to_string(), vec![("e".to_string(), 10, 6)])].into();
         let team_matches: HashMap<String, u32> = [("rivals".to_string(), 10)].into();
-        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &team_picks, team_matches: &team_matches, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &team_picks, team_matches: &team_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
         let text = |ui: &FakeUi, p: &str| ui.text(p).unwrap_or_default();
@@ -1263,7 +1293,7 @@ mod tests {
         let mut rosters = HashMap::new();
         rosters.insert("rivals".to_string(), vec![(9u32, Some(Role::Mid))]);
         let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
-        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
@@ -1321,12 +1351,20 @@ mod tests {
     }
 
     #[test]
+    fn panel_opacity() {
+        assert_eq!(panel_color(100.0), 0x161721ff);
+        assert_eq!(panel_color(60.0), 0x16172199);
+        assert_eq!(panel_color(0.0), 0x16172100);
+        assert_eq!(panel_color(250.0), 0x161721ff, "clamped");
+    }
+
+    #[test]
     fn the_swap_phase_shows_the_best_seating() {
         let snapshot = snapshot(1500);
         let book = NameBook::default();
         let rosters = HashMap::new();
         let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
-        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
         let mut ui = screen();
         for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
             pick(&mut ui, n, "blue", i as u32 + 1);
@@ -1342,6 +1380,11 @@ mod tests {
         let mut screen = DraftScreen::default();
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
         assert_eq!(ui.visible("main.pma.advice.seating"), Some(true));
+        // every pick in: both panels' background fades to a third (60% -> 20%, alpha 0x33)
+        for panel in ["main.pma.win", "main.pma.advice"] {
+            let props = &ui.nodes[panel].props;
+            assert_eq!(props.last().map(String::as_str), Some(format!("color: {};", color(0x16172133)).as_str()), "{panel}");
+        }
         assert!(ui.text("main.pma.advice.seating.title").unwrap().starts_with("Best seating"));
         let seated: Vec<String> = (0..5).map(|k| ui.text(&format!("main.pma.advice.seating.s{k}.name")).unwrap()).collect();
         for n in ["a", "b", "c", "d", "e"] {
@@ -1360,7 +1403,7 @@ mod tests {
         let book = NameBook::default();
         let rosters = HashMap::new();
         let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
-        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true };
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
         for snapshot in [None, Some(snapshot(5))] {
             let mut ui = screen();
             let mut screen = DraftScreen::default();
