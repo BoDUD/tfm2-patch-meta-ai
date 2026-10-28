@@ -144,6 +144,13 @@ fn stats_on_a_save() {
             }
         }
     }
+    for (n, on) in [(games.len(), false), (games.len(), true), (40, false), (40, true)] {
+        let set = Settings { stat_prior: on, ..Settings::default() };
+        let few = &games[games.len() - n..];
+        let started = std::time::Instant::now();
+        let m = build(&Inputs { games: few, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats) }, &set);
+        eprintln!("{n} games, stats {on}: {} iterations, {:?}", m.sweeps, started.elapsed());
+    }
     let set = Settings { lol_prior: 0.0, ..Settings::default() };
     let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats) }, &set);
     for (k, e) in meta.stat_weights.iter().enumerate() {
