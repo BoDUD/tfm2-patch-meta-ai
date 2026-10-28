@@ -1,7 +1,8 @@
 //! The tactics (team strategy) screen before a match: on each strategy group, a chip on the
 //! option the model rates best for the team's five champions - "★ +1.2", its worth over the
-//! group's average option in win-rate points - and a note in the free strip at the top. The
-//! screen shows the champions only as images, so the team is the one the ban/pick screen read.
+//! group's average option in win-rate points - and a note in the free strip at the top (the
+//! console layout of game 0.7.0 has its buttons there and its groups higher: under the groups).
+//! The screen shows the champions only as images, so the team is the one the ban/pick screen read.
 //!
 //! The screen's groups are `main.contents.strategy.<column>.<group>` with one
 //! `color_selectable` per option at `.bg.<option>`; the option names are the records' option
@@ -16,6 +17,12 @@ use crate::shared::Snapshot;
 
 const BASE: &str = "main.contents.strategy";
 const NOTE: &str = "main.pma_tactics";
+/// The note: right-aligned, ending 20 px inside the strategy panel's right edge.
+const NOTE_W: i32 = 810;
+const NOTE_H: i32 = 32;
+/// The PC layout's place for it, right of the header's buttons; the groups start 75 px into the panel.
+const NOTE_AT: (i32, i32) = (1060, 128);
+const ROOM_ABOVE: f32 = 60.0;
 const CHIP: &str = "pma_tip";
 const EVERY: u64 = 15;
 /// Advice under this many win-rate points is not shown.
@@ -52,7 +59,7 @@ fn points(v: f32) -> f32 {
 
 fn chip_source(text: &str) -> String {
     format!(
-        "{CHIP}:label {{ @\"asset/base/style/main#bold_label\"; anchor_x: 1; pivot_x: 1; x: -10px; y: 0px; width: 110px; \
+        "{CHIP}:label {{ @\"asset/base/style/main#bold_label\"; anchor_x: 1; pivot_x: 1; x: -10px; anchor_y: 0.5; pivot_y: 0.5; y: 0px; width: 110px; \
          height: 32px; size: 14; color: {}; align_x: Right; align_y: Center; ignore_event: true; text: {}; }}",
         color(0x4cc38aff),
         quote(text)
@@ -108,16 +115,29 @@ impl TacticsScreen {
         } else {
             "Patch Meta: ★ = best for this line-up (win-rate points) / ★ = 按本局阵容推荐（胜率百分点）".to_string()
         };
+        let (x, y) = note_at(ui);
         ui.spawn(
             "main",
             &format!(
-                "pma_tactics:label {{ @\"asset/base/style/main#label\"; x: 1060px; y: 128px; width: 810px; height: 32px; size: 14; \
+                "pma_tactics:label {{ @\"asset/base/style/main#label\"; x: {x}px; y: {y}px; width: {NOTE_W}px; height: {NOTE_H}px; size: 14; \
                  color: {}; align_x: Right; align_y: Center; ignore_event: true; text: {}; }}",
                 color(0xa3a9b6ff),
                 quote(&note)
             ),
         );
         self.drawn = Some(key);
+    }
+}
+
+/// The note's place: above the groups when the panel leaves room there (PC), else under them.
+fn note_at(ui: &impl Ui) -> (i32, i32) {
+    let known = |p: &str| ui.rect(p).filter(|r| r.2 > 0.0 && r.3 > 0.0);
+    let (Some(panel), Some(groups)) = (known(BASE), known(&format!("{BASE}.sub1"))) else { return NOTE_AT };
+    let x = (panel.0 + panel.2).round() as i32 - 20 - NOTE_W;
+    if groups.1 - panel.1 >= ROOM_ABOVE {
+        (x, NOTE_AT.1)
+    } else {
+        (x, (groups.1 + groups.3).round() as i32 + 8)
     }
 }
 
@@ -168,5 +188,20 @@ mod tests {
         empty.add(&format!("{BASE}.sub1"), "empty");
         TacticsScreen::default().tick(&mut empty, 0, Some(&snapshot), None);
         assert!(empty.spawned.is_empty());
+    }
+
+    #[test]
+    fn the_note_keeps_clear_of_the_groups() {
+        let mut ui = FakeUi::default();
+        ui.add("main", "strategy_ui");
+        assert_eq!(note_at(&ui), NOTE_AT, "nothing laid out yet");
+        // PC: the groups start 75 px into the panel, the header's buttons end at 723
+        ui.add(BASE, "empty").rect = (27.0, 107.0, 1864.0, 856.0);
+        ui.add(&format!("{BASE}.sub1"), "empty").rect = (47.0, 182.0, 444.0, 645.0);
+        assert_eq!(note_at(&ui), (1061, 128));
+        // console: buttons above the panel's top, the groups 4 px in
+        ui.nodes.get_mut(BASE).unwrap().rect = (64.0, 80.0, 1792.0, 832.0);
+        ui.nodes.get_mut(&format!("{BASE}.sub1")).unwrap().rect = (83.6, 84.0, 435.0, 740.0);
+        assert_eq!(note_at(&ui), (1026, 832));
     }
 }

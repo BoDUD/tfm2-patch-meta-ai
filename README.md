@@ -7,7 +7,7 @@
 1. **选人界面**：左下角显示你的阵容胜率，右下角给出当前最佳选择和禁用（附理由；禁用阶段给出最该禁的三个，见下文"教练式禁用"），每张英雄卡片显示此刻选它的价值，敌方每个已选英雄标出最可能的位置。选人顺序也算在内：对方后面还有几手、有没有强力克制，都会压低先手暴露的英雄的价值。Fearless 模式下显示本系列已锁定的英雄数。换位阶段，右下角改为显示把五个英雄分给五名选手的最佳方式。
 2. **战术界面**：选完人后，模型按你的阵容和本存档里各战术的实际胜负，在值得改的战术选项上标出 ★ 和收益。
 3. **首发界面**：按选手实力、位置评分和英雄池（熟练度）推荐五名首发，名单行上标 ★ 和位置；名单下方有空间时列出他们最好的英雄。
-4. **版本分析页**（左侧菜单）：英雄 / 组合 / 选手 / 补丁变化 / 模型 五个标签。英雄表可按位置筛选、按任意列排序，显示对线期经济差；选手页给出训练建议（值得练的英雄）；补丁变化页列出本版本上升、下降和被改动的英雄。
+4. **版本分析页**（经典界面在左侧菜单，新界面在顶部标题栏右侧）：英雄 / 组合 / 选手 / 补丁变化 / 模型 五个标签。英雄表可按位置筛选、按任意列排序，显示对线期经济差；选手页给出训练建议（值得练的英雄）；补丁变化页列出本版本上升、下降和被改动的英雄。
 5. **F8 面板**（任何界面）：梯队榜、下一个对手的侦察（每名选手的拿手英雄、常用英雄、最该禁的英雄）、你的选手英雄池、模型准确度、上一次 BP 的复盘。
 6. **AI 的 ban/pick**：按本局局面给候选英雄估值（位置、配合、克制、伤害类型），推动 AI 原有评分。游戏 0.6.4 起还看双方的上场选手：AI 偏向自家选手的拿手英雄，并禁掉对方选手的拿手英雄。
 7. **自动梯队**：维护你队伍的 S/A/B/C/D 英雄梯队。
@@ -50,6 +50,15 @@
 - **胜率校准**：同一次检验还找出模型的对数几率乘多少最贴近没参与拟合的比赛（0.2～1.2）。小于 1 说明模型偏自信，显示的胜率（左下角、推演、复盘）都按它收缩；排序不受影响。F8 模型页和 `diag.log` 的 `[model] held-out check` 行写着这个系数。
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
+
+## 2.5.3：游戏 0.7.0
+
+游戏 0.7.0 的稳定版 Mod API 没变（自带的 SDK 和本 Mod 用的完全一样），改的是界面：
+
+- **管理界面三种样式**：经典界面照旧（左侧菜单"房子"下面）。新界面（浅色 / 深色）的左侧菜单排满到底，入口改放在顶部标题栏，在游戏自己的按钮（推进、日期、撤销 / 重做……）左边，跟着它们移动；打开的页面从标题栏下面开始，标题栏照常能用。游戏的新界面主题表按颜色值把经典配色换成浅色 / 深色主题的颜色，本页用的就是这些经典配色。主机布局（手柄，"自动"模式用手柄时切过去）的菜单是一排标签、屏幕底部是手柄按键提示，那里没有入口，已打开的页面会关掉；F8 面板照常能开。
+- **首发界面**：0.7.0 在选手行的位置列前面加了"综合评分（OVR）"列，★ 标签改为按游戏的实际坐标放在位置列右端，不再压住名字和 OVR；主机布局的行更高、名单更短，标签和下方面板也按实际坐标放（主机布局下名单下方放不下面板）。
+- **战术界面**：主机布局把按钮放在了提示文字原来的位置，提示改到战术组下面；★ 标签在选项里上下居中。
+- 选人界面的叠加层三种样式都不用改。
 
 ## 和其他 Mod 一起用
 
@@ -111,7 +120,7 @@
 | | `grid_values` | on | 英雄卡片上的价值 |
 | | `lane_tags` | on | 敌方已选英雄的位置推断 |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
-| | `meta_page` | on | 左侧菜单的"版本分析"页 |
+| | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | `[report]` | `report` | on | 写 `meta_report.html` |
 | `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 F9 随时写一份） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
@@ -136,7 +145,7 @@
 - Linux/WSL：`tools/build.sh`，需要 `rustup target add x86_64-pc-windows-gnu` 和 `gcc-mingw-w64-x86-64`。它会跑测试、交叉编译、打包出 `dist/patch_meta_ai/` 和 zip。加 `--smoke` 还会用 Wine 真正加载 DLL，跑一遍模拟的游戏流程。
 - `cargo test`：单元测试（模型能否从模拟比赛中找回已知的英雄强度、选手实力、配合；补丁改动后的估计；选人界面读写），加上走真实 C 接口的整局模拟（`tests/fake_host.rs`）。`cargo test --release -- --ignored --nocapture fit_time` 测一次存档规模的拟合耗时。
 
-`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.5 自带，ABI 等级 10，和 0.6.4 的只差冻结的 abi_level_10.txt），版权归 TeamSamoyed。Mod 只要求 ABI 等级 1，所以用新 SDK 构建的 DLL 在 0.6.0～0.6.3 上照样能加载。
+`vendor/mod-api-stable` 是游戏自带的稳定版 Mod SDK（`mod-sdk-stable`，游戏 0.6.5 自带，ABI 等级 10，和 0.6.4 的只差冻结的 abi_level_10.txt；游戏 0.7.0 自带的和它完全一样），版权归 TeamSamoyed。Mod 只要求 ABI 等级 1，所以用新 SDK 构建的 DLL 在 0.6.0～0.6.3 上照样能加载。
 
 ## 致谢
 
@@ -149,7 +158,7 @@ Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). V
 1. **the ban/pick screen**: your line-up's win chance, the best picks now, and in every ban phase (3+2 included) the three best bans with reasons - or, while the enemy bans, the ones they want against you; picks aware of the draft order (a champion picked early can still be countered); each champion card's value to you, each enemy pick's likely lane, the Fearless count, and the best seating in the swap phase;
 2. **the tactics screen**: a star on each tactic option worth changing for your line-up, with its gain;
 3. **the line-up screen**: the five suggested starters (strength, position rating, champion pool);
-4. **a Meta Analysis page** in the left menu: champions (lane filter, lane-phase gold), pairs, players with training suggestions, patch changes, the model;
+4. **a Meta Analysis page** in the left menu (in game 0.7.0's new UI: in the title bar at the top, left of the game's own buttons; none in the gamepad layout): champions (lane filter, lane-phase gold), pairs, players with training suggestions, patch changes, the model;
 5. **an F8 panel** on any screen: tier list, scouting of your next opponent, your players' pools, the model's held-out accuracy;
 6. **the AI's bans and picks**, valued in the actual draft (a ban by how much worse the enemy's best options in its open lanes get without the champion - an equally good substitute makes it worth little, a flex pick more - less what it takes from our own options; a pick also by what it does to the team's composition) (position locks are left to Smart Position Lock, a separate mod; the advice skips the cards it locks); from game 0.6.4, which hands both line-ups to the AI, also by the fielded players: a pick counts the mastery of the team's player in the lane it would play, a ban that of the enemy's player, times `player_mastery` (0.5, at most ±0.5 log-odds per player before it) - the AI leans to its players' best champions and bans the enemy players' best. The mastery is the model's own player-on-champion effect from this save's matches, not the game's proficiency number, which the game's own score already counts; unknown players, no line-up (older games) or `player_mastery=0` leave the value as before;
 7. **your team's tier list**;
@@ -161,4 +170,4 @@ The game prunes old match records; each save's matches are also kept in `history
 - Game 0.6.4 adds a lane-assignment step after an AI team's picks; this mod stays out of it (when several mods decide, the last one wins), so the game or Smart Position Lock assigns the lanes.
 - Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.
-- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK as shipped with game 0.6.5 (ABI level 10, 0.6.4's plus the frozen abi_level_10.txt); the DLL asks for level 1 only, so it still loads on 0.6.0-0.6.3.
+- MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK as shipped with game 0.6.5 (ABI level 10, 0.6.4's plus the frozen abi_level_10.txt; game 0.7.0 ships it unchanged); the DLL asks for level 1 only, so it still loads on 0.6.0-0.6.3.
