@@ -503,6 +503,21 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             reg.id(Key::Comp(f as u8));
         }
     }
+    // Each stat weight and category offset is tied to many champions: fitted as is, its
+    // curvature would be hundreds of times a champion's and L-BFGS would crawl (hundreds of
+    // iterations). So the fit sees it scaled to a champion's: weight = scale * parameter, with
+    // scale = 1 / sqrt(champions it is tied to), and the prior widened to match.
+    let mut group_sizes: HashMap<u8, usize> = HashMap::new();
+    for (g, _) in features.iter().flatten() {
+        *group_sizes.entry(*g).or_default() += 1;
+    }
+    let stat_scale = 1.0 / (group_sizes.values().sum::<usize>().max(1) as f32).sqrt();
+    let group_scale = |g: u8| 1.0 / (group_sizes.get(&g).copied().unwrap_or(1).max(1) as f32).sqrt();
+    let scale_of = |key: Key| match key {
+        Key::StatW(_) => stat_scale,
+        Key::Group(g) => group_scale(g),
+        _ => 1.0,
+    };
     if features.iter().any(Option::is_some) {
         for k in 0..FEATURES {
             reg.id(Key::StatW(k as u8));
@@ -638,9 +653,9 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Some((group, z)) => {
                 let mut terms = vec![(first, 1.0)];
                 for (k, v) in z.iter().enumerate().filter(|(_, v)| **v != 0.0) {
-                    terms.push((reg.id(Key::StatW(k as u8)), -v));
+                    terms.push((reg.id(Key::StatW(k as u8)), -v * stat_scale));
                 }
-                terms.push((reg.id(Key::Group(*group)), -1.0));
+                terms.push((reg.id(Key::Group(*group)), -group_scale(*group)));
                 problem.links.push(Link { precision: 1.0 / (set.first_sd * set.first_sd), target: tier * set.lol_prior, terms });
             }
             None => problem.prior(first, tier * set.lol_prior, set.first_sd),
@@ -670,8 +685,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         }
         let sd = match key {
             Key::Side | Key::Champ(..) | Key::Comp(_) => continue,
-            Key::StatW(_) => set.stat_sd,
-            Key::Group(_) => set.group_sd,
+            Key::StatW(_) => set.stat_sd / stat_scale,
+            Key::Group(g) => set.group_sd / group_scale(*g),
             Key::Role(..) => set.role_sd,
             Key::Athlete(_) => set.athlete_sd,
             Key::Mastery(..) => set.mastery_sd,
@@ -697,6 +712,11 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             },
             None => Effect::default(),
         }
+    };
+    // a stat weight or category offset as it counts (the fit saw it scaled)
+    let scaled = |key: Key| -> Effect {
+        let (e, s) = (effect(key), scale_of(key));
+        Effect { value: e.value * s, sd: e.sd * s, ..e }
     };
 
     let mut champions = Vec::with_capacity(champ_count as usize);
@@ -739,7 +759,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             pick_rate: per_match(picks.get(&c).copied().unwrap_or(0)),
             ban_rate: per_match(bans.get(&c).copied().unwrap_or(0)),
             from_stats: features[c as usize].as_ref().map(|(g, z)| {
-                z.iter().enumerate().map(|(k, v)| v * effect(Key::StatW(k as u8)).value).sum::<f32>() + effect(Key::Group(*g)).value
+                z.iter().enumerate().map(|(k, v)| v * scaled(Key::StatW(k as u8)).value).sum::<f32>() + scaled(Key::Group(*g)).value
             }),
             name,
         });
@@ -786,7 +806,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
                 out.comp[f as usize] = effect(*key);
             }
             Key::StatW(k) => {
-                out.stat_weights[k as usize] = effect(*key);
+                out.stat_weights[k as usize] = scaled(*key);
             }
             _ => {}
         }
@@ -1182,6 +1202,19 @@ pub(crate) mod tests {
         // without stats a champion never seen is average
         let without = build(&Inputs { stats: None, ..inp }, &set);
         assert!(!without.stat_prior && without.champion("m").unwrap().strength.abs() < 1e-3);
+        // a pool as big as the game's (two hundred more, never seen): the stat weights are
+        // fitted on a champion's scale, so the fit still converges about as fast
+        let mut pool = champions.clone();
+        let mut big = stats.clone();
+        for i in 0..200 {
+            let n = format!("x{i}");
+            let base = [40.0 + (i * 37 % 120) as f32, (i * 13 % 50) as f32, 800.0 + (i * 71 % 400) as f32, 20.0, 20.0, 900.0];
+            big.insert(n.clone(), Stats { category: Some((i % 5) as u8), base, growth: [(i % 7) as f32; 6] });
+            pool.push(n);
+        }
+        let fast = build(&Inputs { champions: &pool, stats: Some(&big), ..inp }, &set);
+        let plain = build(&Inputs { champions: &pool, stats: None, ..inp }, &set);
+        assert!(fast.sweeps <= 3 * plain.sweeps + 20, "{} vs {} iterations", fast.sweeps, plain.sweeps);
         let off = build(&inp, &Settings { stat_prior: false, ..set });
         assert!(!off.stat_prior && off.champion("m").unwrap().from_stats.is_none());
     }
