@@ -4,8 +4,10 @@
 //! decisions apply the lock's own rule here, with the lock's own table:
 //!
 //! - a champion's lanes: the lock's `settings.ini` `[positions]` (the player's list), else its
-//!   built-in list (`league_positions.ini` in its folder), else the main positions it learned from
-//!   the ban/pick cards (`positions.json`), else every lane;
+//!   built-in list (compiled into the lock; this mod carries the same file,
+//!   `knowledge::POSITIONS` - the `league_positions.ini` in the lock's folder is an older copy
+//!   for reading), else the main positions it learned from the ban/pick cards
+//!   (`positions.json`), else every lane;
 //! - a pick is legal when the team's champions and it can still be seated one per lane (when
 //!   none is legal, any is - as the lock does);
 //! - the lock's switches: `[lock]` `enabled`, `ai` (AI teams), `player` (the player's team).
@@ -153,7 +155,7 @@ pub fn dir() -> Option<PathBuf> {
 fn read(dir: &Path) -> Option<Table> {
     let text = |name: &str| std::fs::read(dir.join(name)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
     let settings = text("settings.ini")?;
-    Some(parse(&settings, &text("league_positions.ini").unwrap_or_default(), &text("positions.json").unwrap_or_default()))
+    Some(parse(&settings, crate::knowledge::POSITIONS, &text("positions.json").unwrap_or_default()))
 }
 
 static TABLE: RwLock<Option<Arc<Table>>> = RwLock::new(None);
@@ -258,5 +260,28 @@ mod tests {
         assert_eq!(t.pickable(&["a"], &[(2, "c")]), vec![2]);
         assert!(fits(&[[true, false, false, false, false]; 1]));
         assert!(!fits(&[[true, false, false, false, false]; 2]));
+    }
+}
+
+/// The table read from a real lock folder:
+/// `PMA_LOCK_DIR=<mods>/smart_position_lock cargo test --release --lib lock::real -- --ignored --nocapture`
+#[cfg(test)]
+mod real {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn the_installed_locks_table() {
+        let Some(dir) = std::env::var_os("PMA_LOCK_DIR") else { return };
+        let t = read(Path::new(&dir)).expect("the lock's settings");
+        eprintln!("{} listed, {} learned, ai {}, player {}", t.positions.len(), t.learned.len(), t.ai, t.player);
+        let bottom = [false, false, false, true, false];
+        assert_eq!(t.allowed("league_zeri"), bottom, "the lock keeps Zeri in the bottom lane");
+        assert_eq!(t.allowed("league_tristana"), bottom);
+        let offer = [(1, "league_zeri"), (2, "league_ahri")];
+        assert_eq!(t.pickable(&["league_tristana"], &offer), vec![2], "Tristana and Zeri cannot both be seated");
+        for c in ["tft_loris", "league_nunu", "tft_krug", "league_alistar"] {
+            eprintln!("  {c}: {:?}", t.allowed(c));
+        }
     }
 }
