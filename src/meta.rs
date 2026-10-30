@@ -475,7 +475,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let k = knowledge::get();
     let profiles: Vec<Option<Profile>> = (0..champ_count).map(|c| k.profiles.get(names.name(c)).cloned()).collect();
     let lane_priors: Vec<Option<[f32; 5]>> =
-        (0..champ_count).map(|c| k.positions.get(names.name(c)).map(|r| knowledge::lane_prior(r))).collect();
+        (0..champ_count).map(|c| knowledge::positions_of(names.name(c)).map(|r| knowledge::lane_prior(&r))).collect();
     let open_slot = profiles.iter().any(Option::is_some).then(|| knowledge::average(profiles.iter().flatten()));
     let comp_inputs = open_slot.as_ref().map(|avg| (profiles.as_slice(), avg));
     let features: Vec<Option<(u8, [f32; FEATURES])>> = match inp.stats.filter(|_| set.stat_prior) {

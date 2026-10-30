@@ -61,6 +61,12 @@ pub fn get() -> &'static Knowledge {
     K.get_or_init(|| parse(POSITIONS, COMP))
 }
 
+/// A champion's lanes, main first: Smart Position Lock's when it lists the champion (the lanes it
+/// will let the champion play, `lock`), else the built-in League ones.
+pub fn positions_of(champ: &str) -> Option<Vec<Role>> {
+    crate::lock::get().and_then(|t| t.positions.get(champ).cloned()).or_else(|| get().positions.get(champ).cloned())
+}
+
 fn lines(text: &str) -> impl Iterator<Item = (String, &str)> + '_ {
     let mut section = String::new();
     text.lines().filter_map(move |raw| {

@@ -168,15 +168,13 @@ pub fn ai_choice(
 ) -> Option<u16> {
     let meta = &snapshot.meta;
     let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
-    let open = advisor::open_lanes(meta, ally);
-    // no position lock hands its holds over here: a pick must fit a lane still open
-    let pickable: Vec<u16> = offer.iter().copied().filter(|c| advisor::fits_lanes(meta, *c, &open)).collect();
+    let pickable = lane_fits(snapshot, ally, &offer, |t| t.ai);
     let damage = |c: u16| snapshot.damage_of(c);
     let turn = advisor::TurnInput {
         us: advisor::Team::new(ally, &lineups.ally),
         them: advisor::Team::new(enemy, &lineups.enemy),
         offer: &offer,
-        pickable: if pickable.is_empty() { &offer } else { &pickable },
+        pickable: &pickable,
         banning: ban,
         blue: advisor::side_from_order(bans, ally.len(), enemy.len(), ban),
         bans_made: bans,
@@ -263,14 +261,33 @@ pub fn coach_choice(
     let held: &[u16] = plan.as_ref().map_or(&[], |p| p.held.as_slice());
     let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
     let draft = Draft { ally, enemy, offer: &offer, lineups };
-    let open = advisor::open_lanes(&snapshot.meta, ally);
+    let fits = lane_fits(snapshot, ally, &offer, |t| t.player);
     offer
         .iter()
         .copied()
-        .filter(|c| ban || (!held.contains(c) && advisor::fits_lanes(&snapshot.meta, *c, &open)))
+        .filter(|c| ban || (!held.contains(c) && fits.contains(c)))
         .map(|c| (c, value_with(snapshot, c, &draft, ban, player_weight).total))
         .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(c, _)| (c, CoachSource::Model))
+}
+
+/// The champions of `offer` a team that picked `ally` may pick: by Smart Position Lock's own rule
+/// and table when it holds this team's picks (`holds`: its AI or player switch) - a deciding hook
+/// goes past its score - else those that fit a lane the model sees still open.
+fn lane_fits(snapshot: &Snapshot, ally: &[u16], offer: &[u16], holds: impl Fn(&crate::lock::Table) -> bool) -> Vec<u16> {
+    let names = &snapshot.meta.names;
+    match crate::lock::get().filter(|t| holds(t)) {
+        Some(t) => {
+            let team: Vec<&str> = ally.iter().map(|c| names.name(*c)).collect();
+            let named: Vec<(u16, &str)> = offer.iter().map(|c| (*c, names.name(*c))).collect();
+            t.pickable(&team, &named)
+        }
+        None => {
+            let open = advisor::open_lanes(&snapshot.meta, ally);
+            let fit: Vec<u16> = offer.iter().copied().filter(|c| advisor::fits_lanes(&snapshot.meta, *c, &open)).collect();
+            if fit.is_empty() { offer.to_vec() } else { fit }
+        }
+    }
 }
 
 /// A team's fielded players and the lane each plays (`None`: not known).
@@ -1086,5 +1103,33 @@ mod tests {
         shared::set_player_team(None);
         shared::clear();
         crate::reset_for_tests();
+    }
+
+    /// With Smart Position Lock holding AI picks, ai_draft only takes what the lock would let the
+    /// team seat - here the strongest, c, plays only Mid and the team's a already does.
+    #[test]
+    fn ai_draft_keeps_to_the_locks_lanes() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let s = snapshot();
+        let id = |n: &str| s.meta.names.get(n).unwrap();
+        let available: Vec<(usize, u16)> = (0..12u16).filter(|c| *c != id("a")).map(|c| (c as usize, c)).collect();
+        let none = Lineups::default();
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none), Some(id("c")), "no lock: the strongest");
+        let table = crate::lock::parse("[lock]
+ai=on
+[positions]
+a=Mid
+c=Mid
+", "", "");
+        crate::lock::set(Some(table.clone()));
+        let pick = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none).unwrap();
+        assert_ne!(pick, id("c"), "c cannot be seated next to a");
+        // bans are not held
+        assert!(ai_choice(&s, &[id("a")], &[], 6, true, &available, &none).is_some());
+        // the lock's AI switch off: not held
+        crate::lock::set(Some(crate::lock::Table { ai: false, ..table }));
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none), Some(id("c")));
+        crate::lock::set(None);
     }
 }
