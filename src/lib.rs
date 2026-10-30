@@ -28,6 +28,7 @@ pub mod glm;
 pub mod hell;
 pub mod history;
 pub mod knowledge;
+pub mod lock;
 pub mod meta;
 pub mod model;
 mod paths;
@@ -83,6 +84,7 @@ pub fn reset_for_tests() {
     compat::set(compat::Others::default());
     client::reset_for_tests();
     shared::clear();
+    lock::set(None);
     server::reset_for_tests();
     draft::reset_for_tests();
     config::load_now();

@@ -135,6 +135,7 @@ pub fn load() {
             None => diag::log("\"Hell Draft AI\" is enabled but its settings were not found: both sides assumed"),
         }
     }
+    crate::lock::load(others.enabled.as_ref().is_some_and(|e| e.iter().any(|id| id == crate::lock::MOD_ID)));
     if let Some(name) = others.position_lock() {
         diag::log(&format!("\"{name}\" locks positions: its locks hold the AI's picks, and the advice skips cards it locked"));
     }
