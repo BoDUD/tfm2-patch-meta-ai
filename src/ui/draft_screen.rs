@@ -228,9 +228,6 @@ pub fn last_review() -> Option<Review> {
 /// Spending a champion nothing replaces in a Fearless series costs this share of what it is
 /// worth over the next option, times the share of the series still to come.
 const CONSERVE: f32 = 0.4;
-/// Candidates the lookahead plays out, and the champions it plays with.
-const LOOKAHEAD: usize = 5;
-const LOOKAHEAD_POOL: usize = 28;
 
 /// A team's style and worst gap, in a few words (its open slots counted as average champions).
 fn comp_text(meta: &crate::meta::Meta, picks: &[u16]) -> String {
@@ -569,10 +566,6 @@ fn breakdown_text(d: &Drawn, champ: u16) -> Option<String> {
     (!out.is_empty()).then(|| out.join("    |    "))
 }
 
-/// A pick of ours also keeps the champion from the enemy: this share of what banning it would
-/// take from them counts.
-const CONTEST: f32 = 0.5;
-
 impl DraftScreen {
     /// One frame on a screen that may be the ban/pick screen.
     pub fn tick(&mut self, ui: &mut impl Ui, frame: u64, snapshot: Option<&Arc<Snapshot>>, names: &NameBook, view: &View<'_>) {
@@ -595,6 +588,7 @@ impl DraftScreen {
             // the AI's decisions from now on are the player's own match (diag.log)
             crate::draft::set_live(true);
             crate::shared::take_coach_choices();
+            crate::shared::take_ai_choices();
         }
         if frame < self.next_read {
             return;
@@ -782,8 +776,24 @@ impl DraftScreen {
                 .count();
             format!(", coach override {} decided, {taken} of them made", coach.len())
         };
+        // ai_draft's choices for the other team, the same way
+        let ai = crate::shared::take_ai_choices();
+        let ai_note = if ai.is_empty() {
+            String::new()
+        } else {
+            let names = crate::shared::get().map(|s| s.meta.names.clone());
+            let theirs: Vec<&ReviewRow> = review.rows.iter().filter(|r| r.ours == Some(false)).collect();
+            let made = ai
+                .iter()
+                .filter(|(ban, c)| {
+                    let name = names.as_ref().map(|n| n.name(*c).to_string()).unwrap_or_default();
+                    theirs.iter().any(|r| r.ban == *ban && r.champ == name)
+                })
+                .count();
+            format!(", ai_draft {} decided, {made} of them made", ai.len())
+        };
         diag::log(&format!(
-            "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised){coach_note}, win chance at the end {}",
+            "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised){coach_note}{ai_note}, win chance at the end {}",
             review.team,
             review.enemy,
             review.rows.len(),
@@ -946,33 +956,36 @@ impl DraftScreen {
         });
 
         // advice
-        let ally_open = advisor::open_lanes(meta, &ally);
         let their_left = 5usize.saturating_sub(enemy.len());
         let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref(), lean: None };
         let them =
             advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref(), lean: their_lean.as_deref() };
         let blue = turn.side_known.then_some(side == 0);
-        // our bans, valued by what they take from the enemy's draft
-        let mut board = advisor::ban_board(meta, us, them, advisor::Mastery::FULL, &damage, &open, blue);
-        let by_ban: HashMap<u16, advisor::BanValue> = board.iter().map(|b| (b.champ, b.clone())).collect();
         // a Fearless series with games left: spending what nothing replaces costs a little
         let series = series_left(&ui.text(SERIES).unwrap_or_default(), fearless);
         let conserve_share = series.map_or(0.0, |(left, n)| CONSERVE * left as f32 / (n - 1).max(1) as f32);
-        let mut pick_values: Vec<PickValue> = pickable
-            .iter()
-            .map(|c| {
-                let mut v = advisor::with_exposure(meta, advisor::pick_value_in(meta, *c, &ally, &enemy, players, &damage, &ally_open), their_left, &open);
-                let b = by_ban.get(c);
-                // taking it also keeps it from them
-                v.contest = CONTEST * b.map_or(0.0, |b| b.deny);
-                v.conserve = conserve_share * b.map_or(0.0, |b| b.own);
-                v.total += v.contest - v.conserve;
-                v
-            })
-            .collect();
-        pick_values.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
-        // the enemy's turn to ban: what they would most want to take from us
         let their_turn = turn.acting.is_some_and(|a| a != side);
+        let banned = cards.iter().filter(|c| c.banned).count();
+        // our bans and picks, the best few played out on our turn of a 3+2 draft (the same
+        // ranking the AI drafts by with ai_draft on)
+        let plan = advisor::plan_turn(
+            meta,
+            &advisor::TurnInput {
+                us,
+                them,
+                offer: &open,
+                pickable: &pickable,
+                banning: turn.banning,
+                blue,
+                bans_made: banned,
+                lookahead: !their_turn && !turn.swapping,
+                conserve: conserve_share,
+            },
+            &damage,
+        );
+        let advisor::TurnPlan { board, picks: pick_values, outlook } = plan;
+        let by_ban: HashMap<u16, advisor::BanValue> = board.iter().map(|b| (b.champ, b.clone())).collect();
+        // the enemy's turn to ban: what they would most want to take from us
         let mut their_bans = if turn.banning && their_turn {
             advisor::ban_board(meta, them, us, advisor::Mastery::FULL, &damage, &open, blue.map(|b| !b))
         } else {
@@ -982,39 +995,6 @@ impl DraftScreen {
         if them.lean.is_some() {
             let rating = |c: u16| them.hell_rating(meta, c).unwrap_or(f32::NEG_INFINITY);
             their_bans.sort_by(|a, b| rating(b.champ).partial_cmp(&rating(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
-        }
-
-        // lookahead: on our turn of a 3+2 draft, the best few played out to the end
-        let banned = cards.iter().filter(|c| c.banned).count();
-        let (blue_picks, red_picks) = if side == 0 { (ally.len(), enemy.len()) } else { (enemy.len(), ally.len()) };
-        let at = advisor::order_position(banned, blue_picks, red_picks)
-            .filter(|i| turn.side_known && advisor::ORDER_3_2[*i].blue == (side == 0) && advisor::ORDER_3_2[*i].ban == turn.banning)
-            .filter(|_| !their_turn && !turn.swapping);
-        let mut outlook: HashMap<u16, f32> = HashMap::new();
-        if let Some(at) = at {
-            let candidates: Vec<u16> = if turn.banning {
-                board.iter().take(LOOKAHEAD).map(|b| b.champ).collect()
-            } else {
-                pick_values.iter().take(LOOKAHEAD).map(|v| v.champ).collect()
-            };
-            let mut pool = advisor::lookahead_pool(meta, &open, LOOKAHEAD_POOL);
-            for c in &candidates {
-                if !pool.contains(c) {
-                    pool.push(*c);
-                }
-            }
-            let (blue_team, red_team) = if side == 0 { (us, them) } else { (them, us) };
-            for c in candidates {
-                let blue_wins = advisor::simulate(meta, blue_team, red_team, &pool, at, c, &damage);
-                outlook.insert(c, if side == 0 { blue_wins } else { 1.0 - blue_wins });
-            }
-            // the candidates played out lead, in the order of the draft they lead to
-            let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0);
-            if turn.banning {
-                board.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
-            } else {
-                pick_values.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
-            }
         }
 
         // the coach override follows this ranking when the game's coach drafts for us

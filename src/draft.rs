@@ -100,12 +100,90 @@ impl StableDraftHook for CoachHook {
     }
 
     fn decide_ban(&self, ctx: &StableDraftContext<'_>) -> Option<usize> {
-        coach_decide(ctx, true)
+        coach_decide(ctx, true).or_else(|| ai_decide(ctx, true))
     }
 
     fn decide_pick(&self, ctx: &StableDraftContext<'_>) -> Option<usize> {
-        coach_decide(ctx, false)
+        coach_decide(ctx, false).or_else(|| ai_decide(ctx, false))
     }
+}
+
+/// AI decisions written to `diag.log` per game session besides those on screen (all of which
+/// are written).
+const AI_OFF_SCREEN_LINES: u32 = 6;
+static AI_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// `ai_draft=on`: every AI team's ban or pick, decided outright the way the draft screen would
+/// advise that team ([`advisor::plan_turn`]: the ban board, pick values, the 3+2 lookahead, the
+/// fielded players' mastery) - among the champions that fit a lane it still has open. `None`
+/// for the player's own team, with `ai_draft=off`, before the first fit, or with nothing on offer.
+pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
+    let cfg = config::get();
+    let acting = ctx.ally_team();
+    if !cfg.ai_draft || acting.is_none() || acting == shared::player_team() {
+        return None;
+    }
+    let snapshot = shared::get()?;
+    let model_id = |g: usize| ctx.champion_name(g).and_then(|n| snapshot.meta.names.get(n));
+    let ids = |list: &[usize]| -> Vec<u16> { list.iter().filter_map(|g| model_id(*g)).collect() };
+    let available: Vec<(usize, u16)> =
+        ctx.available_champions().iter().filter_map(|g| Some((*g, model_id(*g)?))).collect();
+    if available.is_empty() {
+        return None;
+    }
+    let (ally, enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
+    let bans = ctx.ally_bans().len() + ctx.enemy_bans().len();
+    let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
+    let champ = ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups)?;
+    let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
+    let live = LIVE.load(Ordering::Relaxed);
+    if live {
+        shared::note_ai_choice(ban, champ);
+    }
+    diag::log_once("ai-decides", "[ai] ai_draft=on: the AI teams' bans and picks follow the model (as the panel would advise them)");
+    if live || AI_LOGGED.fetch_add(1, Ordering::Relaxed) < AI_OFF_SCREEN_LINES {
+        diag::log(&format!(
+            "[ai] {} {} {} vs {}{}: {}",
+            team(&snapshot, acting),
+            if ban { "ban" } else { "pick" },
+            if ban { ctx.ally_bans().len() } else { ctx.ally_picks().len() } + 1,
+            team(&snapshot, ctx.enemy_team()),
+            if live { ", on screen" } else { "" },
+            snapshot.meta.names.name(champ)
+        ));
+    }
+    Some(game_id)
+}
+
+/// The AI's choice among `available` (game id, model id): the top of [`advisor::plan_turn`] for
+/// it, its side read from where a 3+2 draft stands (no lookahead when that does not tell).
+pub fn ai_choice(
+    snapshot: &Snapshot,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+) -> Option<u16> {
+    let meta = &snapshot.meta;
+    let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
+    let open = advisor::open_lanes(meta, ally);
+    // no position lock hands its holds over here: a pick must fit a lane still open
+    let pickable: Vec<u16> = offer.iter().copied().filter(|c| advisor::fits_lanes(meta, *c, &open)).collect();
+    let damage = |c: u16| snapshot.damage_of(c);
+    let turn = advisor::TurnInput {
+        us: advisor::Team::new(ally, &lineups.ally),
+        them: advisor::Team::new(enemy, &lineups.enemy),
+        offer: &offer,
+        pickable: if pickable.is_empty() { &offer } else { &pickable },
+        banning: ban,
+        blue: advisor::side_from_order(bans, ally.len(), enemy.len(), ban),
+        bans_made: bans,
+        lookahead: true,
+        conserve: 0.0,
+    };
+    advisor::plan_turn(meta, &turn, &damage).ranked(ban).first().copied()
 }
 
 /// Where a coach decision came from.
@@ -628,6 +706,7 @@ fn lineup_line(ctx: &StableDraftContext<'_>, snapshot: &Snapshot, lineups: &Line
 pub fn reset_for_tests() {
     LIVE.store(false, Ordering::Relaxed);
     LIVE_LOGGED.store(0, Ordering::Relaxed);
+    AI_LOGGED.store(0, Ordering::Relaxed);
     OFF_SCREEN_LOGGED.store(0, Ordering::Relaxed);
     LINEUPS_SEEN.lock().unwrap_or_else(PoisonError::into_inner).clear();
     PENDING.with(|cell| *cell.borrow_mut() = None);
@@ -948,6 +1027,62 @@ mod tests {
         assert_eq!(decide(&ctx_for(12)), None, "another team");
         assert_eq!(shared::take_coach_choices(), vec![(false, c)]);
         assert_eq!(CoachHook.priority(), i32::MAX);
+        shared::set_player_team(None);
+        shared::clear();
+        crate::reset_for_tests();
+    }
+
+    /// ai_draft: every AI team decides by the model; the player's team is left to the coach.
+    #[test]
+    fn ai_draft_decides_for_the_ai_teams() {
+        use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
+        let _serial = crate::tests::serial();
+        let dir = std::env::temp_dir().join(format!("patch_meta_ai_ai_draft_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var(crate::paths::DIR_ENV, &dir);
+        crate::reset_for_tests();
+        let names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
+        let briefs: Vec<ChampionBriefV1> =
+            names.iter().map(|n| ChampionBriefV1 { name: StrV1::from_str(n), ..Default::default() }).collect();
+        let available: Vec<usize> = (0..names.len()).collect();
+        let ctx_for = |team: usize, phase: DraftPhaseV1| {
+            // SAFETY: a plain C struct; every pointer set below outlives the calls
+            let mut raw: DraftCtxV1 = unsafe { std::mem::zeroed() };
+            raw.size = std::mem::size_of::<DraftCtxV1>();
+            raw.phase = phase.code();
+            raw.available_ptr = available.as_ptr();
+            raw.available_len = available.len();
+            raw.champion_briefs_ptr = briefs.as_ptr();
+            raw.champion_briefs_len = briefs.len();
+            raw.ally_team = team;
+            raw.enemy_team = 19;
+            raw
+        };
+        let decide = |raw: &DraftCtxV1, ban: bool| {
+            // SAFETY: `raw` lives for the call
+            let ctx = unsafe { StableDraftContext::from_raw(raw) }.unwrap();
+            if ban { CoachHook.decide_ban(&ctx) } else { CoachHook.decide_pick(&ctx) }
+        };
+        let s = snapshot();
+        let c = s.meta.names.get("c").unwrap();
+        shared::publish(s);
+        shared::set_player_team(Some(19));
+        let ai_pick = ctx_for(12, DraftPhaseV1::Pick);
+        assert_eq!(decide(&ai_pick, false), None, "ai_draft is off by default");
+        config::set_for_tests(config::Config { ai_draft: true, ..config::Config::default() });
+        set_live(true);
+        shared::take_ai_choices();
+        assert_eq!(decide(&ai_pick, false), Some(c as usize), "the strongest");
+        assert!(decide(&ctx_for(12, DraftPhaseV1::Ban), true).is_some());
+        assert_eq!(shared::take_ai_choices().first(), Some(&(false, c)), "noted for the review");
+        // the player's own team: the coach override, never ai_draft
+        let ours = ctx_for(19, DraftPhaseV1::Pick);
+        // SAFETY: `ours` lives for the call
+        assert_eq!(ai_decide(&unsafe { StableDraftContext::from_raw(&ours) }.unwrap(), false), None);
+        set_live(false);
+        let log = std::fs::read_to_string(dir.join(diag::LOG_FILE)).unwrap();
+        assert!(log.contains("[ai] team #12 pick 1 vs team #19, on screen: c"), "{log}");
         shared::set_player_team(None);
         shared::clear();
         crate::reset_for_tests();
