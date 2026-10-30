@@ -52,6 +52,9 @@ pub struct Config {
     /// The player's own team's draft when the game's coach drafts for it (coach delegation)
     /// follows the model, even with `ban_pick` off.
     pub coach: bool,
+    /// Every AI team bans and picks outright the way the advice would have it (a hard opponent;
+    /// over other draft mods' decisions).
+    pub ai_draft: bool,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -123,6 +126,7 @@ impl Default for Config {
         Self {
             ban_pick: Switch::Auto,
             coach: true,
+            ai_draft: false,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -246,6 +250,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
         "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
         "coach" => cfg.coach = flag(value)?,
+        "ai_draft" => cfg.ai_draft = flag(value)?,
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
@@ -379,6 +384,12 @@ struct Watch {
 static CURRENT: RwLock<Option<Arc<Config>>> = RwLock::new(None);
 static WATCH: Mutex<Watch> = Mutex::new(Watch { next_check: None, stamp: None });
 
+/// Test support: these settings in force (until the next load).
+#[doc(hidden)]
+pub fn set_for_tests(cfg: Config) {
+    *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(cfg));
+}
+
 /// The settings in force (defaults until the file was read).
 pub fn get() -> Arc<Config> {
     let guard = CURRENT.read().unwrap_or_else(PoisonError::into_inner);
@@ -457,11 +468,12 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} coach={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+        "ban_pick={} coach={} ai_draft={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
+        if c.ai_draft { "on" } else { "off" },
         c.tier_list.as_str(),
         c.patches,
         c.drift,
@@ -522,6 +534,12 @@ ban_pick=auto
 ; coach : 选人时交给游戏的教练托管时，你自己的队伍完全照面板的建议禁用和选人（最后决定，别的 BP Mod
 ;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。
 coach=on
+; ai_draft : every AI team bans and picks the way this mod would advise it - the same ranking,
+;            3+2 lookahead and players' mastery you see on the panel - decided outright, over
+;            other draft mods (Hell Draft AI). A hard opponent; also the AI-vs-AI matches.
+; ai_draft : 所有 AI 队伍都完全按本 Mod 的建议禁和选（和你在面板上看到的同一套排序、3+2 推演、
+;            选手熟练度），直接决定，盖过其他 BP Mod（地狱人机）。对手更难；AI 之间的比赛也一样。
+ai_draft=off
 tier_list=auto
 
 [model]

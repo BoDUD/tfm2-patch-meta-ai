@@ -797,6 +797,129 @@ pub fn simulate(
     win_probability(meta, &bp, &rp)
 }
 
+// ------------------------------------------------------------------------------ one turn
+
+/// A pick also keeps the champion from the enemy: this share of what banning it would take from
+/// them counts.
+pub const CONTEST: f32 = 0.5;
+/// Candidates the lookahead plays out, and the champions it plays with.
+pub const LOOKAHEAD: usize = 5;
+pub const LOOKAHEAD_POOL: usize = 28;
+
+/// One team's turn: what the draft screen advises the player, and what the AI does with
+/// `ai_draft` on.
+#[derive(Clone, Copy)]
+pub struct TurnInput<'a> {
+    pub us: Team<'a>,
+    pub them: Team<'a>,
+    /// Still on offer, and what of it `us` may pick (a position lock may hold some).
+    pub offer: &'a [u16],
+    pub pickable: &'a [u16],
+    pub banning: bool,
+    /// `us` is the blue side (`None`: not known - then no lookahead).
+    pub blue: Option<bool>,
+    /// Bans made so far, both sides (where a 3+2 draft stands).
+    pub bans_made: usize,
+    /// Play the best few out to the end of a 3+2 draft when it is `us`'s turn in it.
+    pub lookahead: bool,
+    /// Fearless series: the share of what a pick takes from our later games that counts.
+    pub conserve: f32,
+}
+
+/// [`plan_turn`]'s ranking.
+#[derive(Clone, Debug, Default)]
+pub struct TurnPlan {
+    /// Our bans, best first (the lookahead's order when it ran on a ban).
+    pub board: Vec<BanValue>,
+    /// Our picks, best first (likewise).
+    pub picks: Vec<PickValue>,
+    /// The win chance each played-out candidate leads to (lookahead).
+    pub outlook: HashMap<u16, f32>,
+}
+
+impl TurnPlan {
+    /// The champions of this turn, best first: bans or picks.
+    pub fn ranked(&self, banning: bool) -> Vec<u16> {
+        if banning {
+            self.board.iter().map(|b| b.champ).collect()
+        } else {
+            self.picks.iter().map(|v| v.champ).collect()
+        }
+    }
+}
+
+/// Ranks a team's bans (by what they take from the enemy's draft) and picks (value in an open
+/// lane, how counterable while the enemy has picks left, and half of what it would take from them
+/// as a ban); on its turn of a 3+2 draft the best few are played out to the end and lead in the
+/// order of the win chance they end in.
+pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<Damage>) -> TurnPlan {
+    let (ally, enemy) = (t.us.picks, t.them.picks);
+    let mut board = ban_board(meta, t.us, t.them, Mastery::FULL, damage, t.offer, t.blue);
+    let by_ban: HashMap<u16, &BanValue> = board.iter().map(|b| (b.champ, b)).collect();
+    let open = open_lanes(meta, ally);
+    let their_left = 5usize.saturating_sub(enemy.len());
+    let mut picks: Vec<PickValue> = t
+        .pickable
+        .iter()
+        .map(|c| {
+            let mut v = with_exposure(meta, pick_value_in(meta, *c, ally, enemy, t.us.players, damage, &open), their_left, t.offer);
+            let b = by_ban.get(c);
+            v.contest = CONTEST * b.map_or(0.0, |b| b.deny);
+            v.conserve = t.conserve * b.map_or(0.0, |b| b.own);
+            v.total += v.contest - v.conserve;
+            v
+        })
+        .collect();
+    drop(by_ban);
+    picks.sort_by(|a, b| b.total.partial_cmp(&a.total).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut outlook = HashMap::new();
+    let at = t.blue.filter(|_| t.lookahead).and_then(|blue| {
+        let (bp, rp) = if blue { (ally.len(), enemy.len()) } else { (enemy.len(), ally.len()) };
+        order_position(t.bans_made, bp, rp).filter(|i| ORDER_3_2[*i].blue == blue && ORDER_3_2[*i].ban == t.banning).map(|i| (i, blue))
+    });
+    if let Some((at, blue)) = at {
+        let candidates: Vec<u16> = if t.banning {
+            board.iter().take(LOOKAHEAD).map(|b| b.champ).collect()
+        } else {
+            picks.iter().take(LOOKAHEAD).map(|v| v.champ).collect()
+        };
+        let mut pool = lookahead_pool(meta, t.offer, LOOKAHEAD_POOL);
+        for c in &candidates {
+            if !pool.contains(c) {
+                pool.push(*c);
+            }
+        }
+        let (blue_team, red_team) = if blue { (t.us, t.them) } else { (t.them, t.us) };
+        for c in candidates {
+            let blue_wins = simulate(meta, blue_team, red_team, &pool, at, c, damage);
+            outlook.insert(c, if blue { blue_wins } else { 1.0 - blue_wins });
+        }
+        let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0);
+        if t.banning {
+            board.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            picks.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+    TurnPlan { board, picks, outlook }
+}
+
+/// Which side a team is when the game does not say, from where the draft stands: the side whose
+/// next step of [`ORDER_3_2`] is this team's ban or pick (`None`: another draft format, or either
+/// side fits).
+pub fn side_from_order(bans_made: usize, ours: usize, theirs: usize, banning: bool) -> Option<bool> {
+    let fits = |blue: bool| {
+        let (bp, rp) = if blue { (ours, theirs) } else { (theirs, ours) };
+        order_position(bans_made, bp, rp).is_some_and(|i| ORDER_3_2[i].blue == blue && ORDER_3_2[i].ban == banning)
+    };
+    match (fits(true), fits(false)) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,5 +1168,63 @@ mod tests {
         let hell = Team { lean: Some(&lean), ..plain };
         assert_eq!(hell.hell_ban(&m, &offer), Some(id("l")));
         assert!(hell.habit(id("l")) >= 2.0, "its picks lean the same way");
+    }
+
+    #[test]
+    fn the_side_from_where_the_draft_stands() {
+        // nothing done yet: blue bans first
+        assert_eq!(side_from_order(0, 0, 0, true), Some(true));
+        // one ban made: red's
+        assert_eq!(side_from_order(1, 0, 0, true), Some(false));
+        // six bans, no picks: blue picks first
+        assert_eq!(side_from_order(6, 0, 0, false), Some(true));
+        // blue has one pick, red none: red picks twice
+        assert_eq!(side_from_order(6, 0, 1, false), Some(false));
+        // phase two of the bans: red first
+        assert_eq!(side_from_order(6, 3, 3, true), Some(false));
+        // a pick asked where the order has a ban: another format
+        assert_eq!(side_from_order(0, 0, 0, false), None);
+    }
+
+    #[test]
+    fn a_turn_on_a_full_pool_is_quick_and_plays_out() {
+        // the game's pool: two hundred champions besides the twelve with games
+        let (names, games) = simulate(3000, "1.1", |n| match n {
+            "c" => 0.5,
+            "l" => -0.5,
+            _ => 0.0,
+        }, 11);
+        let mut champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        champions.extend((0..200).map(|i| format!("x{i}")));
+        let m = build(
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Settings::default(),
+        );
+        let offer: Vec<u16> = (0..m.names.len() as u16).collect();
+        let none = |_: u16| None;
+        let started = std::time::Instant::now();
+        let turn = TurnInput {
+            us: Team::new(&[], &[]),
+            them: Team::new(&[], &[]),
+            offer: &offer,
+            pickable: &offer,
+            banning: true,
+            blue: Some(true),
+            bans_made: 0,
+            lookahead: true,
+            conserve: 0.0,
+        };
+        let plan = plan_turn(&m, &turn, &none);
+        let took = started.elapsed();
+        assert_eq!(plan.outlook.len(), LOOKAHEAD, "the first ban of a 3+2 draft is played out");
+        assert!(plan.outlook.contains_key(&plan.board[0].champ), "the lookahead's best leads");
+        assert!(took.as_secs_f32() < 2.0, "{took:?}");
+        eprintln!("one turn on {} champions: {took:?}", offer.len());
+        // the side not known: no lookahead
+        let blind = plan_turn(&m, &TurnInput { blue: None, ..turn }, &none);
+        assert!(blind.outlook.is_empty());
+        // a pick: the strongest
+        let pick = plan_turn(&m, &TurnInput { banning: false, bans_made: 6, ..turn }, &none);
+        assert_eq!(pick.ranked(false)[0], m.names.get("c").unwrap());
     }
 }
