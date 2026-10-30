@@ -19,7 +19,9 @@ use std::sync::OnceLock;
 
 use crate::history::Role;
 
-const POSITIONS: &str = include_str!("../presets/league_positions.ini");
+/// Smart Position Lock's built-in list (a copy of its `presets/league_positions.ini`: keep them
+/// the same - the lock compiles it in, and its folder's copy may be older).
+pub const POSITIONS: &str = include_str!("../presets/league_positions.ini");
 const COMP: &str = include_str!("../presets/league_comp.ini");
 
 /// Damage type.
@@ -272,11 +274,14 @@ mod tests {
     #[test]
     fn the_built_in_tables_parse() {
         let k = get();
-        assert_eq!(k.positions.len(), 165, "positions");
+        assert!(k.positions.len() >= 195, "positions: {}", k.positions.len());
         assert_eq!(k.profiles.len(), 165, "profiles");
-        for id in k.positions.keys() {
-            assert!(k.profiles.contains_key(id), "{id} has no profile");
+        // every champion with a League profile has lanes (the list also has heroes without one)
+        for id in k.profiles.keys() {
+            assert!(k.positions.contains_key(id), "{id} has no lanes");
         }
+        assert_eq!(k.positions["league_zeri"], vec![Role::Bottom]);
+        assert_eq!(k.positions["tft_loris"], vec![Role::Support]);
         for (a, b, _) in k.synergy.iter().chain(&k.counters) {
             assert!(k.profiles.contains_key(a) && k.profiles.contains_key(b), "{a} / {b}");
         }

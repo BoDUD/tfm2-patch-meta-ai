@@ -136,7 +136,8 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
     let champ = ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups)?;
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
-    let live = LIVE.load(Ordering::Relaxed);
+    // the player's own match (the ban/pick screen is open, and the player's team is the other one)
+    let live = LIVE.load(Ordering::Relaxed) && ctx.enemy_team().is_some() && ctx.enemy_team() == shared::player_team();
     if live {
         shared::note_ai_choice(ban, champ);
     }

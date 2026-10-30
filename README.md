@@ -65,7 +65,7 @@
 
 - **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片名字那一行和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
 - **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
-- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。教练托管和困难 AI（`ai_draft`）是直接决定选谁的，会越过它的评分锁，所以 2.6.1 起本 Mod 直接读它的位置表（它 `settings.ini` 的 `[positions]`，没有的用它内置的 `league_positions.ini`，再没有的用它从选人卡片学到的 `positions.json`），按它的规则（选进来后全队还能一人一个位置排开）只选合法的英雄；它的 `ai` / `player` 开关关着时不限制对应的一方。模型估计英雄在哪些位置打时也以这张表为准。它的设置改了几秒内重新读。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。游戏 0.6.4 起 AI 选完人后还有一步"分配位置"，本 Mod 不参与：位置由游戏或 Smart Position Lock 决定（几个 Mod 同时决定时只有最后一个生效，所以本 Mod 不去抢）。
+- **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。教练托管和困难 AI（`ai_draft`）是直接决定选谁的，会越过它的评分锁，所以 2.6.1 起本 Mod 直接读它的位置表（它 `settings.ini` 的 `[positions]`，没有的用它内置的列表——本 Mod 带着同一份 `presets/league_positions.ini`，锁位置文件夹里那份 `league_positions.ini` 可能是旧的，不读——再没有的用它从选人卡片学到的 `positions.json`），按它的规则（选进来后全队还能一人一个位置排开）只选合法的英雄；它的 `ai` / `player` 开关关着时不限制对应的一方。模型估计英雄在哪些位置打时也以这张表为准。它的设置改了几秒内重新读。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。游戏 0.6.4 起 AI 选完人后还有一步"分配位置"，本 Mod 不参与：位置由游戏或 Smart Position Lock 决定（几个 Mod 同时决定时只有最后一个生效，所以本 Mod 不去抢）。
 - **地狱人机（JIN 的 Hell Draft AI）**：可以同时开。AI 队伍的 BP 交给它（`ban_pick=auto` 让出），本 Mod 按它的方式预测对方（见上文 2.5）；教练托管仍以本 Mod 为准。
 - **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
 
