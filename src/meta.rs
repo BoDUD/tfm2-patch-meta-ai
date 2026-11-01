@@ -75,6 +75,10 @@ pub struct Settings {
     /// Prior spread of what one standard deviation of a stat is worth, and of a category.
     pub stat_sd: f32,
     pub group_sd: f32,
+    /// A match this many matches (of its kind) older than the newest counts half (`None`: all
+    /// count alike), and whether the held-out matches choose it (`worker`).
+    pub recency: Option<f32>,
+    pub recency_auto: bool,
 }
 
 impl Default for Settings {
@@ -101,6 +105,8 @@ impl Default for Settings {
             stat_prior_auto: false,
             stat_sd: 0.06,
             group_sd: 0.1,
+            recency: None,
+            recency_auto: false,
         }
     }
 }
@@ -462,6 +468,20 @@ fn game_terms(game: &Game, version: u16, comp: Option<(&[Option<Profile>], &Prof
     }
 }
 
+/// How many newer matches of its kind (competition / solo rank) each game has, by record id -
+/// the order the game created them in.
+fn recency_ages(games: &[Game]) -> Vec<u32> {
+    let mut age = vec![0u32; games.len()];
+    for solo in [false, true] {
+        let mut order: Vec<usize> = (0..games.len()).filter(|i| games[*i].solo == solo).collect();
+        order.sort_by_key(|i| std::cmp::Reverse(games[*i].record));
+        for (rank, i) in order.into_iter().enumerate() {
+            age[i] = rank as u32;
+        }
+    }
+    age
+}
+
 pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let versions = kept_versions(inp.games, inp.current, set.max_patches);
     let version_index: HashMap<&str, u16> =
@@ -558,7 +578,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let mut athlete_lanes: HashMap<u32, [u32; 5]> = HashMap::new();
     let (mut matches, mut solo_matches, mut current_matches) = (0u32, 0u32, 0u32);
     let mut terms = Vec::new();
-    for game in inp.games {
+    let age = recency_ages(inp.games);
+    for (gi, game) in inp.games.iter().enumerate() {
         let Some(&vi) = version_index.get(game.version.as_str()) else { continue };
         if game.sides[0].is_empty() || game.sides[1].is_empty() {
             continue;
@@ -568,7 +589,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         let row_terms: Vec<(u32, f32)> = terms.iter().map(|(k, a)| (reg.id(*k), *a)).collect();
         rows.push(Row {
             y: if game.blue_win { 1.0 } else { 0.0 },
-            weight: if game.solo { set.solo_weight } else { 1.0 },
+            weight: if game.solo { set.solo_weight } else { 1.0 }
+                * set.recency.map_or(1.0, |half| 0.5f32.powf(age[gi] as f32 / half)),
             terms: row_terms,
         });
         if game.solo {
@@ -1229,5 +1251,28 @@ pub(crate) mod tests {
         // right as it is: kept
         let right: Vec<(f32, bool)> = (0..10).map(|i| (logit(0.8), i < 8)).collect();
         assert!((best_scale(&right).0 - 1.0).abs() <= 0.1);
+    }
+
+    #[test]
+    fn newer_matches_count_more_with_recency() {
+        // c was strong in the older half of the matches and weak in the newer half
+        let (names, mut games) = simulate(1600, "1.1", |n| if n == "c" { 0.8 } else { 0.0 }, 31);
+        let (_, newer) = simulate(1600, "1.1", |n| if n == "c" { -0.8 } else { 0.0 }, 32);
+        for (i, g) in games.iter_mut().enumerate() {
+            g.record = i;
+        }
+        games.extend(newer.into_iter().enumerate().map(|(i, mut g)| {
+            g.record = 1600 + i;
+            g
+        }));
+        let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None };
+        let flat = build(&inp, &Settings::default()).champion("c").unwrap().strength;
+        let recent = build(&inp, &Settings { recency: Some(400.0), ..Settings::default() }).champion("c").unwrap().strength;
+        assert!(recent < flat - 0.3 && recent < -0.3, "{flat} -> {recent}");
+        // ages count by record, newest 0
+        let ages = recency_ages(&games);
+        assert_eq!(ages[games.len() - 1], 0);
+        assert_eq!(ages[0] as usize, games.len() - 1);
     }
 }

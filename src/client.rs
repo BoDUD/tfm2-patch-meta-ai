@@ -639,6 +639,8 @@ struct Teams {
     /// Matches the `picks` lists count, per team.
     matches: HashMap<String, u32>,
     last_opponent: Option<String>,
+    /// Per team id: the share of its recent matches it played each champion in (`ai_draft`).
+    habits: HashMap<u32, HashMap<u16, f32>>,
 }
 
 /// Matches per team the "most played" lists count.
@@ -685,6 +687,8 @@ fn teams(st: &mut State, game: &mut impl Game, own: usize) -> Teams {
                 e.1 += g.won(*side) as u32;
             }
         }
+        let recent = list.len().clamp(1, RECENT_PER_TEAM) as f32;
+        out.habits.insert(team, counts.iter().map(|(c, (g, _))| (*c, *g as f32 / recent)).collect());
         let mut picks: Vec<(String, u32, u32)> =
             counts.into_iter().map(|(c, (g, w))| (st.names.name(c).to_string(), g, w)).collect();
         picks.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
@@ -853,6 +857,7 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
     }
     st.labels.date = game.game_date();
     let teams = teams(st, game, team);
+    shared::set_habits(teams.habits.clone());
     // the squad: every athlete of the player's team in the kept matches, and the last starting
     // five; their records are read in the background
     let mut squad: Vec<u32> = Vec::new();

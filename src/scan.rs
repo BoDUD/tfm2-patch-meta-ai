@@ -275,10 +275,19 @@ impl Scanner {
                 m.bans[1].iter().map(|b| names.id(b)).collect(),
             ],
             length: m.length.map(|t| t as f32),
-            tactics: [
-                m.strategies[0].iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect(),
-                m.strategies[1].iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect(),
-            ],
+            tactics: {
+                // what ai_tactics applied at the start, in place of the record's
+                let names = |ps: &[Player]| ps.iter().map(|p| p.champion.clone()).collect::<Vec<String>>();
+                let applied = crate::ai_tactics::override_for(&names(&m.blue), &names(&m.red));
+                let side = |i: usize| -> Vec<u16> {
+                    let list = match &applied[i] {
+                        Some(a) => crate::ai_tactics::merged(&m.strategies[i], a),
+                        None => m.strategies[i].clone(),
+                    };
+                    list.iter().map(|(s, o)| crate::history::tactic_id(s, o)).collect()
+                };
+                [side(0), side(1)]
+            },
         };
         self.games.insert(key, std::sync::Arc::new(game));
         let stats = self.versions.entry(m.version.clone()).or_default();

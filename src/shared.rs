@@ -112,3 +112,36 @@ pub fn note_ai_choice(ban: bool, champ: u16) {
 pub fn take_ai_choices() -> Vec<(bool, u16)> {
     std::mem::take(&mut *AI_CHOICES.write().unwrap_or_else(PoisonError::into_inner))
 }
+
+/// Each team's habits (team id -> share of its recent competition matches it played each
+/// champion in, by the model's ids), for `ai_draft`'s scouting. Published by the client.
+pub type Habits = HashMap<u32, HashMap<u16, f32>>;
+
+static HABITS: RwLock<Option<Arc<Habits>>> = RwLock::new(None);
+
+pub fn set_habits(habits: Habits) {
+    *HABITS.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(habits));
+}
+
+pub fn habits() -> Option<Arc<Habits>> {
+    HABITS.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// The player's last draft as the ban/pick screen saw it: both sides' champions (names, sorted),
+/// the player's side (0 blue, 1 red) and whether the coach override made its picks (auto BP).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PlayerDraft {
+    pub sides: [Vec<String>; 2],
+    pub side: usize,
+    pub auto: bool,
+}
+
+static PLAYER_DRAFT: RwLock<Option<Arc<PlayerDraft>>> = RwLock::new(None);
+
+pub fn set_player_draft(draft: Option<PlayerDraft>) {
+    *PLAYER_DRAFT.write().unwrap_or_else(PoisonError::into_inner) = draft.map(Arc::new);
+}
+
+pub fn player_draft() -> Option<Arc<PlayerDraft>> {
+    PLAYER_DRAFT.read().unwrap_or_else(PoisonError::into_inner).clone()
+}

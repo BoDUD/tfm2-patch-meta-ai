@@ -18,6 +18,7 @@
 //! implementation with its own model.
 
 pub mod advisor;
+pub mod ai_tactics;
 pub mod cache;
 mod client;
 pub mod compat;
@@ -72,6 +73,7 @@ fn init(host: &StableHost) -> StableMod {
     decl.set_server_extension(server::ServerExt);
     decl.add_draft_score_hook(draft::MetaDraftHook);
     decl.add_draft_score_hook(draft::CoachHook);
+    decl.set_match_hook(ai_tactics::TacticsHook);
     decl
 }
 
@@ -85,6 +87,8 @@ pub fn reset_for_tests() {
     client::reset_for_tests();
     shared::clear();
     lock::set(None);
+    ai_tactics::reset_for_tests();
+    draft::variety::reset();
     server::reset_for_tests();
     draft::reset_for_tests();
     config::load_now();
