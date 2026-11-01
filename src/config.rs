@@ -55,6 +55,12 @@ pub struct Config {
     /// Every AI team bans and picks outright the way the advice would have it (a hard opponent;
     /// over other draft mods' decisions).
     pub ai_draft: bool,
+    /// How many win-rate points a turn an AI team may give up for variety: its own read of the
+    /// champions varies from draft to draft (0 = always the model's best).
+    pub ai_variety: f32,
+    /// Teams drafted by the model (AI teams with `ai_draft`, the player's after an auto BP) also
+    /// play the strategy the model rates best for their five champions.
+    pub ai_tactics: bool,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -75,6 +81,11 @@ pub struct Config {
     pub stat_prior: bool,
     /// ... or the save's own matches decide (`auto`, the default).
     pub stat_prior_auto: bool,
+    /// Newer matches count more: a match this many competition matches older counts half
+    /// (`None`: all alike)...
+    pub recency: Option<f32>,
+    /// ... or the save's own matches decide (`auto`, the default).
+    pub recency_auto: bool,
     /// Champion ids reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
     /// Prior spreads (log-odds) of the lane, player, mastery and pair effects: how far the data
@@ -127,6 +138,8 @@ impl Default for Config {
             ban_pick: Switch::Auto,
             coach: true,
             ai_draft: false,
+            ai_variety: 1.0,
+            ai_tactics: false,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -137,6 +150,8 @@ impl Default for Config {
             lol_prior_auto: true,
             stat_prior: true,
             stat_prior_auto: true,
+            recency: None,
+            recency_auto: true,
             reworked: Vec::new(),
             roles: 0.3,
             players: 0.35,
@@ -186,6 +201,8 @@ impl Config {
             lol_prior_auto: self.lol_prior_auto,
             stat_prior: self.stat_prior,
             stat_prior_auto: self.stat_prior_auto,
+            recency: self.recency,
+            recency_auto: self.recency_auto,
             ..crate::meta::Settings::default()
         }
     }
@@ -251,6 +268,17 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
         "coach" => cfg.coach = flag(value)?,
         "ai_draft" => cfg.ai_draft = flag(value)?,
+        "ai_variety" => cfg.ai_variety = number(value)?,
+        "ai_tactics" => cfg.ai_tactics = flag(value)?,
+        "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
+        "recency" if value.trim().eq_ignore_ascii_case("off") => {
+            cfg.recency = None;
+            cfg.recency_auto = false;
+        }
+        "recency" => {
+            cfg.recency = Some(number(value)?);
+            cfg.recency_auto = false;
+        }
         "tier_list" => cfg.tier_list = Switch::parse(value)?,
         "verbose" => cfg.verbose = flag(value)?,
         "report" => cfg.report = flag(value)?,
@@ -338,6 +366,8 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
     check("ban_strength", &mut cfg.ban_strength, (0.0..=5.0).contains(&v), d.ban_strength);
     let v = cfg.edge_scale;
     check("edge_scale", &mut cfg.edge_scale, v > 0.01, d.edge_scale);
+    let v = cfg.ai_variety;
+    check("ai_variety", &mut cfg.ai_variety, (0.0..=5.0).contains(&v), d.ai_variety);
     let v = cfg.player_mastery;
     check("player_mastery", &mut cfg.player_mastery, (0.0..=2.0).contains(&v), d.player_mastery);
     let v = cfg.min_games;
@@ -373,6 +403,13 @@ fn sanitize(cfg: &mut Config, warnings: &mut Vec<String>) {
         warnings.push(format!("s+a+b+c = {total}% is more than 100%, using the defaults"));
         (cfg.s_percent, cfg.a_percent, cfg.b_percent, cfg.c_percent) =
             (d.s_percent, d.a_percent, d.b_percent, d.c_percent);
+    }
+    if let Some(v) = cfg.recency {
+        if v.is_nan() || v < 50.0 {
+            warnings.push(format!("recency={v} is out of range (50 or more, off or auto), using auto"));
+            cfg.recency = None;
+            cfg.recency_auto = true;
+        }
     }
 }
 
@@ -468,12 +505,14 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} coach={} ai_draft={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
-         lol_prior={} stats={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
+        "ban_pick={} coach={} ai_draft={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+         lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_draft { "on" } else { "off" },
+        c.ai_variety,
+        if c.ai_tactics { "on" } else { "off" },
         c.tier_list.as_str(),
         c.patches,
         c.drift,
@@ -485,6 +524,11 @@ pub fn summary(c: &Config) -> String {
             (true, _) => "auto",
             (false, true) => "on",
             (false, false) => "off",
+        },
+        match (c.recency_auto, c.recency) {
+            (true, _) => "auto".to_string(),
+            (false, Some(n)) => n.to_string(),
+            (false, None) => "off".to_string(),
         },
         c.reworked.join(","),
         c.roles,
@@ -540,6 +584,20 @@ coach=on
 ; ai_draft : 所有 AI 队伍都完全按本 Mod 的建议禁和选（和你在面板上看到的同一套排序、3+2 推演、
 ;            选手熟练度），直接决定，盖过其他 BP Mod（地狱人机）。对手更难；AI 之间的比赛也一样。
 ai_draft=off
+; ai_variety : with ai_draft, each AI team's read of the champions varies from draft to draft
+;              (more for champions the model is unsure of), so every champion gets its chances
+;              and the AI is hard to predict - but a ban or pick may fall at most this many
+;              win-rate points below the model's best. 0 = always the best, 1 = default, up to 5.
+; ai_variety : 困难 AI 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
+;              上场，AI 也不好猜；但每一手最多比模型认为的最佳选择差这么多胜率点。
+;              0 = 永远选最佳，1 = 默认，最大 5。
+ai_variety=1
+; ai_tactics : teams the model drafts (AI teams with ai_draft on, your team after an auto BP with
+;              coach=on) also play the strategy the model rates best for their five champions
+;              (the tactics screen's ★), set when the match starts.
+; ai_tactics : 由模型 BP 的队伍（ai_draft 开着时的 AI 队伍；coach=on 时你自动 BP 的那一局）在比赛开始时
+;              也按模型给这五个英雄选最好的战术（战术界面上 ★ 的那些）。
+ai_tactics=off
 tier_list=auto
 
 [model]
@@ -581,6 +639,12 @@ lol_prior=auto
 ; 英雄从自己的属性出发（攻击、法强、生命、护甲、魔抗、移速及其成长，和同类英雄比）：模型从比赛里学
 ; 每项属性值多少胜率，比赛少的英雄按属性相近的英雄的表现估计。auto = 用最新的比赛检验开 / 关哪个更准；on / off。
 stats=auto
+; recency : newer matches count more - a match this many competition matches older counts half.
+;           Hero mods change champions without a new game patch; this lets the model follow them.
+;           auto = check off / 400 / 1200 against the save's newest matches; off; or a number (50+).
+; recency : 新比赛权重更高——早这么多场大会比赛的比赛只算一半。英雄 Mod 改英雄时游戏版本号不变，
+;           这样模型能跟上改动。auto = 用最新的比赛检验 关 / 400 / 1200 哪个最准；off；或填数字（50 以上）。
+recency=auto
 ; champion ids reworked this patch (history barely counts), comma separated
 ; 本版本重做的英雄 id（历史数据几乎不计），逗号分隔，例如 reworked=fighter, demon
 reworked=

@@ -181,6 +181,8 @@ pub struct DraftScreen {
     /// drafting for the AI teams), and its lean for the model it was worked out for.
     hell: Option<Option<crate::hell::Hell>>,
     hell_lean: Option<(usize, Arc<HashMap<u16, f32>>)>,
+    /// The player's side on the last ban/pick screen, when the screen said.
+    player_side: Option<usize>,
     /// The panels' background as last drawn (the breakdown line is added later, in it).
     back: Option<u32>,
 }
@@ -638,6 +640,9 @@ impl DraftScreen {
         }
         // the seating needs to know which team is the player's
         let side_known = side.is_some();
+        if side.is_some() {
+            self.player_side = side;
+        }
         let side = side.unwrap_or(0);
         if self.review.team.is_empty() {
             let names = [ui.text(BLUE_NAME).unwrap_or_default(), ui.text(RED_NAME).unwrap_or_default()];
@@ -763,6 +768,20 @@ impl DraftScreen {
         // the coach override's choices: each one that is not among our picks and bans was
         // overridden by another mod
         let coach = crate::shared::take_coach_choices();
+        // the draft for ai_tactics: both sides' champions, the player's side, and whether the
+        // coach override made our picks (auto BP)
+        if let (Some((ally, enemy)), Some(side), Some(s)) = (self.last_picks.as_ref(), self.player_side, crate::shared::get()) {
+            let names = |list: &[u16]| {
+                let mut v: Vec<String> = list.iter().map(|c| s.meta.names.name(*c).to_string()).collect();
+                v.sort();
+                v
+            };
+            let (blue, red) = if side == 0 { (names(ally), names(enemy)) } else { (names(enemy), names(ally)) };
+            if blue.len() == 5 && red.len() == 5 {
+                let auto = coach.iter().filter(|(ban, _)| !*ban).count() >= 3;
+                crate::shared::set_player_draft(Some(crate::shared::PlayerDraft { sides: [blue, red], side, auto }));
+            }
+        }
         let coach_note = if coach.is_empty() {
             String::new()
         } else {
@@ -980,6 +999,7 @@ impl DraftScreen {
                 bans_made: banned,
                 lookahead: !their_turn && !turn.swapping,
                 conserve: conserve_share,
+                also: &[],
             },
             &damage,
         );

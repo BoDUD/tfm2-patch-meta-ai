@@ -824,6 +824,8 @@ pub struct TurnInput<'a> {
     pub lookahead: bool,
     /// Fearless series: the share of what a pick takes from our later games that counts.
     pub conserve: f32,
+    /// More candidates to play out besides the best few (`ai_variety`'s wishes).
+    pub also: &'a [u16],
 }
 
 /// [`plan_turn`]'s ranking.
@@ -879,11 +881,17 @@ pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<
         order_position(t.bans_made, bp, rp).filter(|i| ORDER_3_2[*i].blue == blue && ORDER_3_2[*i].ban == t.banning).map(|i| (i, blue))
     });
     if let Some((at, blue)) = at {
-        let candidates: Vec<u16> = if t.banning {
+        let mut candidates: Vec<u16> = if t.banning {
             board.iter().take(LOOKAHEAD).map(|b| b.champ).collect()
         } else {
             picks.iter().take(LOOKAHEAD).map(|v| v.champ).collect()
         };
+        let allowed = |c: &u16| if t.banning { t.offer.contains(c) } else { t.pickable.contains(c) };
+        for c in t.also.iter().filter(|c| allowed(c)) {
+            if !candidates.contains(c) {
+                candidates.push(*c);
+            }
+        }
         let mut pool = lookahead_pool(meta, t.offer, LOOKAHEAD_POOL);
         for c in &candidates {
             if !pool.contains(c) {
@@ -1213,6 +1221,7 @@ mod tests {
             bans_made: 0,
             lookahead: true,
             conserve: 0.0,
+            also: &[],
         };
         let plan = plan_turn(&m, &turn, &none);
         let took = started.elapsed();

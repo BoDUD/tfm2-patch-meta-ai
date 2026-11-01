@@ -157,3 +157,36 @@ fn stats_on_a_save() {
         eprintln!("  {:<8} {:+.3} +- {:.3}", patch_meta_ai::stats::feature_name(k), e.value, e.sd);
     }
 }
+
+/// Whether newer matches should count more on a real save (`recency`):
+/// `PMA_HISTORY=<history file> cargo test --release --test save_board -- --ignored --nocapture recency`
+#[test]
+#[ignore]
+fn recency_on_a_save() {
+    let Ok(path) = std::env::var("PMA_HISTORY") else {
+        eprintln!("PMA_HISTORY not set");
+        return;
+    };
+    let text = std::fs::read_to_string(&path).expect("history file");
+    let mut names = Names::default();
+    let games: Vec<_> = patch_meta_ai::cache::decode(&text, &mut names).into_iter().map(|(_, g)| g).collect();
+    let mut champions: Vec<String> = knowledge::get().positions.keys().cloned().collect();
+    champions.sort();
+    let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
+    eprintln!("{} games", games.len());
+    for holdout in [150, 300] {
+        for half in [None, Some(400.0), Some(1200.0)] {
+            let set = Settings { lol_prior: 0.0, recency: half, ..Settings::default() };
+            let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None };
+            if let Some(bt) = patch_meta_ai::meta::backtest(&inputs, &set, holdout) {
+                eprintln!(
+                    "holdout {holdout}: recency {:<6} log-loss {:.4}  favourite won {:.1}%  scale {:.2}",
+                    half.map_or("off".to_string(), |h: f32| format!("{h:.0}")),
+                    bt.log_loss,
+                    bt.accuracy * 100.0,
+                    bt.scale
+                );
+            }
+        }
+    }
+}

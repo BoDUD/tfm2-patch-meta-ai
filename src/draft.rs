@@ -134,7 +134,17 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let (ally, enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
     let bans = ctx.ally_bans().len() + ctx.enemy_bans().len();
     let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
-    let champ = ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups)?;
+    // both teams' habits (scouting), and this draft's own read of the champions (variety)
+    let habits = shared::habits();
+    let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
+    let habits = [habits_of(acting), habits_of(ctx.enemy_team())];
+    let champ = if cfg.ai_variety > 0.0 {
+        let progress = bans + ally.len() + enemy.len();
+        let believed = variety::sampled(&snapshot, (acting, ctx.enemy_team()), progress, 1.0);
+        varied_choice(&snapshot, &believed, cfg.ai_variety, &ally, &enemy, bans, ban, &available, &lineups, habits)?
+    } else {
+        ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, habits)?
+    };
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
     // the player's own match (the ban/pick screen is open, and the player's team is the other one)
     let live = LIVE.load(Ordering::Relaxed) && ctx.enemy_team().is_some() && ctx.enemy_team() == shared::player_team();
@@ -157,7 +167,9 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
 }
 
 /// The AI's choice among `available` (game id, model id): the top of [`advisor::plan_turn`] for
-/// it, its side read from where a 3+2 draft stands (no lookahead when that does not tell).
+/// it, its side read from where a 3+2 draft stands (no lookahead when that does not tell), both
+/// teams' habits (`habits`: its own, the enemy's) counted as the panel counts them.
+#[allow(clippy::too_many_arguments)]
 pub fn ai_choice(
     snapshot: &Snapshot,
     ally: &[u16],
@@ -166,14 +178,73 @@ pub fn ai_choice(
     ban: bool,
     available: &[(usize, u16)],
     lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
 ) -> Option<u16> {
+    ai_plan(snapshot, ally, enemy, bans, ban, available, lineups, habits, &[]).ranked(ban).first().copied()
+}
+
+/// `ai_variety`: the AI's choice by this draft's own read of the champions (`believed`, see
+/// [`variety`]) - the first of its wishes that the model itself rates within `margin` win-rate
+/// points of its own best, else the model's best. On a 3+2 turn the wishes are played out to the
+/// end with the best few and compared by the win chance they end in; else by their value. So
+/// the AI plays champions it is unsure of when they are close to the best, and never gives up
+/// more than `margin` a turn.
+#[allow(clippy::too_many_arguments)]
+pub fn varied_choice(
+    model: &Snapshot,
+    believed: &Snapshot,
+    margin: f32,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
+) -> Option<u16> {
+    let wished = ai_plan(believed, ally, enemy, bans, ban, available, lineups, habits, &[]).ranked(ban);
+    let top: Vec<u16> = wished.iter().take(WISHES).copied().collect();
+    let truth = ai_plan(model, ally, enemy, bans, ban, available, lineups, habits, &top);
+    let best = truth.ranked(ban).first().copied()?;
+    // in win-rate points: the win chance a played-out turn ends in, else the turn's own value
+    let score: HashMap<u16, f32> = if truth.outlook.is_empty() {
+        let values = if ban {
+            truth.board.iter().map(|b| (b.champ, b.total)).collect::<Vec<_>>()
+        } else {
+            truth.picks.iter().map(|v| (v.champ, v.total)).collect()
+        };
+        values.into_iter().map(|(c, v)| (c, points(v))).collect()
+    } else {
+        truth.outlook.iter().map(|(c, w)| (*c, w * 100.0)).collect()
+    };
+    let floor = score.get(&best).copied().unwrap_or(0.0) - margin;
+    Some(top.into_iter().find(|c| score.get(c).is_some_and(|v| *v >= floor)).unwrap_or(best))
+}
+
+/// The wishes of [`varied_choice`] it plays out (its read's best few).
+const WISHES: usize = 3;
+
+/// The AI's ranking of this ban or pick ([`advisor::plan_turn`]), `also` played out besides the
+/// best few.
+#[allow(clippy::too_many_arguments)]
+fn ai_plan(
+    snapshot: &Snapshot,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
+    also: &[u16],
+) -> advisor::TurnPlan {
     let meta = &snapshot.meta;
     let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
     let pickable = lane_fits(snapshot, ally, &offer, |t| t.ai);
     let damage = |c: u16| snapshot.damage_of(c);
     let turn = advisor::TurnInput {
-        us: advisor::Team::new(ally, &lineups.ally),
-        them: advisor::Team::new(enemy, &lineups.enemy),
+        us: advisor::Team { habits: habits[0], ..advisor::Team::new(ally, &lineups.ally) },
+        them: advisor::Team { habits: habits[1], ..advisor::Team::new(enemy, &lineups.enemy) },
         offer: &offer,
         pickable: &pickable,
         banning: ban,
@@ -181,8 +252,108 @@ pub fn ai_choice(
         bans_made: bans,
         lookahead: true,
         conserve: 0.0,
+        also,
     };
-    advisor::plan_turn(meta, &turn, &damage).ranked(ban).first().copied()
+    advisor::plan_turn(meta, &turn, &damage)
+}
+
+/// `ai_draft`'s variety: each AI team drafts by its own read of the champions, drawn once per
+/// draft - every champion's strength moved by its standard deviation times a standard normal
+/// draw (Thompson sampling, times `weight`). A champion the model knows well barely moves; one
+/// seen in few games may come out strong in this draft - so every champion gets its chances, the
+/// AI is harder to predict, and the model gets games on all of them. [`varied_choice`] keeps
+/// what it costs within `ai_variety` win-rate points a turn. The draw stays the same through one
+/// draft (until the bans and picks start over).
+pub mod variety {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use crate::shared::Snapshot;
+
+    /// Draws kept (team pairs), and believed snapshots kept (a copy of the model each).
+    const DRAWS: usize = 256;
+    const COPIES: usize = 6;
+
+    struct Draw {
+        /// Bans and picks made when last asked: fewer now means a new draft.
+        progress: usize,
+        z: Arc<HashMap<u16, f32>>,
+        /// When it was last used (for dropping the oldest).
+        used: u64,
+    }
+
+    #[derive(Default)]
+    struct State {
+        draws: HashMap<(Option<usize>, Option<usize>), Draw>,
+        /// (model, draw, weight) -> the believed snapshot.
+        copies: Vec<((usize, usize, u32), Arc<Snapshot>)>,
+        clock: u64,
+        seed: u64,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    /// A standard normal draw from a 64-bit state (xorshift, Box-Muller).
+    fn normal(state: &mut u64) -> f32 {
+        let mut next = || {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            ((*state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let (u, v) = (next(), next());
+        ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+    }
+
+    /// The model as this team believes it in this draft (`base` itself when `weight` is 0).
+    pub fn sampled(base: &Arc<Snapshot>, teams: (Option<usize>, Option<usize>), progress: usize, weight: f32) -> Arc<Snapshot> {
+        if weight.is_nan() || weight <= 0.0 {
+            return base.clone();
+        }
+        let mut guard = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        let st = guard.get_or_insert_with(|| State {
+            seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9e37, |d| d.as_nanos() as u64) | 1,
+            ..State::default()
+        });
+        st.clock += 1;
+        let clock = st.clock;
+        let fresh = st.draws.get(&teams).is_none_or(|d| progress < d.progress);
+        if fresh {
+            if st.draws.len() >= DRAWS {
+                if let Some(oldest) = st.draws.iter().min_by_key(|(_, d)| d.used).map(|(k, _)| *k) {
+                    st.draws.remove(&oldest);
+                }
+            }
+            let mut rng = st.seed ^ clock.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let z: HashMap<u16, f32> = base.meta.champions.iter().map(|c| (c.id, normal(&mut rng))).collect();
+            st.seed = rng | 1;
+            st.draws.insert(teams, Draw { progress, z: Arc::new(z), used: clock });
+        }
+        let draw = st.draws.get_mut(&teams).expect("just inserted");
+        draw.progress = progress;
+        draw.used = clock;
+        let z = draw.z.clone();
+        let key = (Arc::as_ptr(base) as usize, Arc::as_ptr(&z) as usize, weight.to_bits());
+        if let Some((_, s)) = st.copies.iter().find(|(k, _)| *k == key) {
+            return s.clone();
+        }
+        let mut believed = Snapshot::clone(base);
+        for c in &mut believed.meta.champions {
+            c.strength += weight * c.sd * z.get(&c.id).copied().unwrap_or(0.0);
+        }
+        let believed = Arc::new(believed);
+        if st.copies.len() >= COPIES {
+            st.copies.remove(0);
+        }
+        st.copies.push((key, believed.clone()));
+        believed
+    }
+
+    /// Test support.
+    #[doc(hidden)]
+    pub fn reset() {
+        *STATE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
 }
 
 /// Where a coach decision came from.
@@ -1116,7 +1287,7 @@ mod tests {
         let id = |n: &str| s.meta.names.get(n).unwrap();
         let available: Vec<(usize, u16)> = (0..12u16).filter(|c| *c != id("a")).map(|c| (c as usize, c)).collect();
         let none = Lineups::default();
-        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none), Some(id("c")), "no lock: the strongest");
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]), Some(id("c")), "no lock: the strongest");
         let table = crate::lock::parse("[lock]
 ai=on
 [positions]
@@ -1124,13 +1295,151 @@ a=Mid
 c=Mid
 ", "", "");
         crate::lock::set(Some(table.clone()));
-        let pick = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none).unwrap();
+        let pick = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]).unwrap();
         assert_ne!(pick, id("c"), "c cannot be seated next to a");
         // bans are not held
-        assert!(ai_choice(&s, &[id("a")], &[], 6, true, &available, &none).is_some());
+        assert!(ai_choice(&s, &[id("a")], &[], 6, true, &available, &none, [None, None]).is_some());
         // the lock's AI switch off: not held
         crate::lock::set(Some(crate::lock::Table { ai: false, ..table }));
-        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none), Some(id("c")));
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]), Some(id("c")));
         crate::lock::set(None);
+    }
+
+    /// ai_variety: one draw per draft, kept through it; a new draft draws again; a champion the
+    /// model is sure of barely moves; and over many drafts the AI opens with more champions.
+    #[test]
+    fn variety_draws_once_per_draft_and_spreads_the_picks() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let base = Arc::new(snapshot());
+        let teams = (Some(12), Some(19));
+        assert!(Arc::ptr_eq(&variety::sampled(&base, teams, 0, 0.0), &base), "0: the model itself");
+        let first = variety::sampled(&base, teams, 0, 1.0);
+        let later = variety::sampled(&base, teams, 7, 1.0);
+        assert!(Arc::ptr_eq(&first, &later), "the same draft keeps its draw");
+        let next = variety::sampled(&base, teams, 0, 1.0);
+        assert!(!Arc::ptr_eq(&first, &next), "a new draft draws again");
+        // every champion moves by its own uncertainty
+        for (b, n) in base.meta.champions.iter().zip(&next.meta.champions) {
+            assert!((n.strength - b.strength).abs() <= 5.0 * b.sd + 1e-6, "{}", b.name);
+        }
+        // the AI's first pick over forty drafts: always the same without variety, more with it
+        let available: Vec<(usize, u16)> = (0..12u16).map(|c| (c as usize, c)).collect();
+        let none = Lineups::default();
+        let first_picks = |weight: f32| {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..40 {
+                let s = variety::sampled(&base, (Some(1), Some(2)), 0, weight);
+                let _ = variety::sampled(&base, (Some(1), Some(2)), 99, weight);
+                seen.insert(ai_choice(&s, &[], &[], 6, false, &available, &none, [None, None]).unwrap());
+            }
+            seen.len()
+        };
+        assert_eq!(first_picks(0.0), 1);
+        assert!(first_picks(2.0) > 1, "variety opens with other champions too");
+        variety::reset();
+    }
+
+    /// The AI scouts: a champion the enemy plays in every match is likelier to be banned.
+    #[test]
+    fn ai_draft_bans_what_the_enemy_plays() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let s = snapshot();
+        let available: Vec<(usize, u16)> = (0..12u16).map(|c| (c as usize, c)).collect();
+        let none = Lineups::default();
+        let offer: Vec<u16> = (0..12).collect();
+        let board = |habits: Option<&HashMap<u16, f32>>| {
+            let them = advisor::Team { habits, ..advisor::Team::new(&[], &[]) };
+            let plan = advisor::plan_turn(
+                &s.meta,
+                &advisor::TurnInput {
+                    us: advisor::Team::new(&[], &[]),
+                    them,
+                    offer: &offer,
+                    pickable: &offer,
+                    banning: true,
+                    blue: None,
+                    bans_made: 0,
+                    lookahead: false,
+                    conserve: 0.0,
+                    also: &[],
+                },
+                &|_| None,
+            );
+            plan.board.iter().map(|b| (b.champ, b.total)).collect::<HashMap<u16, f32>>()
+        };
+        let f = s.meta.names.get("f").unwrap();
+        let fond: HashMap<u16, f32> = [(f, 1.0)].into_iter().collect();
+        assert!(board(Some(&fond))[&f] > board(None)[&f], "their habit makes it a better ban");
+        // through ai_choice: the enemy's habits are the second
+        assert!(ai_choice(&s, &[], &[], 0, true, &available, &none, [None, Some(&fond)]).is_some());
+    }
+
+    /// On a real save: AI-vs-AI drafts, blue with variety and red without - how many champions
+    /// blue picks, the ten most picked's share, and blue's win chance at the end (the cost).
+    /// `PMA_HISTORY=<history file> cargo test --release --lib variety_on_a_save -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn variety_on_a_save() {
+        let Ok(path) = std::env::var("PMA_HISTORY") else { return };
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut names = crate::history::Names::default();
+        let games: Vec<_> = crate::cache::decode(&text, &mut names).into_iter().map(|(_, g)| g).collect();
+        let mut champions: Vec<String> = crate::knowledge::get().positions.keys().cloned().collect();
+        champions.sort();
+        let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
+        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None }, &Settings::default());
+        let pool: Vec<u16> = champions.iter().filter_map(|c| meta.names.get(c)).collect();
+        let base = Arc::new(Snapshot::new(meta, HashMap::new()));
+        let none = Lineups::default();
+        for weight in [0.0f32, 0.5, 1.0, 2.0, 4.0] {
+            let mut picked: HashMap<u16, u32> = HashMap::new();
+            let mut cost = 0.0f32;
+            let started = std::time::Instant::now();
+            for d in 0..60usize {
+                let (mut picks, mut bans): ([Vec<u16>; 2], usize) = ([Vec::new(), Vec::new()], 0);
+                let mut taken: Vec<u16> = Vec::new();
+                for step in advisor::ORDER_3_2 {
+                    let me = if step.blue { 0 } else { 1 };
+                    let teams = (Some(2 * d + me), Some(2 * d + 1 - me));
+                    let progress = bans + picks[0].len() + picks[1].len();
+                    // blue drafts with variety, red without: what variety costs
+                    let available: Vec<(usize, u16)> = pool.iter().filter(|c| !taken.contains(c)).map(|c| (*c as usize, *c)).collect();
+                    let c = if me == 0 && weight > 0.0 {
+                        let s = variety::sampled(&base, teams, progress, 1.0);
+                        varied_choice(&base, &s, weight, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None])
+                    } else {
+                        ai_choice(&base, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None])
+                    }
+                    .unwrap();
+                    taken.push(c);
+                    if step.ban {
+                        bans += 1;
+                    } else {
+                        picks[me].push(c);
+                        if me == 0 {
+                            *picked.entry(c).or_default() += 1;
+                        }
+                    }
+                }
+                cost += advisor::win_probability(&base.meta, &picks[0], &picks[1]);
+            }
+            let total: u32 = picked.values().sum();
+            let mut counts: Vec<u32> = picked.values().copied().collect();
+            counts.sort_unstable_by(|a, b| b.cmp(a));
+            let top10: u32 = counts.iter().take(10).sum();
+            eprintln!(
+                "ai_variety {weight}: 60 drafts, {} champions picked of {}, top 10 = {:.0}% of picks, its win chance vs no variety {:.1}% ({:?})",
+                picked.len(),
+                pool.len(),
+                top10 as f32 / total as f32 * 100.0,
+                cost / 60.0 * 100.0,
+                started.elapsed()
+            );
+            variety::reset();
+        }
     }
 }

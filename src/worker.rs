@@ -50,6 +50,8 @@ fn holdout(games: usize) -> usize {
 
 /// The weights of League's knowledge `lol_prior = auto` chooses from.
 const LOL_PRIOR_CHOICES: [f32; 4] = [0.0, 0.5, 1.0, 2.0];
+/// The half-lives (in matches) `recency = auto` chooses from, besides the setting's own.
+const RECENCY_CHOICES: [Option<f32>; 3] = [None, Some(400.0), Some(1200.0)];
 /// ... again once the matches grew by this share.
 const RECALIBRATE_GROWTH: f32 = 1.2;
 
@@ -60,6 +62,8 @@ pub struct Choice {
     pub games: usize,
     pub lol_prior: f32,
     pub stat_prior: bool,
+    /// How much newer matches count (`Settings::recency`).
+    pub recency: Option<f32>,
     /// The scale on the log-odds for win chances.
     pub scale: f32,
 }
@@ -85,17 +89,32 @@ fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -
             let set = Settings { lol_prior: *w, stat_prior: *s, ..settings.clone() };
             let Some(bt) = meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)) else { continue };
             if best.as_ref().is_none_or(|(_, loss)| bt.log_loss < *loss) {
-                best = Some((Choice { games, lol_prior: *w, stat_prior: *s, scale: bt.scale }, bt.log_loss));
+                best = Some((Choice { games, lol_prior: *w, stat_prior: *s, recency: settings.recency, scale: bt.scale }, bt.log_loss));
             }
         }
     }
-    let (choice, _) = best?;
+    let (mut choice, mut loss) = best?;
+    // then how much newer matches should count, with the rest as chosen
+    if settings.recency_auto {
+        for half in RECENCY_CHOICES {
+            let set = Settings { lol_prior: choice.lol_prior, stat_prior: choice.stat_prior, recency: half, ..settings.clone() };
+            if half == settings.recency {
+                continue;
+            }
+            let Some(bt) = meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)) else { continue };
+            if bt.log_loss < loss {
+                (choice, loss) = (Choice { recency: half, scale: bt.scale, ..choice }, bt.log_loss);
+            }
+        }
+    }
     crate::diag::log(&format!(
-        "[model] held-out check ({games} matches): lol_prior {}{}, stats {}{}, win chances scaled by {:.2}",
+        "[model] held-out check ({games} matches): lol_prior {}{}, stats {}{}, recency {}{}, win chances scaled by {:.2}",
         choice.lol_prior,
         if settings.lol_prior_auto { " (auto)" } else { "" },
         if choice.stat_prior { "on" } else { "off" },
         if settings.stat_prior_auto { " (auto)" } else { "" },
+        choice.recency.map_or("off".to_string(), |h| format!("{h:.0}")),
+        if settings.recency_auto { " (auto)" } else { "" },
         choice.scale
     ));
     *last = Some(choice);
@@ -119,6 +138,7 @@ fn run(job: Job, warm: Option<&Meta>, calibration: &mut Calibration) -> Done {
     if let Some(c) = chosen {
         settings.lol_prior = c.lol_prior;
         settings.stat_prior = c.stat_prior;
+        settings.recency = c.recency;
     }
     let mut meta = meta::build(&inputs, &settings);
     meta.lol_prior_chosen = chosen.is_some() && job.settings.lol_prior_auto;
