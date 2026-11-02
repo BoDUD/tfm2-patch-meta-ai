@@ -807,7 +807,7 @@ pub const LOOKAHEAD: usize = 5;
 pub const LOOKAHEAD_POOL: usize = 28;
 
 /// One team's turn: what the draft screen advises the player, and what the AI does with
-/// `ai_draft` on.
+/// `ai_bp` on.
 #[derive(Clone, Copy)]
 pub struct TurnInput<'a> {
     pub us: Team<'a>,

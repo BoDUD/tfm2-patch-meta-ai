@@ -97,7 +97,7 @@ pub fn take_coach_choices() -> Vec<(bool, u16)> {
     std::mem::take(&mut *COACH_CHOICES.write().unwrap_or_else(PoisonError::into_inner))
 }
 
-/// What `ai_draft` chose for the other team in the player's own draft (model ids, in order), for
+/// What `ai_bp` chose for the other team in the player's own draft (model ids, in order), for
 /// the review, like [`note_coach_choice`].
 static AI_CHOICES: RwLock<Vec<(bool, u16)>> = RwLock::new(Vec::new());
 
@@ -108,13 +108,13 @@ pub fn note_ai_choice(ban: bool, champ: u16) {
     }
 }
 
-/// `ai_draft`'s choices since the last call (and forgets them).
+/// `ai_bp`'s choices since the last call (and forgets them).
 pub fn take_ai_choices() -> Vec<(bool, u16)> {
     std::mem::take(&mut *AI_CHOICES.write().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// Each team's habits (team id -> share of its recent competition matches it played each
-/// champion in, by the model's ids), for `ai_draft`'s scouting. Published by the client.
+/// champion in, by the model's ids), for `ai_bp`'s scouting. Published by the client.
 pub type Habits = HashMap<u32, HashMap<u16, f32>>;
 
 static HABITS: RwLock<Option<Arc<Habits>>> = RwLock::new(None);

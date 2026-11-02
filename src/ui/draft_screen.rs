@@ -895,7 +895,7 @@ impl DraftScreen {
                 .count();
             format!(", coach override {} decided, {taken} of them made", coach.len())
         };
-        // ai_draft's choices for the other team, the same way
+        // ai_bp's choices for the other team, the same way
         let ai = crate::shared::take_ai_choices();
         let ai_note = if ai.is_empty() {
             String::new()
@@ -909,7 +909,7 @@ impl DraftScreen {
                     theirs.iter().any(|r| r.ban == *ban && r.champ == name)
                 })
                 .count();
-            format!(", ai_draft {} decided, {made} of them made", ai.len())
+            format!(", ai_bp {} decided, {made} of them made", ai.len())
         };
         diag::log(&format!(
             "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised){coach_note}{ai_note}, win chance at the end {}",
@@ -1094,7 +1094,7 @@ impl DraftScreen {
         let their_turn = turn.acting.is_some_and(|a| a != side);
         let banned = cards.iter().filter(|c| c.banned).count();
         // our bans and picks, the best few played out on our turn of a 3+2 draft (the same
-        // ranking the AI drafts by with ai_draft on)
+        // ranking the AI drafts by with ai_bp on)
         let plan = advisor::plan_turn(
             meta,
             &advisor::TurnInput {

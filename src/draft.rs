@@ -113,14 +113,14 @@ impl StableDraftHook for CoachHook {
 const AI_OFF_SCREEN_LINES: u32 = 6;
 static AI_LOGGED: AtomicU32 = AtomicU32::new(0);
 
-/// `ai_draft=on`: every AI team's ban or pick, decided outright the way the draft screen would
+/// `ai_bp=on`: every AI team's ban or pick, decided outright the way the draft screen would
 /// advise that team ([`advisor::plan_turn`]: the ban board, pick values, the 3+2 lookahead, the
 /// fielded players' mastery) - among the champions that fit a lane it still has open. `None`
-/// for the player's own team, with `ai_draft=off`, before the first fit, or with nothing on offer.
+/// for the player's own team, with `ai_bp=off`, before the first fit, or with nothing on offer.
 pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let cfg = config::get();
     let acting = ctx.ally_team();
-    if !cfg.ai_draft || acting.is_none() || acting == shared::player_team() {
+    if !cfg.ai_bp || acting.is_none() || acting == shared::player_team() {
         return None;
     }
     let snapshot = shared::get()?;
@@ -151,7 +151,7 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if live {
         shared::note_ai_choice(ban, champ);
     }
-    diag::log_once("ai-decides", "[ai] ai_draft=on: the AI teams' bans and picks follow the model (as the panel would advise them)");
+    diag::log_once("ai-decides", "[ai] ai_bp=on: the AI teams' bans and picks follow the model (as the panel would advise them)");
     if live || AI_LOGGED.fetch_add(1, Ordering::Relaxed) < AI_OFF_SCREEN_LINES {
         diag::log(&format!(
             "[ai] {} {} {} vs {}{}: {}",
@@ -258,7 +258,7 @@ fn ai_plan(
     advisor::plan_turn(meta, &turn, &damage)
 }
 
-/// `ai_draft`'s variety: each AI team drafts by its own read of the champions, drawn once per
+/// `ai_bp`'s variety: each AI team drafts by its own read of the champions, drawn once per
 /// draft - every champion's strength moved by its standard deviation times a standard normal
 /// draw (Thompson sampling, times `weight`). A champion the model knows well barely moves; one
 /// seen in few games may come out strong in this draft - so every champion gets its chances, the
@@ -408,7 +408,7 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
 /// The coach's choice among `available` (game id, model id): the panel's ranking when it was
 /// drawn for this draft (sorted picks, ban count and phase alike), else the AI's own ranking
 /// ([`ai_plan`]: the 3+2 lookahead, both teams' habits, the fielded players) - as strong as
-/// `ai_draft`'s, without its variety - for a pick among the champions the position lock lets
+/// `ai_bp`'s, without its variety - for a pick among the champions the position lock lets
 /// the team seat and that no position
 /// lock holds.
 #[allow(clippy::too_many_arguments)]
@@ -1219,12 +1219,12 @@ mod tests {
         crate::reset_for_tests();
     }
 
-    /// ai_draft: every AI team decides by the model; the player's team is left to the coach.
+    /// ai_bp: every AI team decides by the model; the player's team is left to the coach.
     #[test]
-    fn ai_draft_decides_for_the_ai_teams() {
+    fn ai_bp_decides_for_the_ai_teams() {
         use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
         let _serial = crate::tests::serial();
-        let dir = std::env::temp_dir().join(format!("patch_meta_ai_ai_draft_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patch_meta_ai_ai_bp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var(crate::paths::DIR_ENV, &dir);
@@ -1256,14 +1256,14 @@ mod tests {
         shared::publish(s);
         shared::set_player_team(Some(19));
         let ai_pick = ctx_for(12, DraftPhaseV1::Pick);
-        assert_eq!(decide(&ai_pick, false), None, "ai_draft is off by default");
-        config::set_for_tests(config::Config { ai_draft: true, ..config::Config::default() });
+        assert_eq!(decide(&ai_pick, false), None, "ai_bp is off by default");
+        config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
         set_live(true);
         shared::take_ai_choices();
         assert_eq!(decide(&ai_pick, false), Some(c as usize), "the strongest");
         assert!(decide(&ctx_for(12, DraftPhaseV1::Ban), true).is_some());
         assert_eq!(shared::take_ai_choices().first(), Some(&(false, c)), "noted for the review");
-        // the player's own team: the coach override, never ai_draft
+        // the player's own team: the coach override, never ai_bp
         let ours = ctx_for(19, DraftPhaseV1::Pick);
         // SAFETY: `ours` lives for the call
         assert_eq!(ai_decide(&unsafe { StableDraftContext::from_raw(&ours) }.unwrap(), false), None);
@@ -1275,10 +1275,10 @@ mod tests {
         crate::reset_for_tests();
     }
 
-    /// With Smart Position Lock holding AI picks, ai_draft only takes what the lock would let the
+    /// With Smart Position Lock holding AI picks, ai_bp only takes what the lock would let the
     /// team seat - here the strongest, c, plays only Mid and the team's a already does.
     #[test]
-    fn ai_draft_keeps_to_the_locks_lanes() {
+    fn ai_bp_keeps_to_the_locks_lanes() {
         let _serial = crate::tests::serial();
         crate::reset_for_tests();
         let s = snapshot();
@@ -1340,7 +1340,7 @@ c=Mid
 
     /// The AI scouts: a champion the enemy plays in every match is likelier to be banned.
     #[test]
-    fn ai_draft_bans_what_the_enemy_plays() {
+    fn ai_bp_bans_what_the_enemy_plays() {
         let _serial = crate::tests::serial();
         crate::reset_for_tests();
         let s = snapshot();
@@ -1441,7 +1441,7 @@ c=Mid
         }
     }
 
-    /// Without the panel's plan the coach drafts exactly as ai_draft does (without variety):
+    /// Without the panel's plan the coach drafts exactly as ai_bp does (without variety):
     /// bans and picks alike, the 3+2 lookahead included.
     #[test]
     fn the_coach_without_the_panel_drafts_like_the_ai() {
