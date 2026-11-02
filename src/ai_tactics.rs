@@ -1,4 +1,4 @@
-//! `ai_tactics`: AI teams the model drafted (`ai_draft` on) also play the strategy the model
+//! `ai_tactics`: AI teams the model drafted (`ai_bp` on) also play the strategy the model
 //! rates best for their five champions (`plan::tactics_for`, the tactics screen's ★), set when
 //! the match starts (`StableMatchHook::on_match_start`, `strategy_set_json`). A setting keeps the
 //! team's own option unless the advised one is worth [`SWITCH_MARGIN`] more by the model; the
@@ -205,10 +205,10 @@ fn players_side(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>) 
     }
 }
 
-/// Which sides of a match play the model's strategy: every AI side when `ai_draft` is on, never
+/// Which sides of a match play the model's strategy: every AI side when `ai_bp` is on, never
 /// the player's (after an auto BP too: the player's own strategy stays).
-fn model_sides(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>, ai_draft: bool) -> [bool; 2] {
-    let mut out = [ai_draft; 2];
+fn model_sides(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>, ai_bp: bool) -> [bool; 2] {
+    let mut out = [ai_bp; 2];
     if let Some((side, _)) = players_side(sides, player) {
         out[side] = false;
     }
@@ -347,7 +347,7 @@ fn apply(sim: &mut StableSim<'_>) -> bool {
                 return true;
             };
             let player = shared::player_draft();
-            let model = model_sides(&sides, player.as_deref(), cfg.ai_draft);
+            let model = model_sides(&sides, player.as_deref(), cfg.ai_bp);
             let mut plan: [Option<Strategy>; 2] = [None, None];
             for side in 0..2 {
                 if !model[side] {
@@ -456,7 +456,7 @@ mod tests {
     fn which_sides_the_model_drafted() {
         let (a, b) = (five("a"), five("b"));
         let sides = [a.clone(), b.clone()];
-        // not the player's match: every AI side with ai_draft
+        // not the player's match: every AI side with ai_bp
         assert_eq!(model_sides(&sides, None, true), [true, true]);
         assert_eq!(model_sides(&sides, None, false), [false, false]);
         // the player's match, the player blue: red only, after an auto BP too

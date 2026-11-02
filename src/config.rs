@@ -54,11 +54,11 @@ pub struct Config {
     pub coach: bool,
     /// Every AI team bans and picks outright the way the advice would have it (a hard opponent;
     /// over other draft mods' decisions).
-    pub ai_draft: bool,
+    pub ai_bp: bool,
     /// How many win-rate points a turn an AI team may give up for variety: its own read of the
     /// champions varies from draft to draft (0 = always the model's best).
     pub ai_variety: f32,
-    /// Teams drafted by the model (AI teams with `ai_draft`, the player's after an auto BP) also
+    /// Teams drafted by the model (AI teams with `ai_bp`, the player's after an auto BP) also
     /// play the strategy the model rates best for their five champions.
     pub ai_tactics: bool,
     pub tier_list: Switch,
@@ -137,7 +137,7 @@ impl Default for Config {
         Self {
             ban_pick: Switch::Auto,
             coach: true,
-            ai_draft: false,
+            ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
             tier_list: Switch::Auto,
@@ -267,7 +267,8 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
         "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
         "coach" => cfg.coach = flag(value)?,
-        "ai_draft" => cfg.ai_draft = flag(value)?,
+        // `ai_draft`: its name before 2.7.9
+        "ai_bp" | "ai_draft" => cfg.ai_bp = flag(value)?,
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
@@ -505,12 +506,12 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} coach={} ai_draft={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+        "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
-        if c.ai_draft { "on" } else { "off" },
+        if c.ai_bp { "on" } else { "off" },
         c.ai_variety,
         if c.ai_tactics { "on" } else { "off" },
         c.tier_list.as_str(),
@@ -578,25 +579,25 @@ ban_pick=auto
 ; coach : 选人时交给游戏的教练托管时，你自己的队伍完全照面板的建议禁用和选人（最后决定，别的 BP Mod
 ;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。
 coach=on
-; ai_draft : every AI team bans and picks the way this mod would advise it - the same ranking,
+; ai_bp : every AI team bans and picks the way this mod would advise it - the same ranking,
 ;            3+2 lookahead and players' mastery you see on the panel - decided outright, over
 ;            other draft mods (Hell Draft AI). A hard opponent; also the AI-vs-AI matches.
-; ai_draft : 所有 AI 队伍都完全按本 Mod 的建议禁和选（和你在面板上看到的同一套排序、3+2 推演、
+; ai_bp : 所有 AI 队伍都完全按本 Mod 的建议禁和选（和你在面板上看到的同一套排序、3+2 推演、
 ;            选手熟练度），直接决定，盖过其他 BP Mod（地狱人机）。对手更难；AI 之间的比赛也一样。
-ai_draft=off
-; ai_variety : with ai_draft, each AI team's read of the champions varies from draft to draft
+ai_bp=off
+; ai_variety : with ai_bp, each AI team's read of the champions varies from draft to draft
 ;              (more for champions the model is unsure of), so every champion gets its chances
 ;              and the AI is hard to predict - but a ban or pick may fall at most this many
 ;              win-rate points below the model's best. 0 = always the best, 1 = default, up to 5.
-; ai_variety : 困难 AI 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
+; ai_variety : AI 智能BP 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
 ;              上场，AI 也不好猜；但每一手最多比模型认为的最佳选择差这么多胜率点。
 ;              0 = 永远选最佳，1 = 默认，最大 5。
 ai_variety=1
-; ai_tactics : teams the model drafts (AI teams with ai_draft on, your team after an auto BP with
-;              coach=on) also play the strategy the model rates best for their five champions
-;              (the tactics screen's ★), set when the match starts.
-; ai_tactics : 由模型 BP 的队伍（ai_draft 开着时的 AI 队伍；coach=on 时你自动 BP 的那一局）在比赛开始时
-;              也按模型给这五个英雄选最好的战术（战术界面上 ★ 的那些）。
+; ai_tactics : AI teams the model drafts (ai_bp on) also play the strategy the model rates best
+;              for their five champions (the tactics screen's ★) where it is clearly better than
+;              their own, set when the match starts. Your own team keeps your strategy.
+; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
+;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。
 ai_tactics=off
 tier_list=auto
 
@@ -739,6 +740,17 @@ mod tests {
         let (cfg, warnings) = parse(TEMPLATE);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn ai_bp_and_its_old_name() {
+        assert!(parse("ai_bp=on
+").0.ai_bp);
+        assert!(parse("ai_draft=on
+").0.ai_bp, "a settings.ini from before 2.7.9");
+        assert!(!parse("ai_draft=on
+ai_bp=off
+").0.ai_bp, "the later line wins");
     }
 
     #[test]

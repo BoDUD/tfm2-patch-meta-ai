@@ -55,7 +55,7 @@ use mod_api_stable::{LaneV1, StableDraftContext, StableDraftDecision, StableDraf
 use crate::advisor::PickValue;
 use crate::history::Role;
 use crate::shared::Snapshot;
-use crate::{advisor, config, diag, shared};
+use crate::{advisor, config, diag, series, shared};
 
 pub struct MetaDraftHook;
 
@@ -113,14 +113,14 @@ impl StableDraftHook for CoachHook {
 const AI_OFF_SCREEN_LINES: u32 = 6;
 static AI_LOGGED: AtomicU32 = AtomicU32::new(0);
 
-/// `ai_draft=on`: every AI team's ban or pick, decided outright the way the draft screen would
+/// `ai_bp=on`: every AI team's ban or pick, decided outright the way the draft screen would
 /// advise that team ([`advisor::plan_turn`]: the ban board, pick values, the 3+2 lookahead, the
 /// fielded players' mastery) - among the champions that fit a lane it still has open. `None`
-/// for the player's own team, with `ai_draft=off`, before the first fit, or with nothing on offer.
+/// for the player's own team, with `ai_bp=off`, before the first fit, or with nothing on offer.
 pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let cfg = config::get();
     let acting = ctx.ally_team();
-    if !cfg.ai_draft || acting.is_none() || acting == shared::player_team() {
+    if !cfg.ai_bp || acting.is_none() || acting == shared::player_team() {
         return None;
     }
     let snapshot = shared::get()?;
@@ -138,12 +138,13 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let habits = shared::habits();
     let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
     let habits = [habits_of(acting), habits_of(ctx.enemy_team())];
+    let conserve = fearless_share(ctx, &snapshot);
     let champ = if cfg.ai_variety > 0.0 {
         let progress = bans + ally.len() + enemy.len();
         let believed = variety::sampled(&snapshot, (acting, ctx.enemy_team()), progress, 1.0);
-        varied_choice(&snapshot, &believed, cfg.ai_variety, &ally, &enemy, bans, ban, &available, &lineups, habits)?
+        varied_choice(&snapshot, &believed, cfg.ai_variety, &ally, &enemy, bans, ban, &available, &lineups, habits, conserve)?
     } else {
-        ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, habits)?
+        ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, habits, conserve)?
     };
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
     // the player's own match (the ban/pick screen is open, and the player's team is the other one)
@@ -151,7 +152,7 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if live {
         shared::note_ai_choice(ban, champ);
     }
-    diag::log_once("ai-decides", "[ai] ai_draft=on: the AI teams' bans and picks follow the model (as the panel would advise them)");
+    diag::log_once("ai-decides", "[ai] ai_bp=on: the AI teams' bans and picks follow the model (as the panel would advise them)");
     if live || AI_LOGGED.fetch_add(1, Ordering::Relaxed) < AI_OFF_SCREEN_LINES {
         diag::log(&format!(
             "[ai] {} {} {} vs {}{}: {}",
@@ -166,9 +167,38 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     Some(game_id)
 }
 
+/// In a Fearless series with games to come ([`series`]): the share of a champion's worth that
+/// spending one nothing replaces costs this draft (留后局), else 0.
+fn fearless_share(ctx: &StableDraftContext<'_>, snapshot: &Snapshot) -> f32 {
+    let (Some(us), Some(them)) = (ctx.ally_team(), ctx.enemy_team()) else { return 0.0 };
+    let call = series::Call {
+        team: us,
+        enemy: them,
+        ally_picks: ctx.ally_picks(),
+        enemy_picks: ctx.enemy_picks(),
+        ally_bans: ctx.ally_bans(),
+        enemy_bans: ctx.enemy_bans(),
+        available: ctx.available_champions(),
+    };
+    let Some((left, n)) = series::observe(&call) else { return 0.0 };
+    let share = series::share(left, n);
+    diag::log_once(
+        "series-fearless",
+        &format!(
+            "[ai] Fearless series seen: {} vs {}, game {} of Bo{n} - spending a champion nothing replaces costs {:.0}% of its worth",
+            team(snapshot, Some(us)),
+            team(snapshot, Some(them)),
+            n - left,
+            share * 100.0
+        ),
+    );
+    share
+}
+
 /// The AI's choice among `available` (game id, model id): the top of [`advisor::plan_turn`] for
 /// it, its side read from where a 3+2 draft stands (no lookahead when that does not tell), both
-/// teams' habits (`habits`: its own, the enemy's) counted as the panel counts them.
+/// teams' habits (`habits`: its own, the enemy's) counted as the panel counts them; `conserve`:
+/// see [`fearless_share`].
 #[allow(clippy::too_many_arguments)]
 pub fn ai_choice(
     snapshot: &Snapshot,
@@ -179,8 +209,9 @@ pub fn ai_choice(
     available: &[(usize, u16)],
     lineups: &Lineups,
     habits: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
 ) -> Option<u16> {
-    ai_plan(snapshot, ally, enemy, bans, ban, available, lineups, habits, &[], false).ranked(ban).first().copied()
+    ai_plan(snapshot, ally, enemy, bans, ban, available, lineups, habits, conserve, &[], false).ranked(ban).first().copied()
 }
 
 /// `ai_variety`: the AI's choice by this draft's own read of the champions (`believed`, see
@@ -201,10 +232,11 @@ pub fn varied_choice(
     available: &[(usize, u16)],
     lineups: &Lineups,
     habits: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
 ) -> Option<u16> {
-    let wished = ai_plan(believed, ally, enemy, bans, ban, available, lineups, habits, &[], false).ranked(ban);
+    let wished = ai_plan(believed, ally, enemy, bans, ban, available, lineups, habits, conserve, &[], false).ranked(ban);
     let top: Vec<u16> = wished.iter().take(WISHES).copied().collect();
-    let truth = ai_plan(model, ally, enemy, bans, ban, available, lineups, habits, &top, false);
+    let truth = ai_plan(model, ally, enemy, bans, ban, available, lineups, habits, conserve, &top, false);
     let best = truth.ranked(ban).first().copied()?;
     // in win-rate points: the win chance a played-out turn ends in, else the turn's own value
     let score: HashMap<u16, f32> = if truth.outlook.is_empty() {
@@ -236,6 +268,7 @@ fn ai_plan(
     available: &[(usize, u16)],
     lineups: &Lineups,
     habits: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
     also: &[u16],
     player: bool,
 ) -> advisor::TurnPlan {
@@ -252,13 +285,13 @@ fn ai_plan(
         blue: advisor::side_from_order(bans, ally.len(), enemy.len(), ban),
         bans_made: bans,
         lookahead: true,
-        conserve: 0.0,
+        conserve,
         also,
     };
     advisor::plan_turn(meta, &turn, &damage)
 }
 
-/// `ai_draft`'s variety: each AI team drafts by its own read of the champions, drawn once per
+/// `ai_bp`'s variety: each AI team drafts by its own read of the champions, drawn once per
 /// draft - every champion's strength moved by its standard deviation times a standard normal
 /// draw (Thompson sampling, times `weight`). A champion the model knows well barely moves; one
 /// seen in few games may come out strong in this draft - so every champion gets its chances, the
@@ -386,8 +419,18 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
     let habits = shared::habits();
     let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
-    let (champ, source) =
-        coach_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, [habits_of(ctx.ally_team()), habits_of(ctx.enemy_team())])?;
+    let conserve = fearless_share(ctx, &snapshot);
+    let (champ, source) = coach_choice(
+        &snapshot,
+        &ally,
+        &enemy,
+        bans,
+        ban,
+        &available,
+        &lineups,
+        [habits_of(ctx.ally_team()), habits_of(ctx.enemy_team())],
+        conserve,
+    )?;
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
     shared::note_coach_choice(ban, champ);
     diag::log_once("coach-decides", "[coach] the coach override decides the player's team's bans and picks (coach=on)");
@@ -408,7 +451,7 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
 /// The coach's choice among `available` (game id, model id): the panel's ranking when it was
 /// drawn for this draft (sorted picks, ban count and phase alike), else the AI's own ranking
 /// ([`ai_plan`]: the 3+2 lookahead, both teams' habits, the fielded players) - as strong as
-/// `ai_draft`'s, without its variety - for a pick among the champions the position lock lets
+/// `ai_bp`'s, without its variety - for a pick among the champions the position lock lets
 /// the team seat and that no position
 /// lock holds.
 #[allow(clippy::too_many_arguments)]
@@ -421,6 +464,7 @@ pub fn coach_choice(
     available: &[(usize, u16)],
     lineups: &Lineups,
     habits: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
 ) -> Option<(u16, CoachSource)> {
     let on_offer = |c: u16| available.iter().any(|(_, m)| *m == c);
     let plan = shared::coach_plan();
@@ -435,7 +479,7 @@ pub fn coach_choice(
     let held: &[u16] = plan.as_ref().map_or(&[], |p| p.held.as_slice());
     let open: Vec<(usize, u16)> = available.iter().copied().filter(|(_, c)| ban || !held.contains(c)).collect();
     let open = if open.is_empty() { available.to_vec() } else { open };
-    ai_plan(snapshot, ally, enemy, bans, ban, &open, lineups, habits, &[], true)
+    ai_plan(snapshot, ally, enemy, bans, ban, &open, lineups, habits, conserve, &[], true)
         .ranked(ban)
         .first()
         .map(|c| (*c, CoachSource::Model))
@@ -1148,7 +1192,7 @@ mod tests {
         let none = Lineups::default();
         // no plan: the model's best pick, c
         shared::set_coach_plan(None);
-        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, [None, None]), Some((id("c"), CoachSource::Model)));
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, [None, None], 0.0), Some((id("c"), CoachSource::Model)));
         // the panel's ranking for this very draft (picks in any order)
         let plan = shared::CoachPlan {
             ally: vec![],
@@ -1159,18 +1203,18 @@ mod tests {
             held: vec![id("c")],
         };
         shared::set_coach_plan(Some(plan.clone()));
-        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, [None, None]), Some((id("e"), CoachSource::Panel)));
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &available, &none, [None, None], 0.0), Some((id("e"), CoachSource::Panel)));
         // its first choice taken meanwhile: the next one
         let fewer: Vec<(usize, u16)> = available.iter().copied().filter(|(_, c)| *c != id("e")).collect();
-        assert_eq!(coach_choice(&s, &[], &[], 6, false, &fewer, &none, [None, None]), Some((id("f"), CoachSource::Panel)));
+        assert_eq!(coach_choice(&s, &[], &[], 6, false, &fewer, &none, [None, None], 0.0), Some((id("f"), CoachSource::Panel)));
         // a plan for another moment of the draft: the model, never a card a position lock holds
-        let (choice, source) = coach_choice(&s, &[], &[], 7, false, &available, &none, [None, None]).unwrap();
+        let (choice, source) = coach_choice(&s, &[], &[], 7, false, &available, &none, [None, None], 0.0).unwrap();
         assert_eq!(source, CoachSource::Model);
         assert_ne!(choice, id("c"), "held by the position lock");
         // bans: the panel's when it was drawn for a ban, the model's else
-        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, [None, None]).map(|c| c.1), Some(CoachSource::Model));
+        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, [None, None], 0.0).map(|c| c.1), Some(CoachSource::Model));
         shared::set_coach_plan(Some(shared::CoachPlan { ban: true, ranked: vec![id("k")], ..plan }));
-        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, [None, None]), Some((id("k"), CoachSource::Panel)));
+        assert_eq!(coach_choice(&s, &[], &[], 6, true, &available, &none, [None, None], 0.0), Some((id("k"), CoachSource::Panel)));
         shared::set_coach_plan(None);
     }
 
@@ -1219,12 +1263,12 @@ mod tests {
         crate::reset_for_tests();
     }
 
-    /// ai_draft: every AI team decides by the model; the player's team is left to the coach.
+    /// ai_bp: every AI team decides by the model; the player's team is left to the coach.
     #[test]
-    fn ai_draft_decides_for_the_ai_teams() {
+    fn ai_bp_decides_for_the_ai_teams() {
         use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
         let _serial = crate::tests::serial();
-        let dir = std::env::temp_dir().join(format!("patch_meta_ai_ai_draft_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("patch_meta_ai_ai_bp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var(crate::paths::DIR_ENV, &dir);
@@ -1256,14 +1300,14 @@ mod tests {
         shared::publish(s);
         shared::set_player_team(Some(19));
         let ai_pick = ctx_for(12, DraftPhaseV1::Pick);
-        assert_eq!(decide(&ai_pick, false), None, "ai_draft is off by default");
-        config::set_for_tests(config::Config { ai_draft: true, ..config::Config::default() });
+        assert_eq!(decide(&ai_pick, false), None, "ai_bp is off by default");
+        config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
         set_live(true);
         shared::take_ai_choices();
         assert_eq!(decide(&ai_pick, false), Some(c as usize), "the strongest");
         assert!(decide(&ctx_for(12, DraftPhaseV1::Ban), true).is_some());
         assert_eq!(shared::take_ai_choices().first(), Some(&(false, c)), "noted for the review");
-        // the player's own team: the coach override, never ai_draft
+        // the player's own team: the coach override, never ai_bp
         let ours = ctx_for(19, DraftPhaseV1::Pick);
         // SAFETY: `ours` lives for the call
         assert_eq!(ai_decide(&unsafe { StableDraftContext::from_raw(&ours) }.unwrap(), false), None);
@@ -1275,17 +1319,17 @@ mod tests {
         crate::reset_for_tests();
     }
 
-    /// With Smart Position Lock holding AI picks, ai_draft only takes what the lock would let the
+    /// With Smart Position Lock holding AI picks, ai_bp only takes what the lock would let the
     /// team seat - here the strongest, c, plays only Mid and the team's a already does.
     #[test]
-    fn ai_draft_keeps_to_the_locks_lanes() {
+    fn ai_bp_keeps_to_the_locks_lanes() {
         let _serial = crate::tests::serial();
         crate::reset_for_tests();
         let s = snapshot();
         let id = |n: &str| s.meta.names.get(n).unwrap();
         let available: Vec<(usize, u16)> = (0..12u16).filter(|c| *c != id("a")).map(|c| (c as usize, c)).collect();
         let none = Lineups::default();
-        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]), Some(id("c")), "no lock: the strongest");
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0), Some(id("c")), "no lock: the strongest");
         let table = crate::lock::parse("[lock]
 ai=on
 [positions]
@@ -1293,13 +1337,13 @@ a=Mid
 c=Mid
 ", "", "");
         crate::lock::set(Some(table.clone()));
-        let pick = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]).unwrap();
+        let pick = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0).unwrap();
         assert_ne!(pick, id("c"), "c cannot be seated next to a");
         // bans are not held
-        assert!(ai_choice(&s, &[id("a")], &[], 6, true, &available, &none, [None, None]).is_some());
+        assert!(ai_choice(&s, &[id("a")], &[], 6, true, &available, &none, [None, None], 0.0).is_some());
         // the lock's AI switch off: not held
         crate::lock::set(Some(crate::lock::Table { ai: false, ..table }));
-        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None]), Some(id("c")));
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0), Some(id("c")));
         crate::lock::set(None);
     }
 
@@ -1329,7 +1373,7 @@ c=Mid
             for _ in 0..40 {
                 let s = variety::sampled(&base, (Some(1), Some(2)), 0, weight);
                 let _ = variety::sampled(&base, (Some(1), Some(2)), 99, weight);
-                seen.insert(ai_choice(&s, &[], &[], 6, false, &available, &none, [None, None]).unwrap());
+                seen.insert(ai_choice(&s, &[], &[], 6, false, &available, &none, [None, None], 0.0).unwrap());
             }
             seen.len()
         };
@@ -1338,9 +1382,30 @@ c=Mid
         variety::reset();
     }
 
+    /// In a Fearless series with games to come the AI's picks count what spending a champion
+    /// costs the later games (留后局), as the panel's do.
+    #[test]
+    fn ai_bp_saves_champions_for_later_games() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let s = snapshot();
+        let available: Vec<(usize, u16)> = (0..12u16).map(|c| (c as usize, c)).collect();
+        let none = Lineups::default();
+        let totals = |conserve: f32| -> HashMap<u16, f32> {
+            ai_plan(&s, &[], &[], 6, false, &available, &none, [None, None], conserve, &[], false)
+                .picks
+                .iter()
+                .map(|v| (v.champ, v.total))
+                .collect()
+        };
+        let (free, saving) = (totals(0.0), totals(series::share(1, 3)));
+        assert!(saving.iter().all(|(c, v)| *v <= free[c] + 1e-6), "spending never gains");
+        assert!(saving.iter().any(|(c, v)| *v < free[c] - 1e-4), "something nothing replaces costs more");
+    }
+
     /// The AI scouts: a champion the enemy plays in every match is likelier to be banned.
     #[test]
-    fn ai_draft_bans_what_the_enemy_plays() {
+    fn ai_bp_bans_what_the_enemy_plays() {
         let _serial = crate::tests::serial();
         crate::reset_for_tests();
         let s = snapshot();
@@ -1371,7 +1436,7 @@ c=Mid
         let fond: HashMap<u16, f32> = [(f, 1.0)].into_iter().collect();
         assert!(board(Some(&fond))[&f] > board(None)[&f], "their habit makes it a better ban");
         // through ai_choice: the enemy's habits are the second
-        assert!(ai_choice(&s, &[], &[], 0, true, &available, &none, [None, Some(&fond)]).is_some());
+        assert!(ai_choice(&s, &[], &[], 0, true, &available, &none, [None, Some(&fond)], 0.0).is_some());
     }
 
     /// On a real save: AI-vs-AI drafts, blue with variety and red without - how many champions
@@ -1408,9 +1473,9 @@ c=Mid
                     let available: Vec<(usize, u16)> = pool.iter().filter(|c| !taken.contains(c)).map(|c| (*c as usize, *c)).collect();
                     let c = if me == 0 && weight > 0.0 {
                         let s = variety::sampled(&base, teams, progress, 1.0);
-                        varied_choice(&base, &s, weight, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None])
+                        varied_choice(&base, &s, weight, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None], 0.0)
                     } else {
-                        ai_choice(&base, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None])
+                        ai_choice(&base, &picks[me], &picks[1 - me], bans, step.ban, &available, &none, [None, None], 0.0)
                     }
                     .unwrap();
                     taken.push(c);
@@ -1441,7 +1506,7 @@ c=Mid
         }
     }
 
-    /// Without the panel's plan the coach drafts exactly as ai_draft does (without variety):
+    /// Without the panel's plan the coach drafts exactly as ai_bp does (without variety):
     /// bans and picks alike, the 3+2 lookahead included.
     #[test]
     fn the_coach_without_the_panel_drafts_like_the_ai() {
@@ -1455,8 +1520,8 @@ c=Mid
         let enemy = [id("b"), id("d")];
         let available: Vec<(usize, u16)> = (0..12u16).filter(|c| ![id("a"), id("b"), id("d")].contains(c)).map(|c| (c as usize, c)).collect();
         for (bans, ban) in [(6, false), (6, true), (8, true), (10, false)] {
-            let coach = coach_choice(&s, &ally, &enemy, bans, ban, &available, &none, [None, None]).map(|c| c.0);
-            let ai = ai_choice(&s, &ally, &enemy, bans, ban, &available, &none, [None, None]);
+            let coach = coach_choice(&s, &ally, &enemy, bans, ban, &available, &none, [None, None], 0.0).map(|c| c.0);
+            let ai = ai_choice(&s, &ally, &enemy, bans, ban, &available, &none, [None, None], 0.0);
             assert_eq!(coach, ai, "bans {bans}, ban {ban}");
         }
     }

@@ -33,8 +33,11 @@
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
 //! badge is visible once that side picked it, with the pick number in `<badge>.text`, its
-//! `ban` icon once it is banned, and its `fearless_x` once Fearless rules lock it (used in an
-//! earlier game of the series) - such a card is not offered as advice and gets no value. Team names sit in `main.bottom.<side>_side.name` with the
+//! `ban` icon once it is banned, and a Fearless mark once it was played in an earlier game of
+//! the series (`fearless_x`, a cross, or `fearless_icon`, a ringed set number) with its tooltip
+//! (`fearless_tooltip.text`: your team / blue / red / both teams cannot select it). A card
+//! Fearless keeps off the player's team is not advised and gets no value; one it keeps off the
+//! enemy is not advised as a ban ([`Fearless`]). Team names sit in `main.bottom.<side>_side.name` with the
 //! league rank appended ("Samsung Galaxy #1"). Labels read back the raw text they were given,
 //! so champion names are written as the game's own name reference and the game shows them in
 //! its language. Both bottom corners of the screen - the bottom bar under the pick columns, up
@@ -122,10 +125,87 @@ pub struct Card {
     pub blue: Option<u32>,
     pub red: Option<u32>,
     pub banned: bool,
-    /// Not pickable now (Fearless).
+    /// What Fearless marks on it (played earlier in the series), and for whom.
+    pub fearless: Option<Fearless>,
+    /// Not pickable now for the player's team (Fearless; set by [`lock_for`]).
     pub locked: bool,
     /// Another mod's position lock covers it: the player's team may not pick it now.
     pub held: bool,
+}
+
+/// Which teams Fearless keeps off a champion, by its card's tooltip; `Marked`: a mark without a
+/// readable tooltip (kept off the player's team, to be safe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fearless {
+    Own,
+    Blue,
+    Red,
+    Both,
+    Marked,
+}
+
+impl Fearless {
+    /// From the tooltip's text, in any of the game's languages, or its text key.
+    fn from_tooltip(text: &str) -> Fearless {
+        let t = text.to_lowercase();
+        let any = |words: &[&str]| words.iter().any(|w| t.contains(w));
+        if any(&["双方", "neither", "both", "両チーム", "두 팀", "keines"]) {
+            Fearless::Both
+        } else if any(&["你的", "your", "own", "自チーム", "우리", "dein"]) {
+            Fearless::Own
+        } else if any(&["蓝", "blue", "ブルー", "블루", "blau"]) {
+            Fearless::Blue
+        } else if any(&["红", "red", "レッド", "레드", "rot"]) {
+            Fearless::Red
+        } else {
+            Fearless::Marked
+        }
+    }
+
+    /// Whether it keeps the player's team (0 blue, 1 red; `None`: not known) off the champion.
+    pub fn keeps_off(self, side: Option<usize>) -> bool {
+        match self {
+            Fearless::Own | Fearless::Both | Fearless::Marked => true,
+            Fearless::Blue => side != Some(1),
+            Fearless::Red => side != Some(0),
+        }
+    }
+
+    /// Whether it keeps the player's opponent off the champion (the player `side`).
+    pub fn keeps_enemy_off(self, side: usize) -> bool {
+        match self {
+            Fearless::Own => false,
+            Fearless::Both | Fearless::Marked => true,
+            Fearless::Blue => side == 1,
+            Fearless::Red => side == 0,
+        }
+    }
+}
+
+/// Marks the cards Fearless keeps off the player's team (`side`).
+pub fn lock_for(cards: &mut [Card], side: Option<usize>) {
+    for c in cards {
+        c.locked = c.fearless.is_some_and(|f| f.keeps_off(side));
+    }
+}
+
+/// A card's Fearless mark: the cross or the ringed set number the game draws on a champion
+/// played earlier in the series, with its tooltip's text.
+fn fearless_mark(ui: &impl Ui, path: &str) -> Option<Fearless> {
+    if !visible(ui, &format!("{path}.fearless_x")) && !visible(ui, &format!("{path}.fearless_icon")) {
+        return None;
+    }
+    let tip = ui.text(&format!("{path}.fearless_tooltip.text")).unwrap_or_default();
+    Some(Fearless::from_tooltip(&tip))
+}
+
+/// A card's Fearless nodes as the game shows them (diag.log).
+fn describe_fearless(ui: &impl Ui, path: &str) -> String {
+    let node = |n: &str| {
+        let p = format!("{path}.{n}");
+        format!("{n} {} {:?}", if visible(ui, &p) { "shown" } else { "hidden" }, ui.text(&format!("{p}.text")).unwrap_or_default())
+    };
+    format!("{}; {}; {}", node("fearless_x"), node("fearless_icon"), node("fearless_tooltip"))
 }
 
 impl Card {
@@ -227,10 +307,6 @@ pub fn last_review() -> Option<Review> {
     LAST_REVIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
-/// Spending a champion nothing replaces in a Fearless series costs this share of what it is
-/// worth over the next option, times the share of the series still to come.
-const CONSERVE: f32 = 0.4;
-
 /// A team's style and worst gap, in a few words (its open slots counted as average champions).
 fn comp_text(meta: &crate::meta::Meta, picks: &[u16]) -> String {
     use crate::knowledge::COMP_NAMES_ZH;
@@ -312,7 +388,8 @@ pub fn read_grid(ui: &impl Ui, known: &dyn Fn(&str) -> bool, names: &NameBook) -
                 blue: badge("blue"),
                 red: badge("red"),
                 banned: visible(ui, &format!("{path}.ban")),
-                locked: visible(ui, &format!("{path}.fearless_x")),
+                fearless: fearless_mark(ui, &path),
+                locked: false,
                 held: visible(ui, &format!("{path}.{POSITION_LOCK}")),
                 path,
             }
@@ -621,7 +698,26 @@ impl DraftScreen {
         };
         let meta = &snapshot.meta;
         let known = |c: &str| meta.names.get(c).is_some();
-        let cards = read_grid(ui, &known, names);
+        let mut cards = read_grid(ui, &known, names);
+        lock_for(&mut cards, side);
+        if let Some(c) = cards.iter().find(|c| c.fearless.is_some()) {
+            let count = |f: Fearless| cards.iter().filter(|c| c.fearless == Some(f)).count();
+            diag::log_once(
+                "draft-fearless",
+                &format!(
+                    "[ui] Fearless: {} cards marked (yours {}, blue {}, red {}, both {}, tooltip unread {}), {} kept off your team; e.g. {}: {}",
+                    cards.iter().filter(|c| c.fearless.is_some()).count(),
+                    count(Fearless::Own),
+                    count(Fearless::Blue),
+                    count(Fearless::Red),
+                    count(Fearless::Both),
+                    count(Fearless::Marked),
+                    cards.iter().filter(|c| c.locked).count(),
+                    c.champ.as_deref().unwrap_or("?"),
+                    describe_fearless(ui, &c.path)
+                ),
+            );
+        }
         let swap_phase = ui.visible(SWAP) == Some(true);
         let banning = ui.text(STEP).is_some_and(|t| ban_phase(&t));
         let acting = (0..2).find(|s| visible(ui, TURN_ARROWS[*s]));
@@ -654,7 +750,7 @@ impl DraftScreen {
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for c in &cards {
-            (&c.champ, c.blue, c.red, c.banned, c.locked, c.held).hash(&mut h);
+            (&c.champ, c.blue, c.red, c.banned, c.fearless, c.locked, c.held).hash(&mut h);
         }
         (side, Arc::as_ptr(snapshot) as usize, swap_phase, banning, acting, view.panel_opacity.to_bits()).hash(&mut h);
         let key = h.finish() | 1 << 63;
@@ -795,7 +891,7 @@ impl DraftScreen {
                 .count();
             format!(", coach override {} decided, {taken} of them made", coach.len())
         };
-        // ai_draft's choices for the other team, the same way
+        // ai_bp's choices for the other team, the same way
         let ai = crate::shared::take_ai_choices();
         let ai_note = if ai.is_empty() {
             String::new()
@@ -809,7 +905,7 @@ impl DraftScreen {
                     theirs.iter().any(|r| r.ban == *ban && r.champ == name)
                 })
                 .count();
-            format!(", ai_draft {} decided, {made} of them made", ai.len())
+            format!(", ai_bp {} decided, {made} of them made", ai.len())
         };
         diag::log(&format!(
             "[review] {} vs {}: {} picks and bans seen, ours {} ({} as advised){coach_note}{ai_note}, win chance at the end {}",
@@ -916,15 +1012,23 @@ impl DraftScreen {
         let (ally, enemy) = if side == 0 { (blue, red) } else { (red, blue) };
         self.last_picks = Some((ally.clone(), enemy.clone()));
         let damage = |c: u16| snapshot.damage_of(c);
-        let open: Vec<u16> =
-            cards.iter().filter(|c| c.open()).filter_map(&id).collect();
-        // the champions the player's team may pick: open, and not held by a position lock
+        // on offer to the enemy (what bans, threats and the lookahead are about): not taken, and
+        // not kept off the enemy by Fearless (a champion only the player's team played is)
+        let open: Vec<u16> = cards
+            .iter()
+            .filter(|c| c.blue.is_none() && c.red.is_none() && !c.banned)
+            .filter(|c| !c.fearless.is_some_and(|f| f.keeps_enemy_off(side)))
+            .filter_map(&id)
+            .collect();
+        // on offer to the player's team (what the enemy would ban): not taken, not kept off by
+        // Fearless; and of those, what it may pick now (not held by a position lock)
+        let ours: Vec<u16> = cards.iter().filter(|c| c.open()).filter_map(&id).collect();
         let pickable: Vec<u16> = cards.iter().filter(|c| c.open() && !c.held).filter_map(&id).collect();
 
         // win chance, and each side's composition
         let p = advisor::win_probability(meta, &ally, &enemy);
         let (mine, theirs) = if side == 0 { (BLUE, RED) } else { (RED, BLUE) };
-        let fearless = cards.iter().filter(|c| c.locked).count();
+        let fearless = cards.iter().filter(|c| c.fearless.is_some()).count();
         let title = if fearless > 0 {
             format!("胜率 Win · {} vs {} · Fearless {fearless}", ally.len(), enemy.len())
         } else {
@@ -981,12 +1085,17 @@ impl DraftScreen {
             advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref(), lean: their_lean.as_deref() };
         let blue = turn.side_known.then_some(side == 0);
         // a Fearless series with games left: spending what nothing replaces costs a little
-        let series = series_left(&ui.text(SERIES).unwrap_or_default(), fearless);
-        let conserve_share = series.map_or(0.0, |(left, n)| CONSERVE * left as f32 / (n - 1).max(1) as f32);
+        let label = ui.text(SERIES).unwrap_or_default();
+        if let Some(n) = label.trim().strip_prefix("Bo").and_then(|n| n.parse().ok()) {
+            // the AI teams' drafts of this stage take the same length (`series`)
+            crate::series::set_length(n);
+        }
+        let series = series_left(&label, fearless);
+        let conserve_share = series.map_or(0.0, |(left, n)| crate::series::share(left, n));
         let their_turn = turn.acting.is_some_and(|a| a != side);
         let banned = cards.iter().filter(|c| c.banned).count();
         // our bans and picks, the best few played out on our turn of a 3+2 draft (the same
-        // ranking the AI drafts by with ai_draft on)
+        // ranking the AI drafts by with ai_bp on)
         let plan = advisor::plan_turn(
             meta,
             &advisor::TurnInput {
@@ -1007,7 +1116,7 @@ impl DraftScreen {
         let by_ban: HashMap<u16, advisor::BanValue> = board.iter().map(|b| (b.champ, b.clone())).collect();
         // the enemy's turn to ban: what they would most want to take from us
         let mut their_bans = if turn.banning && their_turn {
-            advisor::ban_board(meta, them, us, advisor::Mastery::FULL, &damage, &open, blue.map(|b| !b))
+            advisor::ban_board(meta, them, us, advisor::Mastery::FULL, &damage, &ours, blue.map(|b| !b))
         } else {
             Vec::new()
         };
@@ -1279,6 +1388,48 @@ mod tests {
     }
 
     #[test]
+    fn fearless_marks_by_side() {
+        let book = NameBook::default();
+        let mut ui = screen();
+        // the ringed set number, no tooltip text read: kept off the player, to be safe
+        ui.add(&format!("{GRID}.a.fearless_icon"), "color").visible = true;
+        // the cross, with the tooltips the game writes
+        for (n, tip) in [
+            ("b", "无畏征召 - 你的队伍无法选择此英雄。"),
+            ("c", "无畏征召 - 红方队伍无法选择此英雄。"),
+            ("d", "Fearless - Blue team cannot select this champion."),
+            ("e", "无畏征召 - 双方队伍都无法选择此英雄。"),
+        ] {
+            ui.nodes.get_mut(&format!("{GRID}.{n}.fearless_x")).unwrap().visible = true;
+            ui.add(&format!("{GRID}.{n}.fearless_tooltip.text"), "label").text = Some(tip.into());
+        }
+        let known = |c: &str| NAMES.contains(&c);
+        let mut cards = read_grid(&ui, &known, &book);
+        let fearless = |cards: &[Card], n: &str| cards.iter().find(|c| c.champ.as_deref() == Some(n)).unwrap().fearless;
+        assert_eq!(fearless(&cards, "a"), Some(Fearless::Marked));
+        assert_eq!(fearless(&cards, "b"), Some(Fearless::Own));
+        assert_eq!(fearless(&cards, "c"), Some(Fearless::Red));
+        assert_eq!(fearless(&cards, "d"), Some(Fearless::Blue));
+        assert_eq!(fearless(&cards, "e"), Some(Fearless::Both));
+        assert_eq!(fearless(&cards, "f"), None);
+        let locked = |cards: &[Card]| -> Vec<String> {
+            cards.iter().filter(|c| c.locked).filter_map(|c| c.champ.clone()).collect()
+        };
+        lock_for(&mut cards, Some(0));
+        assert_eq!(locked(&cards), ["a", "b", "d", "e"], "blue: red's own mark leaves it open");
+        lock_for(&mut cards, Some(1));
+        assert_eq!(locked(&cards), ["a", "b", "c", "e"]);
+        lock_for(&mut cards, None);
+        assert_eq!(locked(&cards), ["a", "b", "c", "d", "e"], "side unknown: every mark");
+        // the enemy's: the player blue, red's own mark keeps red off "c", the player's own "b" does not
+        let enemy_off = |side: usize| -> Vec<String> {
+            cards.iter().filter(|c| c.fearless.is_some_and(|f| f.keeps_enemy_off(side))).filter_map(|c| c.champ.clone()).collect()
+        };
+        assert_eq!(enemy_off(0), ["a", "c", "e"]);
+        assert_eq!(enemy_off(1), ["a", "d", "e"]);
+    }
+
+    #[test]
     fn reads_the_draft_and_draws_the_overlay() {
         let snapshot = snapshot(2000);
         let book = NameBook::default();
@@ -1298,7 +1449,8 @@ mod tests {
         screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
 
         let known = |c: &str| NAMES.contains(&c);
-        let cards = read_grid(&ui, &known, &book);
+        let mut cards = read_grid(&ui, &known, &book);
+        lock_for(&mut cards, Some(0));
         assert_eq!(cards.len(), 12);
         let card = |n: &str| cards.iter().find(|c| c.champ.as_deref() == Some(n)).unwrap();
         assert_eq!(card("a").red, Some(1));

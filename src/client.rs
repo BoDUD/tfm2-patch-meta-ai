@@ -639,7 +639,7 @@ struct Teams {
     /// Matches the `picks` lists count, per team.
     matches: HashMap<String, u32>,
     last_opponent: Option<String>,
-    /// Per team id: the share of its recent matches it played each champion in (`ai_draft`).
+    /// Per team id: the share of its recent matches it played each champion in (`ai_bp`).
     habits: HashMap<u32, HashMap<u16, f32>>,
 }
 

@@ -1,6 +1,6 @@
 //! Smart Position Lock's lanes (mod id `smart_position_lock`). The lock holds every pick that
 //! would leave a team unable to seat its champions one per lane - by its score hook, which a
-//! deciding hook (`draft::CoachHook`: the coach override, `ai_draft`) goes past. So those
+//! deciding hook (`draft::CoachHook`: the coach override, `ai_bp`) goes past. So those
 //! decisions apply the lock's own rule here, with the lock's own table:
 //!
 //! - a champion's lanes: the lock's `settings.ini` `[positions]` (the player's list), else its
