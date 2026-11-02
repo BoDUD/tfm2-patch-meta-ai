@@ -56,10 +56,10 @@ const NEW_MENU: &str = "main.top.left.team_header";
 const CONSOLE_MENU: &str = "main.top.left.c_groups";
 /// The new UI's title bar: the screen's name on the left, the game's buttons from the right.
 const TITLE_BAR: &str = "main.bottom";
-/// The left-anchored nodes of the title bar; the others are the game's buttons.
-const TITLE_TEXTS: [&str; 2] = ["title", "subtitle"];
-/// The entry in the title bar, as high as the game's buttons there.
+/// The entry in the title bar, as high as the game's buttons there; just its icon when the bar has
+/// no room for its name.
 const BAR_NAV_W: u32 = 176;
+const BAR_NAV_ICON_W: u32 = 40;
 const BAR_NAV_H: u32 = 40;
 const BAR_NAV_GAP: f32 = 16.0;
 /// The bottom of the new UI's title bar (y 16, 48 high), when its rectangle is not known.
@@ -319,7 +319,7 @@ pub struct MetaPage {
     /// The look of the management screen the entry was made for, and where it was put in the
     /// new UI's title bar.
     menu: Menu,
-    nav_at: Option<(i32, i32)>,
+    nav_at: Option<Slot>,
     next_place: u64,
     registered: HashSet<String>,
 }
@@ -345,23 +345,92 @@ fn menu_style(ui: &impl Ui) -> Menu {
     }
 }
 
+/// Where the entry is in the new UI's title bar, and whether only its icon fits there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Slot {
+    x: i32,
+    y: i32,
+    compact: bool,
+}
+
+/// Where a label's text ends: its rectangle, cut to what its text needs when the text is written
+/// out (a CJK character about a font size wide, other characters about 0.58 of one; the font
+/// about 0.6 of the label's height). A text reference (`#...`) or no text: the whole rectangle.
+fn text_end(text: Option<&str>, (x, _, w, h): (f32, f32, f32, f32)) -> f32 {
+    match text {
+        Some(t) if !t.is_empty() && !t.starts_with('#') => {
+            let font = (h * 0.6).clamp(12.0, 32.0);
+            let need: f32 = t.chars().map(|c| if c.is_ascii() { 0.58 } else { 1.0 }).sum::<f32>() * font;
+            x + need.min(w)
+        }
+        _ => x + w,
+    }
+}
+
 /// Where the entry goes in the new UI's title bar: left of the leftmost of the game's buttons shown
-/// there, which the game lays out as it goes (the advance button's text changes, undo / redo come
-/// and go). Hidden nodes have no rectangle.
-fn title_bar_slot(ui: &impl Ui) -> Option<(i32, i32)> {
+/// there (they move as the game lays them out: the advance button's text changes, undo / redo come
+/// and go), and right of every text in the bar (the screen's name, the date, the season, the
+/// time) - just its icon when its name does not fit between them. Hidden nodes have no rectangle.
+fn title_bar_slot(ui: &impl Ui) -> Option<Slot> {
     let (bx, by, bw, bh) = ui.rect(TITLE_BAR).filter(|r| r.2 > 0.0 && r.3 > 0.0)?;
-    let left = ui
-        .children(TITLE_BAR)
+    let shown = |path: &str| ui.visible(path) == Some(true);
+    let button = |path: &str| ui.runner(path).is_some_and(|r| r.contains("button"));
+    let mut left = bx + bw;
+    let mut right = bx;
+    for child in ui.children(TITLE_BAR) {
+        let path = format!("{TITLE_BAR}.{child}");
+        if !shown(&path) {
+            continue;
+        }
+        let Some(rect) = ui.rect(&path).filter(|r| r.2 > 0.0 && r.0 >= bx) else { continue };
+        if button(&path) {
+            left = left.min(rect.0);
+            continue;
+        }
+        // a text, or a group of texts (one level down)
+        let mut ends = Vec::new();
+        if ui.runner(&path).is_some_and(|r| r.contains("label")) {
+            ends.push(text_end(ui.text(&path).as_deref(), rect));
+        }
+        for inner in ui.children(&path) {
+            let inner = format!("{path}.{inner}");
+            if shown(&inner) && !button(&inner) && ui.runner(&inner).is_some_and(|r| r.contains("label")) {
+                if let Some(r) = ui.rect(&inner).filter(|r| r.2 > 0.0) {
+                    ends.push(text_end(ui.text(&inner).as_deref(), r));
+                }
+            }
+        }
+        right = ends.into_iter().fold(right, f32::max);
+    }
+    let y = (by + (bh - BAR_NAV_H as f32) / 2.0).round() as i32;
+    let full = left - BAR_NAV_GAP - BAR_NAV_W as f32;
+    if full >= right + BAR_NAV_GAP {
+        return Some(Slot { x: full.round() as i32, y, compact: false });
+    }
+    let icon = (left - BAR_NAV_GAP - BAR_NAV_ICON_W as f32).max(bx);
+    Some(Slot { x: icon.round() as i32, y, compact: true })
+}
+
+/// The title bar's nodes as the game laid them out (diag.log, once): name, kind, rectangle, text.
+fn describe_title_bar(ui: &impl Ui) -> String {
+    ui.children(TITLE_BAR)
         .iter()
-        .filter(|c| !TITLE_TEXTS.contains(&c.as_str()))
-        .map(|c| format!("{TITLE_BAR}.{c}"))
-        .filter(|c| ui.visible(c) == Some(true))
-        .filter_map(|c| ui.rect(&c))
-        .filter(|&(x, _, w, _)| w > 0.0 && x >= bx)
-        .map(|(x, ..)| x)
-        .fold(bx + bw, f32::min);
-    let x = (left - BAR_NAV_GAP - BAR_NAV_W as f32).max(bx);
-    Some((x.round() as i32, (by + (bh - BAR_NAV_H as f32) / 2.0).round() as i32))
+        .map(|c| {
+            let path = format!("{TITLE_BAR}.{c}");
+            let r = ui.rect(&path).unwrap_or_default();
+            let text: String = ui.text(&path).unwrap_or_default().chars().take(24).collect();
+            format!(
+                "{c} {} {} ({:.0},{:.0},{:.0},{:.0}) {text:?}",
+                ui.runner(&path).unwrap_or_default(),
+                if ui.visible(&path) == Some(true) { "shown" } else { "hidden" },
+                r.0,
+                r.1,
+                r.2,
+                r.3
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl Default for MetaPage {
@@ -445,6 +514,7 @@ impl MetaPage {
             let source = if menu == Menu::New {
                 // the title bar is laid out a frame after the screen
                 let Some(at) = title_bar_slot(ui) else { return };
+                crate::diag::log_once("page-title-bar", &format!("[page] title bar: {}", describe_title_bar(ui)));
                 self.nav_at = Some(at);
                 self.next_place = frame + HEAL_EVERY;
                 bar_nav_source(&text, at)
@@ -466,8 +536,13 @@ impl MetaPage {
         } else if menu == Menu::New && frame >= self.next_place {
             self.next_place = frame + HEAL_EVERY;
             if let Some(at) = title_bar_slot(ui).filter(|at| self.nav_at != Some(*at)) {
+                if self.nav_at.is_some_and(|was| was.compact != at.compact) {
+                    // the other width: made again on the next frame
+                    ui.remove(NAV);
+                    return;
+                }
                 self.nav_at = Some(at);
-                ui.set_properties(NAV, &format!("x: {}px; y: {}px;", at.0, at.1));
+                ui.set_properties(NAV, &format!("x: {}px; y: {}px;", at.x, at.y));
             }
         }
 
@@ -838,15 +913,17 @@ fn bar_nav_style(lit: bool) -> String {
     )
 }
 
-fn bar_nav_source(text: &str, (x, y): (i32, i32)) -> String {
+fn bar_nav_source(text: &str, at: Slot) -> String {
+    let (x, y) = (at.x, at.y);
+    let (w, shown) = if at.compact { (BAR_NAV_ICON_W, "false") } else { (BAR_NAV_W, "true") };
     format!(
-        "pma_nav:empty {{ x: {x}px; y: {y}px; width: {BAR_NAV_W}px; height: {BAR_NAV_H}px; \
-         #button:color_icon_button {{ width: {BAR_NAV_W}px; height: {BAR_NAV_H}px; {} \
+        "pma_nav:empty {{ x: {x}px; y: {y}px; width: {w}px; height: {BAR_NAV_H}px; \
+         #button:color_icon_button {{ width: {w}px; height: {BAR_NAV_H}px; {} \
          hover_sound: \"asset/base/sound/sfx/UI_mouse_hover\"; click_sound: \"asset/base/sound/sfx/UI_mouse_click\"; \
          #icon:image {{ x: 12px; y: 10px; width: 20px; height: 20px; ignore_event: true; color: #141922ff; \
          source: \"asset/base/ui/icons/chart\"; }} \
          #text:label {{ @\"asset/base/style/main#bold_label\"; x: 40px; y: 10px; width: {}px; height: 20px; align_x: Left; \
-         align_y: Center; size: 18; fit_width: true; ignore_event: true; color: #141922ff; text: {}; }} }} }}",
+         align_y: Center; size: 18; fit_width: true; ignore_event: true; visible: {shown}; color: #141922ff; text: {}; }} }} }}",
         bar_nav_style(false),
         BAR_NAV_W - 52,
         quote(text)
@@ -1642,6 +1719,30 @@ mod tests {
         help.visible = false;
         help.rect = (0.0, 0.0, 0.0, 0.0);
         ui
+    }
+
+    /// The bar as the player's screenshot shows it: the date, then the season and the time - texts
+    /// the entry must not cover (it sat on the season before); no room for its name: its icon.
+    #[test]
+    fn the_title_bar_entry_keeps_off_the_texts() {
+        let mut ui = new_management();
+        ui.nodes.get_mut(&format!("{TITLE_BAR}.title")).unwrap().text = Some("今天 · 4月8日 星期四".into());
+        let sub = ui.nodes.get_mut(&format!("{TITLE_BAR}.subtitle")).unwrap();
+        sub.text = Some("2027 中国 春季赛".into());
+        sub.rect = (600.0, 20.0, 700.0, 40.0);
+        ui.add(&format!("{TITLE_BAR}.time"), "label").rect = (930.0, 20.0, 600.0, 40.0);
+        ui.nodes.get_mut(&format!("{TITLE_BAR}.time")).unwrap().text = Some("00:00".into());
+        let at = title_bar_slot(&ui).unwrap();
+        // the time's text ends about 930 + 5 x 0.58 x 24 = 1000; the entry is right of it, whole
+        assert!(!at.compact && at.x >= 1000, "{at:?}");
+        assert_eq!(at.x, 1560 - 16 - BAR_NAV_W as i32, "left of the leftmost button");
+        // a text reaching the buttons (a reference: its whole box): just the icon, by the buttons
+        ui.nodes.get_mut(&format!("{TITLE_BAR}.time")).unwrap().text = Some("#asset/base/text/ui?long".into());
+        let at = title_bar_slot(&ui).unwrap();
+        assert!(at.compact && at.x == 1560 - 16 - BAR_NAV_ICON_W as i32, "{at:?}");
+        assert!(bar_nav_source("Meta", at).contains("width: 40px;"));
+        assert!(text_end(Some("00:00"), (0.0, 0.0, 600.0, 40.0)) < 80.0, "cut to the text, not the box");
+        assert_eq!(text_end(None, (10.0, 0.0, 50.0, 40.0)), 60.0);
     }
 
     #[test]
