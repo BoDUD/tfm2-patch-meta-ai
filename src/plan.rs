@@ -78,16 +78,25 @@ pub struct TacticAdvice {
 
 /// Options seen in fewer games than this are not advised.
 const MIN_TACTIC_GAMES: u32 = 8;
+/// What the five champions' part of an option counts for: each champion's is fitted from few
+/// games, and five of them summed can outweigh the option's own, better-known worth.
+pub const CHAMP_WEIGHT: f32 = 0.5;
 
 /// The best option of every strategy setting for a team of `team` (best gain first).
 pub fn tactics_for(meta: &Meta, team: &[u16]) -> Vec<TacticAdvice> {
+    tactics_weighted(meta, team, CHAMP_WEIGHT)
+}
+
+/// [`tactics_for`] with the champions' part (`TacticChamp`) weighted by `champ_weight`.
+pub fn tactics_weighted(meta: &Meta, team: &[u16], champ_weight: f32) -> Vec<TacticAdvice> {
     let mut by_setting: HashMap<String, Vec<(String, f32)>> = HashMap::new();
     for (t, e) in &meta.tactics {
         if e.tally.games < MIN_TACTIC_GAMES {
             continue;
         }
         let (setting, option) = tactic(*t);
-        let with: f32 = team.iter().map(|c| meta.tactic_champ.get(&(*t, *c)).map_or(0.0, |x| x.value)).sum();
+        let with: f32 =
+            champ_weight * team.iter().map(|c| meta.tactic_champ.get(&(*t, *c)).map_or(0.0, |x| x.value)).sum::<f32>();
         by_setting.entry(setting).or_default().push((option, e.value + with));
     }
     let mut out: Vec<TacticAdvice> = by_setting

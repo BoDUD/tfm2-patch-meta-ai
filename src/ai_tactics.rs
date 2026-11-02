@@ -1,7 +1,8 @@
-//! `ai_tactics`: teams the model drafted - AI teams with `ai_draft` on, the player's team after
-//! an auto BP (`coach=on` made its picks) - also play the strategy the model rates best for
-//! their five champions (`plan::tactics_for`, the tactics screen's ★), set when the match starts
-//! (`StableMatchHook::on_match_start`, `strategy_set_json`).
+//! `ai_tactics`: AI teams the model drafted (`ai_draft` on) also play the strategy the model
+//! rates best for their five champions (`plan::tactics_for`, the tactics screen's ★), set when
+//! the match starts (`StableMatchHook::on_match_start`, `strategy_set_json`). A setting keeps the
+//! team's own option unless the advised one is worth [`SWITCH_MARGIN`] more by the model; the
+//! player's team always keeps the player's own strategy, auto BP or not.
 //!
 //! A match is simulated more than once: the server plays it out first (`ServerPresim`, the
 //! result), the client plays it again to show it, and replays play it again later. Every run
@@ -32,6 +33,11 @@ pub const FILE: &str = "ai_tactics.json";
 const KEPT: usize = 4000;
 /// Matches written to `diag.log` per game session besides the player's own.
 const LOGGED: usize = 4;
+
+/// What the advised option must be worth over the team's own (log-odds) before it is set: on a
+/// save's matches the model was not fitted on, the side playing the advice won about 52% where
+/// it was ahead by any margin, about 55% where it was ahead by this much.
+const SWITCH_MARGIN: f32 = 0.1;
 
 /// One side's applied strategy: (setting, option).
 pub type Strategy = Vec<(String, String)>;
@@ -160,9 +166,28 @@ pub fn value_for(current: Option<&Value>, option: &str) -> Option<String> {
 }
 
 /// The ★ strategy for these champions (by the model's ids).
-fn advised(snapshot: &shared::Snapshot, champions: &[String]) -> Vec<(String, String, f32)> {
+fn advised(snapshot: &shared::Snapshot, champions: &[String]) -> Vec<plan::TacticAdvice> {
     let ids: Vec<u16> = champions.iter().filter_map(|c| snapshot.meta.names.get(c)).collect();
-    plan::tactics_for(&snapshot.meta, &ids).into_iter().map(|a| (a.setting, a.option, a.gain)).collect()
+    plan::tactics_for(&snapshot.meta, &ids)
+}
+
+/// The option a setting holds (a variant with data by its name).
+fn option_of(current: Option<&Value>) -> Option<&str> {
+    match current? {
+        Value::String(s) => Some(s),
+        Value::Object(m) if m.len() == 1 => m.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// Whether the advice is worth more than the team's own option by [`SWITCH_MARGIN`] (an own
+/// option the model does not rate: yes).
+fn worth_switching(advice: &plan::TacticAdvice, current: Option<&str>) -> bool {
+    let Some(best) = advice.options.first() else { return false };
+    match current.and_then(|c| advice.options.iter().find(|o| o.0 == c)) {
+        Some(own) => best.1 - own.1 >= SWITCH_MARGIN,
+        None => true,
+    }
 }
 
 /// The player's side in this match (`None`: not the player's last draft) and whether its picks
@@ -180,12 +205,12 @@ fn players_side(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>) 
     }
 }
 
-/// Which sides of a match the model drafted: the player's side only after an auto BP, every
-/// other side when `ai_draft` is on.
-fn model_sides(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>, ai_draft: bool, coach: bool) -> [bool; 2] {
+/// Which sides of a match play the model's strategy: every AI side when `ai_draft` is on, never
+/// the player's (after an auto BP too: the player's own strategy stays).
+fn model_sides(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>, ai_draft: bool) -> [bool; 2] {
     let mut out = [ai_draft; 2];
-    if let Some((side, auto)) = players_side(sides, player) {
-        out[side] = auto && coach;
+    if let Some((side, _)) = players_side(sides, player) {
+        out[side] = false;
     }
     out
 }
@@ -322,26 +347,30 @@ fn apply(sim: &mut StableSim<'_>) -> bool {
                 return true;
             };
             let player = shared::player_draft();
-            let model = model_sides(&sides, player.as_deref(), cfg.ai_draft, cfg.coach);
+            let model = model_sides(&sides, player.as_deref(), cfg.ai_draft);
             let mut plan: [Option<Strategy>; 2] = [None, None];
             for side in 0..2 {
                 if !model[side] {
                     continue;
                 }
                 let mut applied = Strategy::new();
-                for (setting, option, _) in advised(&snapshot, &sides[side]) {
-                    let current = sim.strategy_get_json(side, &setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
-                    if let Some(json) = value_for(current.as_ref(), &option) {
-                        if sim.strategy_set_json(side, &setting, &json) {
-                            applied.push((setting, option));
+                for advice in advised(&snapshot, &sides[side]) {
+                    let (setting, option) = (advice.setting.as_str(), advice.option.as_str());
+                    let current = sim.strategy_get_json(side, setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
+                    if !worth_switching(&advice, option_of(current.as_ref())) {
+                        continue;
+                    }
+                    if let Some(json) = value_for(current.as_ref(), option) {
+                        if sim.strategy_set_json(side, setting, &json) {
+                            applied.push((setting.to_string(), option.to_string()));
                         } else {
                             diag::log_once(
                                 &format!("tactics-reject-{setting}"),
                                 &format!("[tactics] the game did not take {setting} = {json} (current {current:?})"),
                             );
                         }
-                    } else if already(current.as_ref(), &option) {
-                        applied.push((setting, option));
+                    } else if already(current.as_ref(), option) {
+                        applied.push((setting.to_string(), option.to_string()));
                     }
                 }
                 plan[side] = Some(applied);
@@ -362,8 +391,11 @@ fn apply(sim: &mut StableSim<'_>) -> bool {
                     sides[1].join(","),
                     show(&plan[1]),
                     match mine {
-                        Some((side, true)) if cfg.coach => format!(" (you: {}, auto BP)", ["blue", "red"][side]),
-                        Some((side, _)) => format!(" (you: {}, your own tactics)", ["blue", "red"][side]),
+                        Some((side, auto)) => format!(
+                            " (you: {}{}, your own tactics)",
+                            ["blue", "red"][side],
+                            if auto && cfg.coach { ", auto BP" } else { "" }
+                        ),
                         None => String::new(),
                     }
                 ));
@@ -425,17 +457,34 @@ mod tests {
         let (a, b) = (five("a"), five("b"));
         let sides = [a.clone(), b.clone()];
         // not the player's match: every AI side with ai_draft
-        assert_eq!(model_sides(&sides, None, true, true), [true, true]);
-        assert_eq!(model_sides(&sides, None, false, true), [false, false]);
-        // the player's match, the player blue: red only, unless the player's picks were an auto BP
+        assert_eq!(model_sides(&sides, None, true), [true, true]);
+        assert_eq!(model_sides(&sides, None, false), [false, false]);
+        // the player's match, the player blue: red only, after an auto BP too
         let mut p = shared::PlayerDraft { sides: [a.clone(), b.clone()], side: 0, auto: false };
-        assert_eq!(model_sides(&sides, Some(&p), true, true), [false, true]);
+        assert_eq!(model_sides(&sides, Some(&p), true), [false, true]);
         p.auto = true;
-        assert_eq!(model_sides(&sides, Some(&p), true, true), [true, true]);
-        assert_eq!(model_sides(&sides, Some(&p), true, false), [false, true], "coach=off");
+        assert_eq!(model_sides(&sides, Some(&p), true), [false, true], "the player's own strategy after an auto BP");
         // the same match with the sides the other way round
         let flipped = [b, a];
-        assert_eq!(model_sides(&flipped, Some(&shared::PlayerDraft { auto: false, ..p }), true, true), [true, false]);
+        assert_eq!(model_sides(&flipped, Some(&p), true), [true, false]);
+    }
+
+    #[test]
+    fn the_advice_must_be_clearly_better() {
+        let advice = |options: &[(&str, f32)]| plan::TacticAdvice {
+            setting: "game_finish".into(),
+            option: options[0].0.into(),
+            gain: 0.0,
+            options: options.iter().map(|(o, v)| (o.to_string(), *v)).collect(),
+        };
+        let close = advice(&[("Aggressive", 0.05), ("Flexible", 0.0), ("Stable", -0.2)]);
+        assert!(!worth_switching(&close, Some("Flexible")), "within the margin: the team's own stays");
+        assert!(worth_switching(&close, Some("Stable")));
+        assert!(worth_switching(&close, None), "no option read");
+        assert!(worth_switching(&close, Some("Unknown")), "an option the model does not rate");
+        let split: Value = serde_json::from_str(r#"{"Split131": {"position1": "Top"}}"#).unwrap();
+        assert_eq!(option_of(Some(&split)), Some("Split131"));
+        assert_eq!(option_of(Some(&Value::String("Gather".into()))), Some("Gather"));
     }
 
     #[test]
