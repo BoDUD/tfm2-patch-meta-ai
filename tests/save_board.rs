@@ -190,3 +190,97 @@ fn recency_on_a_save() {
         }
     }
 }
+
+/// Whether the strategy advice (the tactics screen's ★, `ai_tactics`) picks options that win, on
+/// matches the model was not fitted on: fitted on all but the newest, then, for every setting
+/// where the two sides played different options, how often the side that played the advised one
+/// won - by the champions' weight and by the margin the advice is ahead by.
+/// `PMA_HISTORY=<history file> [PMA_TACTICS=<mod folder>/ai_tactics.json] cargo test --release --test save_board -- --ignored --nocapture tactics`
+#[test]
+#[ignore]
+fn tactics_on_a_save() {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let Ok(path) = std::env::var("PMA_HISTORY") else {
+        eprintln!("PMA_HISTORY not set");
+        return;
+    };
+    let text = std::fs::read_to_string(&path).expect("history file");
+    let mut names = Names::default();
+    let mut games: Vec<_> = patch_meta_ai::cache::decode(&text, &mut names).into_iter().map(|(_, g)| g).collect();
+    games.retain(|g| !g.solo);
+    games.sort_by_key(|g| g.record);
+    // matches whose strategies the mod set (the advice on both sides): no contrast, left out
+    let decided: HashSet<String> = std::env::var("PMA_TACTICS")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["matches"].as_array().map(|m| m.iter().filter_map(|e| e["key"].as_str().map(str::to_string)).collect()))
+        .unwrap_or_default();
+    let key = |g: &patch_meta_ai::history::Game| {
+        let side = |s: usize| {
+            let mut v: Vec<String> = g.sides[s].iter().map(|x| names.name(x.champ).to_string()).collect();
+            v.sort();
+            v.join(",")
+        };
+        format!("{}|{}", side(0), side(1))
+    };
+    let natural: Vec<_> = games.iter().filter(|g| !decided.contains(&key(g))).cloned().collect();
+    let mut champions: Vec<String> = knowledge::get().positions.keys().cloned().collect();
+    champions.sort();
+    let hold = 500.min(natural.len() / 4);
+    let (train, test) = natural.split_at(natural.len() - hold);
+    let current = train.iter().map(|g| g.version.clone()).max().unwrap_or_default();
+    let meta = build(
+        &Inputs { games: train, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None },
+        &Settings::default(),
+    );
+    eprintln!(
+        "{} matches ({} set by the mod left out), fitted on {}, checked on {}",
+        games.len(),
+        games.len() - natural.len(),
+        train.len(),
+        test.len()
+    );
+    for w in [0.0, 0.25, 0.5, 1.0] {
+        for margin in [0.0, 0.02, 0.05, 0.1] {
+            let (mut won, mut n) = (0u32, 0u32);
+            let mut by: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+            for g in test {
+                let ids = |s: usize| -> Vec<u16> {
+                    g.sides[s].iter().map(|x| meta.names.get(names.name(x.champ)).unwrap_or(u16::MAX)).collect()
+                };
+                let played = |s: usize| -> HashMap<String, String> {
+                    g.tactics[s].iter().map(|t| patch_meta_ai::history::tactic(*t)).collect()
+                };
+                let both = [played(0), played(1)];
+                for s in 0..2 {
+                    for a in patch_meta_ai::plan::tactics_weighted(&meta, &ids(s), w) {
+                        let (Some(mine), Some(theirs)) = (both[s].get(&a.setting), both[1 - s].get(&a.setting)) else {
+                            continue;
+                        };
+                        // this side played the advice, the other side something else, the advice
+                        // ahead of that by `margin`
+                        if *mine != a.option || theirs == mine {
+                            continue;
+                        }
+                        let other = a.options.iter().find(|o| &o.0 == theirs).map_or(f32::NEG_INFINITY, |o| o.1);
+                        if a.options[0].1 - other < margin {
+                            continue;
+                        }
+                        n += 1;
+                        won += u32::from(g.won(s));
+                        let e = by.entry(format!("{}={} over {theirs}", a.setting, a.option)).or_default();
+                        e.0 += u32::from(g.won(s));
+                        e.1 += 1;
+                    }
+                }
+            }
+            eprintln!("  champ weight {w:<4} margin {margin:<4}: the advised side won {won}/{n} = {:.1}%", 100.0 * won as f64 / n.max(1) as f64);
+            if margin == 0.0 && w == 0.5 {
+                for (k, (won, n)) in &by {
+                    eprintln!("      {k:<40} {won}/{n} = {:.1}%", 100.0 * *won as f64 / (*n).max(1) as f64);
+                }
+            }
+        }
+    }
+}
