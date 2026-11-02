@@ -39,6 +39,7 @@ pub mod plan;
 pub mod records;
 pub mod report;
 pub mod scan;
+pub mod series;
 pub mod stats;
 pub mod server;
 mod shared;

@@ -307,10 +307,6 @@ pub fn last_review() -> Option<Review> {
     LAST_REVIEW.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
-/// Spending a champion nothing replaces in a Fearless series costs this share of what it is
-/// worth over the next option, times the share of the series still to come.
-const CONSERVE: f32 = 0.4;
-
 /// A team's style and worst gap, in a few words (its open slots counted as average champions).
 fn comp_text(meta: &crate::meta::Meta, picks: &[u16]) -> String {
     use crate::knowledge::COMP_NAMES_ZH;
@@ -1089,8 +1085,13 @@ impl DraftScreen {
             advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref(), lean: their_lean.as_deref() };
         let blue = turn.side_known.then_some(side == 0);
         // a Fearless series with games left: spending what nothing replaces costs a little
-        let series = series_left(&ui.text(SERIES).unwrap_or_default(), fearless);
-        let conserve_share = series.map_or(0.0, |(left, n)| CONSERVE * left as f32 / (n - 1).max(1) as f32);
+        let label = ui.text(SERIES).unwrap_or_default();
+        if let Some(n) = label.trim().strip_prefix("Bo").and_then(|n| n.parse().ok()) {
+            // the AI teams' drafts of this stage take the same length (`series`)
+            crate::series::set_length(n);
+        }
+        let series = series_left(&label, fearless);
+        let conserve_share = series.map_or(0.0, |(left, n)| crate::series::share(left, n));
         let their_turn = turn.acting.is_some_and(|a| a != side);
         let banned = cards.iter().filter(|c| c.banned).count();
         // our bans and picks, the best few played out on our turn of a 3+2 draft (the same
