@@ -18,6 +18,7 @@
 //! set when the team already plays that variant; every other option is a plain name.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
 use mod_api_stable::{SimOriginKindV1, StableMatchHook, StableSim};
@@ -191,103 +192,201 @@ fn model_sides(sides: &[Vec<String>; 2], player: Option<&shared::PlayerDraft>, a
 
 pub struct TacticsHook;
 
-impl StableMatchHook for TacticsHook {
-    fn on_match_start(&self, sim: &mut StableSim<'_>) {
-        let cfg = config::get();
-        if !cfg.ai_tactics {
-            return;
-        }
-        // the five champions of each team (team 0 = blue)
-        let mut sides: [Vec<String>; 2] = [Vec::new(), Vec::new()];
-        for i in 0..sim.player_count() {
-            let Some(p) = sim.player_at(i) else { continue };
-            let team = p.team();
-            let name = p.champion().and_then(|e| e.name());
-            if let (Some(side), Some(name)) = (sides.get_mut(team), name) {
-                side.push(name);
+/// The first call of each kind is described in `diag.log` (what the match shows of its players).
+static START_LOGGED: AtomicBool = AtomicBool::new(false);
+static TICK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// The ticks a match's strategy is tried in, when its champions are not there at the start.
+const TICK_WINDOW: usize = 600;
+
+/// The runs seen lately: the run (origin) -> (the last tick seen, done).
+static RUNS: LazyLock<Mutex<VecDeque<(RunKey, usize, bool)>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+const RUNS_KEPT: usize = 64;
+
+type RunKey = (u32, u64, u64, u64);
+
+fn run_key(sim: &StableSim<'_>) -> RunKey {
+    sim.sim_origin().map_or((u32::MAX, u64::MAX, u64::MAX, u64::MAX), |o| (o.kind, o.match_id, o.replay_id, o.set_index))
+}
+
+fn origin_label(origin: Option<mod_api_stable::SimOriginV1>) -> String {
+    match origin.and_then(|o| SimOriginKindV1::from_code(o.kind)) {
+        Some(k) => format!("{k:?}"),
+        None => "origin unknown".to_string(),
+    }
+}
+
+/// What the match shows of its players (diag.log, once per kind of call).
+fn describe(sim: &StableSim<'_>) -> String {
+    let players: Vec<String> = (0..sim.player_count())
+        .filter_map(|i| sim.player_at(i))
+        .map(|p| format!("{}:{}", p.team(), p.champion().and_then(|e| e.name()).unwrap_or_else(|| "?".into())))
+        .collect();
+    format!("tick {}, {}, {} players [{}]", sim.tick(), origin_label(sim.sim_origin()), players.len(), players.join(" "))
+}
+
+/// Tries one run of a match on this tick: `true` when it is done with (set, kept, or left
+/// alone), `false` to try again on a later tick.
+fn attempt(sim: &mut StableSim<'_>, at_start: bool) -> bool {
+    let run = run_key(sim);
+    let tick = sim.tick();
+    {
+        let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+        match runs.iter_mut().find(|(k, _, _)| *k == run) {
+            // the same run again: done, unless the tick went back (the match started over)
+            Some((_, last, done)) => {
+                if tick < *last {
+                    *done = false;
+                }
+                *last = tick;
+                if *done {
+                    return true;
+                }
             }
-        }
-        if sides.iter().any(|s| s.len() != 5) {
-            diag::log_once("tactics-shape", &format!("[tactics] a match without five champions a side ({} / {}): left alone", sides[0].len(), sides[1].len()));
-            return;
-        }
-        let key = key(&sides);
-        let origin = sim.sim_origin();
-        let first_run = origin.is_some_and(|o| SimOriginKindV1::from_code(o.kind) == Some(SimOriginKindV1::ServerPresim));
-        let mut st = STORE.lock().unwrap_or_else(PoisonError::into_inner);
-        load(&mut st);
-        let kept = st.by_key.get(&key).cloned();
-        let plan: [Option<Strategy>; 2] = match kept {
-            Some(kept) => kept,
-            // a run that is not the server's first, of a match nothing was decided for: leave it
-            None if !first_run => return,
             None => {
-                let Some(snapshot) = shared::get() else {
-                    remember(&mut st, key, [None, None]);
-                    return;
-                };
-                let player = shared::player_draft();
-                let model = model_sides(&sides, player.as_deref(), cfg.ai_draft, cfg.coach);
-                let mut plan: [Option<Strategy>; 2] = [None, None];
-                for side in 0..2 {
-                    if !model[side] {
-                        continue;
-                    }
-                    let mut applied = Strategy::new();
-                    for (setting, option, _) in advised(&snapshot, &sides[side]) {
-                        let current = sim.strategy_get_json(side, &setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
-                        if let Some(json) = value_for(current.as_ref(), &option) {
-                            if sim.strategy_set_json(side, &setting, &json) {
-                                applied.push((setting, option));
-                            } else {
-                                diag::log_once(
-                                    &format!("tactics-reject-{setting}"),
-                                    &format!("[tactics] the game did not take {setting} = {json} (current {current:?})"),
-                                );
-                            }
-                        } else if already(current.as_ref(), &option) {
-                            applied.push((setting, option));
-                        }
-                    }
-                    plan[side] = Some(applied);
-                }
-                let mine = players_side(&sides, player.as_deref());
-                let ours = mine.is_some();
-                if ours || st.logged < LOGGED {
-                    st.logged += 1;
-                    let show = |s: &Option<Strategy>| match s {
-                        Some(list) => list.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(" "),
-                        None => "-".to_string(),
-                    };
-                    diag::log(&format!(
-                        "[tactics]{} blue [{}]: {} | red [{}]: {}{}",
-                        if ours { " your match," } else { "" },
-                        sides[0].join(","),
-                        show(&plan[0]),
-                        sides[1].join(","),
-                        show(&plan[1]),
-                        match mine {
-                            Some((side, true)) if cfg.coach => format!(" (you: {}, auto BP)", ["blue", "red"][side]),
-                            Some((side, _)) => format!(" (you: {}, your own tactics)", ["blue", "red"][side]),
-                            None => String::new(),
-                        }
-                    ));
-                }
-                remember(&mut st, key, plan.clone());
-                return;
-            }
-        };
-        drop(st);
-        // a later run of a decided match: the same strategy again
-        for (side, strategy) in plan.iter().enumerate() {
-            for (setting, option) in strategy.iter().flatten() {
-                let current = sim.strategy_get_json(side, setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
-                if let Some(json) = value_for(current.as_ref(), option) {
-                    sim.strategy_set_json(side, setting, &json);
+                runs.push_back((run, tick, false));
+                while runs.len() > RUNS_KEPT {
+                    runs.pop_front();
                 }
             }
         }
     }
+    let done = apply(sim);
+    if done {
+        let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(r) = runs.iter_mut().find(|(k, _, _)| *k == run) {
+            r.2 = true;
+        }
+    } else if !at_start && tick >= TICK_WINDOW {
+        diag::log_once("tactics-never", &format!("[tactics] no five champions a side by tick {TICK_WINDOW}: {}", describe(sim)));
+    }
+    done
+}
+
+impl StableMatchHook for TacticsHook {
+    fn on_match_start(&self, sim: &mut StableSim<'_>) {
+        if !config::get().ai_tactics {
+            return;
+        }
+        if !START_LOGGED.swap(true, Ordering::Relaxed) {
+            diag::log(&format!("[tactics] match start: {}", describe(sim)));
+        }
+        attempt(sim, true);
+    }
+
+    fn on_match_tick(&self, sim: &mut StableSim<'_>, _rng_seed: u64) {
+        if sim.tick() > TICK_WINDOW || !config::get().ai_tactics {
+            return;
+        }
+        if !TICK_LOGGED.swap(true, Ordering::Relaxed) {
+            diag::log(&format!("[tactics] match tick: {}", describe(sim)));
+        }
+        attempt(sim, false);
+    }
+}
+
+/// Sets (or keeps, or leaves alone) one run's strategy - see the module notes. `false`: the
+/// champions are not all there yet.
+fn apply(sim: &mut StableSim<'_>) -> bool {
+    let cfg = config::get();
+    if !cfg.ai_tactics {
+        return true;
+    }
+    // the five champions of each team (team 0 = blue)
+    let mut sides: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    for i in 0..sim.player_count() {
+        let Some(p) = sim.player_at(i) else { continue };
+        let team = p.team();
+        let name = p.champion().and_then(|e| e.name());
+        if let (Some(side), Some(name)) = (sides.get_mut(team), name) {
+            side.push(name);
+        }
+    }
+    if sides.iter().any(|s| s.len() != 5) {
+        // the champions may not be there yet: try again on a later tick
+        return false;
+    }
+    let key = key(&sides);
+    let origin = sim.sim_origin();
+    let first_run = origin.is_some_and(|o| SimOriginKindV1::from_code(o.kind) == Some(SimOriginKindV1::ServerPresim));
+    let mut st = STORE.lock().unwrap_or_else(PoisonError::into_inner);
+    load(&mut st);
+    let kept = st.by_key.get(&key).cloned();
+    let plan: [Option<Strategy>; 2] = match kept {
+        Some(kept) => kept,
+        // a run that is not the server's first, of a match nothing was decided for: leave it
+        None if !first_run => return true,
+        None => {
+            let Some(snapshot) = shared::get() else {
+                remember(&mut st, key, [None, None]);
+                return true;
+            };
+            let player = shared::player_draft();
+            let model = model_sides(&sides, player.as_deref(), cfg.ai_draft, cfg.coach);
+            let mut plan: [Option<Strategy>; 2] = [None, None];
+            for side in 0..2 {
+                if !model[side] {
+                    continue;
+                }
+                let mut applied = Strategy::new();
+                for (setting, option, _) in advised(&snapshot, &sides[side]) {
+                    let current = sim.strategy_get_json(side, &setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
+                    if let Some(json) = value_for(current.as_ref(), &option) {
+                        if sim.strategy_set_json(side, &setting, &json) {
+                            applied.push((setting, option));
+                        } else {
+                            diag::log_once(
+                                &format!("tactics-reject-{setting}"),
+                                &format!("[tactics] the game did not take {setting} = {json} (current {current:?})"),
+                            );
+                        }
+                    } else if already(current.as_ref(), &option) {
+                        applied.push((setting, option));
+                    }
+                }
+                plan[side] = Some(applied);
+            }
+            let mine = players_side(&sides, player.as_deref());
+            let ours = mine.is_some();
+            if ours || st.logged < LOGGED {
+                st.logged += 1;
+                let show = |s: &Option<Strategy>| match s {
+                    Some(list) => list.iter().map(|(a, b)| format!("{a}={b}")).collect::<Vec<_>>().join(" "),
+                    None => "-".to_string(),
+                };
+                diag::log(&format!(
+                    "[tactics]{} blue [{}]: {} | red [{}]: {}{}",
+                    if ours { " your match," } else { "" },
+                    sides[0].join(","),
+                    show(&plan[0]),
+                    sides[1].join(","),
+                    show(&plan[1]),
+                    match mine {
+                        Some((side, true)) if cfg.coach => format!(" (you: {}, auto BP)", ["blue", "red"][side]),
+                        Some((side, _)) => format!(" (you: {}, your own tactics)", ["blue", "red"][side]),
+                        None => String::new(),
+                    }
+                ));
+            }
+            remember(&mut st, key, plan.clone());
+            return true;
+        }
+    };
+    drop(st);
+    // a later run of a decided match: the same strategy again
+    diag::log_once(
+        "tactics-again",
+        &format!("[tactics] a later run of a decided match ({}): the same strategy again", origin_label(origin)),
+    );
+    for (side, strategy) in plan.iter().enumerate() {
+        for (setting, option) in strategy.iter().flatten() {
+            let current = sim.strategy_get_json(side, setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
+            if let Some(json) = value_for(current.as_ref(), option) {
+                sim.strategy_set_json(side, setting, &json);
+            }
+        }
+    }
+    true
 }
 
 /// Test support: forget the kept matches (the file stays).
