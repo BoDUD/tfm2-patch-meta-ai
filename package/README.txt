@@ -1,5 +1,5 @@
 ﻿======================================================================
- Patch Meta AI 2.7.9 —— 智能 BP 教练 + 自动梯队
+ Patch Meta AI 2.7.10 —— 智能 BP 教练 + 自动梯队
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -110,7 +110,7 @@
 不用重启游戏。删掉它会重新生成默认设置。常用的几项：
 
   [features]
-  ban_pick=auto      AI 队伍的 BP 用本 Mod 的估值（auto = 开，除非装了接管 AI 选人的 Mod）；off = 关
+  ban_pick=off       AI 队伍的 BP 用本 Mod 的估值（默认关；auto = 开，除非装了接管 AI 选人的 Mod）
   tier_list=auto     自动梯队（auto = 开，除非装了写梯队的 Mod）；off = 关
   coach=on           教练托管时你自己的队伍按建议 BP；off = 关
   ai_bp=off          AI 智能BP：on = 所有 AI 队伍都完全按本 Mod 的建议禁和选（和面板同一套
