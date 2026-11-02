@@ -71,9 +71,9 @@
 ## 和其他 Mod 一起用
 
 - **Bows' Drafter's Toolbox**：可以同时开。`tier_list=auto`（默认）检测到它时把梯队交给它；Toolbox 不改 AI 选人，所以本 Mod 的 AI 部分照常工作。两者在选人界面的标注位置不同（本 Mod 在卡片名字那一行和屏幕下方两角）；如果嫌挤，可以设 `grid_values=off`。
-- **Bows' Terminator Draft AI**：它完全接管 AI 选人，`ban_pick=auto` 检测到它时自动让出。选人顾问、面板和报告照常工作。
+- **Bows' Terminator Draft AI**：它完全接管 AI 选人；`ban_pick` 默认关，设成 `auto` 时检测到它会自动让出。选人顾问、面板和报告照常工作。
 - **Smart Position Lock（智能位置锁定）**：位置锁定是单独的 Mod。教练托管和 AI 智能BP（`ai_bp`）是直接决定选谁的，会越过它的评分锁，所以 2.6.1 起本 Mod 直接读它的位置表（它 `settings.ini` 的 `[positions]`，没有的用它内置的列表——本 Mod 带着同一份 `presets/league_positions.ini`，锁位置文件夹里那份 `league_positions.ini` 可能是旧的，不读——再没有的用它从选人卡片学到的 `positions.json`），按它的规则（选进来后全队还能一人一个位置排开）只选合法的英雄；它的 `ai` / `player` 开关关着时不限制对应的一方。模型估计英雄在哪些位置打时也以这张表为准。它的设置改了几秒内重新读。和它一起用时，被它锁住的英雄不会出现在推荐里，卡片上也不显示价值。tfm2mods 的 Champion Position Lock 同样可以一起用。游戏 0.6.4 起 AI 选完人后还有一步"分配位置"，本 Mod 不参与：位置由游戏或 Smart Position Lock 决定（几个 Mod 同时决定时只有最后一个生效，所以本 Mod 不去抢）。
-- **地狱人机（JIN 的 Hell Draft AI）**：可以同时开。AI 队伍的 BP 交给它（`ban_pick=auto` 让出），本 Mod 按它的方式预测对方（见上文 2.5）；教练托管仍以本 Mod 为准。
+- **地狱人机（JIN 的 Hell Draft AI）**：可以同时开。AI 队伍的 BP 交给它（`ban_pick` 默认关；设成 `auto` 也会让出），本 Mod 按它的方式预测对方（见上文 2.5）；教练托管仍以本 Mod 为准。
 - **yudra 的 Win-Rate Ban/Pick AI**（已停止更新）：会被检测到并让出梯队和 AI 选人，但建议直接停用它。
 
 启用了哪些 Mod 是从游戏的 `config/game/mods.json` 读的。另外，如果梯队在游戏内换日后连续被别的东西改回去，本 Mod 也会自动停止写入并在 `diag.log` 里说明。
@@ -108,7 +108,7 @@
 
 | 段落 | 键 | 默认 | 作用 |
 |---|---|---|---|
-| `[features]` | `ban_pick` / `tier_list` | auto / auto | AI 选人、自动梯队：`auto` = 开，除非已启用做同样事情的 Mod；`on` / `off` |
+| `[features]` | `ban_pick` / `tier_list` | off / auto | AI 选人（2.7.10 起默认关）、自动梯队：`auto` = 开，除非已启用做同样事情的 Mod；`on` / `off` |
 | | `ai_bp` | off | AI 智能BP：所有 AI 队伍完全按本 Mod 的建议禁和选（含 3+2 推演、对手习惯），盖过其他 BP Mod |
 | | `ai_variety` | 1 | AI 智能BP 的多样性：每局对英雄的判断浮动，每一手最多让出这么多胜率点（0～5，0 = 永远选最佳） |
 | | `ai_tactics` | off | 由模型 BP 的 AI 队伍开场时按模型选战术（明显更好才换；你自己的战术不动） |
@@ -178,7 +178,7 @@ Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). V
 
 The game prunes old match records; each save's matches are also kept in `history/` in the mod folder (never in the save) and merged back once the save's recent matches confirm the file is its own.
 
-- `ban_pick` / `tier_list` default to `auto`: they step aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
+- `ban_pick` defaults to `off` (2.7.10), `tier_list` to `auto`; `auto` steps aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
 - Game 0.6.4 adds a lane-assignment step after an AI team's picks; this mod stays out of it (when several mods decide, the last one wins), so the game or Smart Position Lock assigns the lanes.
 - Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.

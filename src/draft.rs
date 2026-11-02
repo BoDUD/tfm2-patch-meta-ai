@@ -1115,6 +1115,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var(crate::paths::DIR_ENV, &dir);
         crate::reset_for_tests();
+        // the nudges are ban_pick's (off by default)
+        config::set_for_tests(config::Config { ban_pick: config::Switch::On, ..config::Config::default() });
 
         let (mut s, f) = with_mastery(snapshot(), 0.4);
         s.athlete_names.insert(501, "Faker".into());

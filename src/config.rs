@@ -135,7 +135,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            ban_pick: Switch::Auto,
+            ban_pick: Switch::Off,
             coach: true,
             ai_bp: false,
             ai_variety: 1.0,
@@ -569,10 +569,11 @@ pub const TEMPLATE: &str = r#"; ================================================
 ; tier_list : your team's champion tier list is kept up to date automatically
 ;             自动维护你队伍的英雄梯队
 ; auto = on, unless another enabled mod already does it (Drafter's Toolbox writes tiers,
-;        Terminator Draft AI drives the AI's draft); on / off = always / never
-; auto = 默认开启；若已启用其他做同样事情的 Mod（Drafter's Toolbox 写梯队、Terminator Draft AI
-;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关
-ban_pick=auto
+;        Terminator Draft AI drives the AI's draft); on / off = always / never.
+;        ban_pick is off unless you turn it on (2.7.10).
+; auto = 开启；若已启用其他做同样事情的 Mod（Drafter's Toolbox 写梯队、Terminator Draft AI
+;        接管 AI 选人）则自动让给它。on / off = 总是开 / 总是关。ban_pick 默认关（2.7.10 起）。
+ban_pick=off
 ; coach : when you let the game's coach draft for you (coach delegation), your team bans and
 ;         picks exactly what the panel advises - it decides last, over other draft mods - even
 ;         with ban_pick=off. Other teams are not touched by this switch.

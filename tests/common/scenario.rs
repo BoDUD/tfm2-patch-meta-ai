@@ -232,6 +232,10 @@ pub type EntryFn = unsafe extern "C" fn(*const HostApiV1) -> *mut ModExportV1;
 /// Runs the session; `dir` is the mod folder the entry point was told to use. Panics on the
 /// first thing that is wrong.
 pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
+    // the AI nudges below are ban_pick's, off by default: a player who turned it on
+    std::fs::write(dir.join("settings.ini"), "[features]
+ban_pick=on
+").unwrap();
 
     let names = ["alpha", "bravo", "charlie", "delta", "echo", "fox", "golf", "hotel", "india", "juliet"];
     let mut w = World {
@@ -465,7 +469,7 @@ pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
         let log = std::fs::read_to_string(dir.join("diag.log")).unwrap();
         assert!(log.contains("[probe] competition record #30"), "{log}");
         assert!(log.contains("tier list accepted"), "{log}");
-        assert!(std::fs::read_to_string(dir.join("settings.ini")).unwrap().contains("[draft]"));
+        assert!(std::fs::read_to_string(dir.join("settings.ini")).unwrap().contains("ban_pick=on"), "the player's own settings stay");
 
         // back to the title: the tables are dropped, the hook passes
         frame(SceneKindV1::Title.code());
