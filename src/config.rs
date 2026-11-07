@@ -596,9 +596,10 @@ ai_bp=off
 ai_variety=1
 ; ai_tactics : AI teams the model drafts (ai_bp on) also play the strategy the model rates best
 ;              for their five champions (the tactics screen's ★) where it is clearly better than
-;              their own, set when the match starts. Your own team keeps your strategy.
+;              their own, set when the match starts. Your own team keeps your strategy. Game
+;              finish stays each team's coach's choice.
 ; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
-;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。
+;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。「收官」由各队教练自己选。
 ai_tactics=off
 tier_list=auto
 

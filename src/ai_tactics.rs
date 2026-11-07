@@ -17,6 +17,10 @@
 //!
 //! An option that carries data (`morgard_use` `Split131` / `Split14`: which lanes split) is only
 //! set when the team already plays that variant; every other option is a plain name.
+//!
+//! Some settings stay the team's own coach's ([`LEFT_TO_THE_COACH`]): `game_finish`, whose
+//! Aggressive the model rated best for nearly every line-up, which cut the matches short. A match
+//! decided before a setting was left to the coach plays what it played then on every later run.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +42,18 @@ const LOGGED: usize = 4;
 /// save's matches the model was not fitted on, the side playing the advice won about 52% where
 /// it was ahead by any margin, about 55% where it was ahead by this much.
 const SWITCH_MARGIN: f32 = 0.1;
+
+/// Settings `ai_tactics` never sets: the team's own coach chooses them. `game_finish`: with the
+/// model's Aggressive on 97% of the AI sides the matches ended about three minutes sooner - on a
+/// real save's patch 2027.2.0, 197 matches with `ai_tactics` on averaged 11.5 minutes, 155 with
+/// it off 14.3, the coaches choosing Aggressive for 16% of the sides (user 2026-11-07: keep the
+/// game's own pace, the other settings as before).
+pub const LEFT_TO_THE_COACH: &[&str] = &["game_finish"];
+
+/// The advice `ai_tactics` acts on: every setting but those [`LEFT_TO_THE_COACH`].
+fn acted_on(advice: Vec<plan::TacticAdvice>) -> impl Iterator<Item = plan::TacticAdvice> {
+    advice.into_iter().filter(|a| !LEFT_TO_THE_COACH.contains(&a.setting.as_str()))
+}
 
 /// One side's applied strategy: (setting, option).
 pub type Strategy = Vec<(String, String)>;
@@ -354,7 +370,7 @@ fn apply(sim: &mut StableSim<'_>) -> bool {
                     continue;
                 }
                 let mut applied = Strategy::new();
-                for advice in advised(&snapshot, &sides[side]) {
+                for advice in acted_on(advised(&snapshot, &sides[side])) {
                     let (setting, option) = (advice.setting.as_str(), advice.option.as_str());
                     let current = sim.strategy_get_json(side, setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
                     if !worth_switching(&advice, option_of(current.as_ref())) {
@@ -485,6 +501,19 @@ mod tests {
         let split: Value = serde_json::from_str(r#"{"Split131": {"position1": "Top"}}"#).unwrap();
         assert_eq!(option_of(Some(&split)), Some("Split131"));
         assert_eq!(option_of(Some(&Value::String("Gather".into()))), Some("Gather"));
+    }
+
+    #[test]
+    fn game_finish_stays_the_coachs() {
+        let advice = |setting: &str| plan::TacticAdvice {
+            setting: setting.into(),
+            option: "Aggressive".into(),
+            gain: 0.5,
+            options: vec![("Aggressive".into(), 0.5), ("Stable".into(), -0.5)],
+        };
+        let set: Vec<String> =
+            acted_on(vec![advice("early_jungle"), advice("game_finish"), advice("object_battle")]).map(|a| a.setting).collect();
+        assert_eq!(set, ["early_jungle", "object_battle"]);
     }
 
     #[test]
