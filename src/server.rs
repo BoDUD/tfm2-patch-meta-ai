@@ -4,7 +4,8 @@
 //!
 //! The balance patches' server half (2.8.0, `apply_balance`): with `balance` on, the save's own auto-patcher makes no
 //! champion change (every count zero; its values kept in the save to put back when `balance` is turned off), and
-//! each new round's notes go to the player's inbox once.
+//! each new round's notes go into the player's news once, as the game's own patch notes (into the game's notes of
+//! the patch, or patch notes of their own for a hotfix), with the patch's news cards.
 //!
 //! Game 0.6 stores `champion_tiers` as `{"<champion>": "S" | "A" | "B" | "C" | "D" | "NoTier"}`.
 //! A write the game's schema rejects changes nothing, so when the whole object is refused this
@@ -15,8 +16,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
 use mod_api_stable::{CommandResultV1, SettingTargetV1, StableCommand, StableServerCtx, StableServerExtension};
-use serde_json::{Map, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 
+use crate::balance::{Article, Row};
 use crate::diag;
 use crate::records::{kind, top_keys};
 
@@ -29,8 +32,6 @@ pub const BALANCE_RESULT: &str = "apply_balance_result";
 /// The save's own auto-patcher values while the balance has them off, and the newest round put in the news.
 const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
 const NEWS_DONE: &str = "pma_balance_news";
-/// The news' author.
-const AUTHOR: &str = "智能BP / Patch Meta AI";
 
 pub struct ServerExt;
 
@@ -45,7 +46,7 @@ impl StableServerExtension for ServerExt {
     fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
         if cmd.command == APPLY_BALANCE {
             let reply = cmd.reply_target();
-            let (state, ok, detail) = match BalanceRequest::parse(cmd.payload, cmd.sender_team_id) {
+            let (state, ok, detail) = match BalanceRequest::parse(cmd.payload) {
                 Ok(req) => {
                     let (ok, detail) = balance(ctx, &req);
                     (format!("{}/{}", u8::from(req.off), req.round), ok, detail)
@@ -264,30 +265,40 @@ fn probe(docs: &impl TeamDocs, team: usize, existing: Option<&Value>) {
 
 // ===================== the balance patches (2.8.0) =====================
 
-/// What the client sends: `v1`, team id, `1` (the game's champion patches off) or `0` (put back), the newest round,
-/// its news title, then the news lines.
-#[derive(Debug, PartialEq)]
+/// What the client sends (JSON): the team, whether the game's champion patches are to be off (else put back), the
+/// newest round, and that round's notes and news cards. The client sends it again until the server answers; the
+/// notes and cards are written once (the newest round written is kept in the save).
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BalanceRequest {
     pub team: usize,
     pub off: bool,
     pub round: u32,
+    #[serde(default)]
+    pub note: Option<NoteRequest>,
+    #[serde(default)]
+    pub articles: Vec<Article>,
+}
+
+/// A round's notes: for the game's patch `version`, named `label`; `merge`d into the game's own notes of that patch
+/// (else patch notes of their own); each champion's lines and reason codes; and the plain news (`title`, `content`)
+/// the inbox keeps should the game take the notes in neither form.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct NoteRequest {
+    pub version: String,
+    pub label: String,
+    pub merge: bool,
+    pub champions: Vec<(String, Vec<Row>, String)>,
     pub title: String,
     pub content: String,
 }
 
 impl BalanceRequest {
-    pub fn parse(payload: &[u8], sender_team: Option<usize>) -> Result<BalanceRequest, String> {
-        let text = String::from_utf8_lossy(payload);
-        let mut lines = text.split('\n');
-        if lines.next().map(str::trim) != Some("v1") {
-            return Err("unknown format".to_string());
-        }
-        let team = lines.next().and_then(|l| l.trim().parse::<usize>().ok()).or(sender_team).ok_or("no team id")?;
-        let off = lines.next().map(str::trim) == Some("1");
-        let round = lines.next().and_then(|l| l.trim().parse::<u32>().ok()).unwrap_or(0);
-        let title = lines.next().unwrap_or("").trim().to_string();
-        let content = lines.collect::<Vec<_>>().join("\n");
-        Ok(BalanceRequest { team, off, round, title, content })
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn parse(payload: &[u8]) -> Result<BalanceRequest, String> {
+        serde_json::from_slice(payload).map_err(|e| format!("not a balance request ({e})"))
     }
 }
 
@@ -297,7 +308,13 @@ pub trait BalanceHost {
     fn set_autopatch(&mut self, json: &str) -> bool;
     fn saved(&self, key: &str) -> Option<String>;
     fn set_saved(&mut self, key: &str, value: Option<&str>) -> bool;
-    fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool;
+    /// A plain news item at the end of the team's news, dated now.
+    fn push_news(&mut self, team: usize, title: &str, content: &str, author: &str) -> bool;
+    /// The team's news list (JSON).
+    fn news(&self, team: usize) -> Option<String>;
+    /// Replaces one item of the team's news (the game reads the whole record again and refuses what it cannot
+    /// read, changing nothing).
+    fn set_news_item(&mut self, team: usize, index: usize, json: &str) -> bool;
 }
 
 impl BalanceHost for StableServerCtx<'_> {
@@ -316,8 +333,14 @@ impl BalanceHost for StableServerCtx<'_> {
             None => self.save_remove_key(key),
         }
     }
-    fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool {
-        self.news_push(team, title, content, AUTHOR)
+    fn push_news(&mut self, team: usize, title: &str, content: &str, author: &str) -> bool {
+        self.news_push(team, title, content, author)
+    }
+    fn news(&self, team: usize) -> Option<String> {
+        self.team_get_json(team, "news")
+    }
+    fn set_news_item(&mut self, team: usize, index: usize, json: &str) -> bool {
+        self.team_set_json(team, &format!("news.{index}"), json)
     }
 }
 
@@ -343,7 +366,8 @@ pub fn champion_patches_off(doc: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
-/// One request: the game's champion patches off (its values kept) or put back, and the round's news once.
+/// One request: the game's champion patches off (its values kept) or put back, and the round's notes and news cards
+/// once.
 pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, String) {
     let mut said = Vec::new();
     let mut ok = true;
@@ -374,13 +398,23 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
             }
         }
         let done = host.saved(NEWS_DONE).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-        if req.round > done && !req.title.is_empty() {
-            if host.push_news(req.team, &req.title, &req.content) {
+        if req.round > done {
+            let mut written = true;
+            if let Some(note) = &req.note {
+                match write_note(host, req.team, note) {
+                    Ok(how) => said.push(format!("round {} {how}", req.round)),
+                    Err(why) => {
+                        ok = false;
+                        written = false;
+                        said.push(format!("the notes of round {} not written: {why}", req.round));
+                    }
+                }
+            }
+            if written {
+                if !req.articles.is_empty() {
+                    said.push(write_articles(host, req.team, &req.articles));
+                }
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
-                said.push(format!("round {} in the news", req.round));
-            } else {
-                ok = false;
-                said.push(format!("the news of round {} was refused", req.round));
             }
         }
     } else if let Some(kept) = host.saved(AUTOPATCH_KEPT) {
@@ -396,6 +430,245 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
         said.push("nothing to put back".to_string());
     }
     (ok, said.join("; "))
+}
+
+/// The team's news items.
+fn news_items(host: &impl BalanceHost, team: usize) -> Result<Vec<Value>, String> {
+    let json = host.news(team).ok_or("the team's news is not readable")?;
+    match serde_json::from_str::<Value>(&json) {
+        Ok(Value::Array(items)) => Ok(items),
+        Ok(other) => Err(format!("the team's news is a {}", kind(&other))),
+        Err(e) => Err(format!("the team's news is not JSON ({e})")),
+    }
+}
+
+fn patch_body(item: &Value) -> Option<&Value> {
+    item.get("ty")?.get("PatchNote")
+}
+
+fn patch_version(item: &Value) -> Option<&str> {
+    patch_body(item)?.get("version")?.as_str()
+}
+
+fn rows_json(rows: &[Row]) -> Vec<Value> {
+    rows.iter().filter_map(|r| serde_json::to_value(r).ok()).collect()
+}
+
+/// Adds a champion's lines to `champion_patch_data` (a list of `[champion, lines]`, or a map): after the lines the
+/// champion already has.
+fn add_lines(field: &mut Value, champion: &str, rows: &[Row]) {
+    let lines = rows_json(rows);
+    match field {
+        Value::Array(entries) => {
+            let at = entries
+                .iter()
+                .position(|e| e.get(0).and_then(Value::as_str) == Some(champion) && e.get(1).is_some_and(Value::is_array));
+            match at {
+                Some(at) => {
+                    if let Some(Value::Array(old)) = entries[at].get_mut(1) {
+                        old.extend(lines);
+                    }
+                }
+                None => entries.push(json!([champion, lines])),
+            }
+        }
+        Value::Object(map) => {
+            if map.get(champion).is_some_and(Value::is_array) {
+                if let Some(Value::Array(old)) = map.get_mut(champion) {
+                    old.extend(lines);
+                }
+            } else {
+                map.insert(champion.to_string(), Value::Array(lines));
+            }
+        }
+        other => *other = json!([[champion, lines]]),
+    }
+}
+
+/// Adds a champion's reason codes to `champion_patch_reasons` (a list of `[champion, codes]`, or a map): after the
+/// codes it already has, comma-separated as the game writes them.
+fn add_reason(field: &mut Value, champion: &str, codes: &str) {
+    let join = |old: &mut String| {
+        if !old.is_empty() {
+            old.push(',');
+        }
+        old.push_str(codes);
+    };
+    match field {
+        Value::Array(entries) => {
+            let at = entries
+                .iter()
+                .position(|e| e.get(0).and_then(Value::as_str) == Some(champion) && e.get(1).is_some_and(Value::is_string));
+            match at {
+                Some(at) => {
+                    if let Some(Value::String(old)) = entries[at].get_mut(1) {
+                        join(old);
+                    }
+                }
+                None => entries.push(json!([champion, codes])),
+            }
+        }
+        Value::Object(map) => {
+            if map.get(champion).is_some_and(Value::is_string) {
+                if let Some(Value::String(old)) = map.get_mut(champion) {
+                    join(old);
+                }
+            } else {
+                map.insert(champion.to_string(), Value::String(codes.to_string()));
+            }
+        }
+        other => *other = json!([[champion, codes]]),
+    }
+}
+
+/// Puts the round's champions into a patch-notes item (its own lines kept), unread again.
+fn merge_note(item: &mut Value, note: &NoteRequest) -> bool {
+    {
+        let Some(Value::Object(body)) = item.get_mut("ty").and_then(|t| t.get_mut("PatchNote")) else { return false };
+        let data = body.entry("champion_patch_data").or_insert_with(|| json!([]));
+        for (champion, rows, _) in &note.champions {
+            add_lines(data, champion, rows);
+        }
+        let reasons = body.entry("champion_patch_reasons").or_insert_with(|| json!([]));
+        for (champion, _, codes) in &note.champions {
+            if !codes.is_empty() {
+                add_reason(reasons, champion, codes);
+            }
+        }
+    }
+    if let Value::Object(map) = item {
+        map.insert("is_read".to_string(), Value::Bool(false));
+    }
+    true
+}
+
+/// The pushed plain news made patch notes: the game's title (`补丁公告 v<label>`), the balance's author, and the body
+/// in each form the game might want - the newest patch notes' own (`template`) first, then the 0.7 form and others.
+fn own_note_items(pushed: &Value, note: &NoteRequest, template: Option<&Value>) -> Vec<Value> {
+    let Value::Object(head) = pushed else { return Vec::new() };
+    let mut head = head.clone();
+    head.insert("title".to_string(), json!("#asset/base/text/news?patch.title"));
+    head.insert("title_bind".to_string(), json!([["Version", note.label]]));
+    head.insert("author".to_string(), json!(crate::balance::AUTHOR));
+    head.insert("is_read".to_string(), Value::Bool(false));
+    let empty_like = |v: &Value| match v {
+        Value::Array(_) => json!([]),
+        Value::Object(_) => json!({}),
+        Value::String(_) => json!(""),
+        _ => Value::Null,
+    };
+    let mut bodies: Vec<Value> = Vec::new();
+    if let Some(Value::Object(t)) = template {
+        let mut body: serde_json::Map<String, Value> = t.iter().map(|(k, v)| (k.clone(), empty_like(v))).collect();
+        body.insert("version".to_string(), json!(note.version));
+        bodies.push(Value::Object(body));
+    }
+    for (data, reasons) in [(json!([]), json!([])), (json!({}), json!({}))] {
+        for rule_reasons in [json!([]), json!({}), json!("")] {
+            bodies.push(json!({
+                "version": note.version,
+                "added_champion": [],
+                "champion_patch_data": data,
+                "champion_patch_reasons": reasons,
+                "game_rule_patch_data": [],
+                "game_rule_patch_reasons": rule_reasons,
+            }));
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    for body in bodies {
+        let mut item = Value::Object(head.clone());
+        if let Value::Object(map) = &mut item {
+            map.insert("ty".to_string(), json!({ "PatchNote": body }));
+        }
+        merge_note(&mut item, note);
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// A round's notes into the team's news: into the game's own notes of the patch (`merge`), else as patch notes of
+/// their own - first a plain news item (it stays, readable, should the game refuse the patch-notes form), then made
+/// patch notes. Ok says how; Err when nothing could be written.
+pub fn write_note(host: &mut impl BalanceHost, team: usize, note: &NoteRequest) -> Result<String, String> {
+    let items = news_items(host, team)?;
+    if note.merge {
+        if let Some(i) = items.iter().rposition(|it| patch_version(it) == Some(note.version.as_str())) {
+            let mut item = items[i].clone();
+            if merge_note(&mut item, note) && host.set_news_item(team, i, &item.to_string()) {
+                return Ok(format!("written into the game's patch notes {}", note.version));
+            }
+            diag::log(&format!(
+                "[balance] the game refused its patch notes {} with the round's champions in them: {}",
+                note.version,
+                diag::clip(&item.to_string(), 400)
+            ));
+        }
+    }
+    let template = items.iter().rev().find_map(|it| patch_body(it).cloned());
+    if !host.push_news(team, &note.title, &note.content, crate::balance::AUTHOR) {
+        return Err("the game refused the news".to_string());
+    }
+    let items = news_items(host, team)?;
+    let Some(i) = items.iter().rposition(|it| it.get("title").and_then(Value::as_str) == Some(note.title.as_str())) else {
+        return Ok(format!("as plain news {} (not found again to make it patch notes)", note.label));
+    };
+    let tries = own_note_items(&items[i], note, template.as_ref());
+    for item in &tries {
+        if host.set_news_item(team, i, &item.to_string()) {
+            return Ok(format!("written as patch notes {}", note.label));
+        }
+    }
+    diag::log(&format!(
+        "[balance] the game refused {} forms of patch notes {}; they stay plain news. The pushed item: {}; the newest patch notes: {}",
+        tries.len(),
+        note.label,
+        diag::clip(&items[i].to_string(), 300),
+        template.map_or("none".to_string(), |t| diag::clip(&t.to_string(), 300))
+    ));
+    Ok(format!("as plain news {}; the game refused the patch-notes form", note.label))
+}
+
+fn binds(list: &[(String, String)]) -> Value {
+    Value::Array(list.iter().map(|(k, v)| json!([k, v])).collect())
+}
+
+/// The round's news cards: each a plain news item made the game's card (its texts and binds).
+fn write_articles(host: &mut impl BalanceHost, team: usize, articles: &[Article]) -> String {
+    let (mut cards, mut plain, mut refused) = (0, 0, 0);
+    for a in articles {
+        if !host.push_news(team, &a.plain_title, &a.plain_content, &a.author) {
+            refused += 1;
+            continue;
+        }
+        let item = news_items(host, team).ok().and_then(|items| {
+            let i = items.iter().rposition(|it| it.get("title").and_then(Value::as_str) == Some(a.plain_title.as_str()))?;
+            Some((i, items[i].clone()))
+        });
+        let Some((i, Value::Object(mut map))) = item else {
+            plain += 1;
+            continue;
+        };
+        map.insert("title".to_string(), json!(a.title));
+        map.insert("title_bind".to_string(), binds(&a.title_bind));
+        map.insert("author".to_string(), json!(a.author));
+        map.insert("ty".to_string(), json!({"Simple": {"content": a.content, "content_bind": binds(&a.content_bind)}}));
+        if host.set_news_item(team, i, &Value::Object(map).to_string()) {
+            cards += 1;
+        } else {
+            plain += 1;
+        }
+    }
+    let mut out = format!("{cards} news cards");
+    if plain > 0 {
+        out.push_str(&format!(", {plain} as plain news"));
+    }
+    if refused > 0 {
+        out.push_str(&format!(", {refused} refused"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -492,12 +765,15 @@ mod tests {
         assert_eq!(t.doc[FIELD]["fighter"], "B");
     }
 
+    /// A save's news as the server sees it, and the game's reading of a news item (`strict`: what 0.7 saves hold).
     #[derive(Default)]
     struct Host {
         autopatch: Option<String>,
         saved: BTreeMap<String, String>,
-        news: Vec<(usize, String, String)>,
+        news: Vec<Value>,
         refuse: bool,
+        strict: bool,
+        refuse_items: bool,
     }
 
     impl BalanceHost for Host {
@@ -521,24 +797,114 @@ mod tests {
             };
             true
         }
-        fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool {
-            self.news.push((team, title.to_string(), content.to_string()));
+        fn push_news(&mut self, _team: usize, title: &str, content: &str, author: &str) -> bool {
+            self.news.push(json!({
+                "author": author, "date": "2027-09-20T13:00:00", "is_favorite": false, "is_read": false, "is_sent": true,
+                "title": title, "title_bind": [], "ty": {"Simple": {"content": content, "content_bind": []}}
+            }));
             true
+        }
+        fn news(&self, _team: usize) -> Option<String> {
+            Some(Value::Array(self.news.clone()).to_string())
+        }
+        fn set_news_item(&mut self, _team: usize, index: usize, json: &str) -> bool {
+            let Ok(item) = serde_json::from_str::<Value>(json) else { return false };
+            if self.refuse_items || (self.strict && !game_reads(&item)) {
+                return false;
+            }
+            match self.news.get_mut(index) {
+                Some(slot) => {
+                    *slot = item;
+                    true
+                }
+                None => false,
+            }
         }
     }
 
+    /// The news item layout of 0.7 saves: `[key, value]` binds, a `PatchNote` with exactly its six fields as lists.
+    fn game_reads(item: &Value) -> bool {
+        let pairs = |v: &Value| {
+            v.as_array().is_some_and(|a| a.iter().all(|p| p.as_array().is_some_and(|p| p.len() == 2 && p.iter().all(Value::is_string))))
+        };
+        let row = |r: &Value| {
+            r.as_object().is_some_and(|o| {
+                o.len() == 5
+                    && o["key"].is_string()
+                    && (o["target_action"].is_null() || o["target_action"].is_string())
+                    && o["pre_value"].is_string()
+                    && o["after_value"].is_string()
+                    && o["is_buff"].is_boolean()
+            })
+        };
+        if !pairs(&item["title_bind"]) || !item["author"].is_string() || !item["date"].is_string() || !item["title"].is_string() {
+            return false;
+        }
+        match &item["ty"] {
+            Value::String(_) => true,
+            Value::Object(ty) if ty.len() == 1 => match ty.iter().next() {
+                Some((k, body)) if k == "PatchNote" => {
+                    body.as_object().is_some_and(|b| b.len() == 6)
+                        && body["version"].is_string()
+                        && body["added_champion"].is_array()
+                        && body["champion_patch_data"]
+                            .as_array()
+                            .is_some_and(|e| e.iter().all(|p| p[0].is_string() && p[1].as_array().is_some_and(|rows| rows.iter().all(row))))
+                        && pairs(&body["champion_patch_reasons"])
+                        && body["game_rule_patch_data"].is_array()
+                        && body["game_rule_patch_reasons"].is_array()
+                }
+                Some((k, body)) if k == "Simple" => body["content"].is_string() && pairs(&body["content_bind"]),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn line(key: &str, pre: &str, after: &str) -> Row {
+        Row { key: key.into(), target_action: None, pre_value: pre.into(), after_value: after.into(), is_buff: after > pre }
+    }
+
+    fn note(version: &str, label: &str, merge: bool) -> NoteRequest {
+        NoteRequest {
+            version: version.into(),
+            label: label.into(),
+            merge,
+            champions: vec![
+                ("tft_maddie".into(), vec![line("#asset/base/text/champion?stat.attack", "94", "89.3")], "pma_wr_74,pma_cap".into()),
+                ("league_kaisa".into(), vec![line("#asset/base/text/champion?stat.hp", "900", "945")], "pma_wr_35".into()),
+            ],
+            title: format!("智能BP 平衡补丁 {label}"),
+            content: "【削弱】\n麦迪：…".into(),
+        }
+    }
+
+    /// The game's own patch notes of a patch (one champion of its own; its rule changes).
+    fn official(version: &str) -> Value {
+        json!({
+            "author": "Team Samoyed", "date": "2027-10-01T00:00:00", "is_favorite": false, "is_read": true, "is_sent": true,
+            "title": "#asset/base/text/news?patch.title", "title_bind": [["Version", version]],
+            "ty": {"PatchNote": {
+                "version": version, "added_champion": [],
+                "champion_patch_data": [["league_brand", [
+                    {"key": "#asset/base/text/champion?stat.attack", "target_action": null, "pre_value": "94", "after_value": "75", "is_buff": false}]]],
+                "champion_patch_reasons": [["league_brand", "early_game_dominant_2"]],
+                "game_rule_patch_data": [{"category": "x", "pre_value": "1", "after_value": "2", "is_buff": true, "key": "kill_gold"}],
+                "game_rule_patch_reasons": ["game_too_long_1"]
+            }}
+        })
+    }
+
     fn breq(off: bool, round: u32) -> BalanceRequest {
-        BalanceRequest { team: 3, off, round, title: format!("round {round}"), content: "a\nb".into() }
+        BalanceRequest { team: 3, off, round, note: Some(note("2027.4.1", "2027.4.1b", false)), articles: Vec::new() }
     }
 
     #[test]
     fn the_balance_request_round_trips() {
-        let payload = "v1\n3\n1\n2\n智能BP 平衡补丁 2027.4.1（第 2 轮）\n【削弱】\n麦迪：…";
-        let req = BalanceRequest::parse(payload.as_bytes(), None).unwrap();
-        assert_eq!((req.team, req.off, req.round), (3, true, 2));
-        assert_eq!(req.title, "智能BP 平衡补丁 2027.4.1（第 2 轮）");
-        assert_eq!(req.content, "【削弱】\n麦迪：…");
-        assert!(BalanceRequest::parse(b"v9\n3", None).is_err());
+        let mut req = breq(true, 2);
+        req.articles.push(Article { title: "t".into(), title_bind: vec![("Champion".into(), "x".into())], ..Article::default() });
+        assert_eq!(BalanceRequest::parse(req.encode().as_bytes()).unwrap(), req);
+        assert!(BalanceRequest::parse(b"v1\n3\n1").is_err());
     }
 
     #[test]
@@ -559,23 +925,22 @@ mod tests {
     }
 
     #[test]
-    fn on_keeps_the_games_values_and_news_once_off_puts_them_back() {
+    fn on_keeps_the_games_values_and_writes_each_round_once_off_puts_them_back() {
         let original = r#"{"major_strong_nerf_count":2,"meta_stale_high_threshold":4}"#;
-        let mut host = Host { autopatch: Some(original.into()), ..Host::default() };
+        let mut host = Host { autopatch: Some(original.into()), news: vec![official("2027.4.1")], ..Host::default() };
         let (ok, said) = balance(&mut host, &breq(true, 1));
         assert!(ok, "{said}");
         assert!(host.autopatch.as_deref().unwrap().contains(r#""major_strong_nerf_count":0"#));
         let kept: Value = serde_json::from_str(host.saved.get(AUTOPATCH_KEPT).unwrap()).unwrap();
         assert_eq!(kept, serde_json::from_str::<Value>(original).unwrap(), "the game's own values kept");
-        assert_eq!(host.news.len(), 1);
-        // the same round again (a new session): no second news, the values kept from the first time
+        assert_eq!(host.news.len(), 2, "{said}");
+        // the same round again (a new session): nothing written twice, the values kept from the first time
         let (ok, said) = balance(&mut host, &breq(true, 1));
         assert!(ok && said.contains("already off"), "{said}");
-        assert_eq!(host.news.len(), 1);
-        // the next round: its news
-        balance(&mut host, &breq(true, 2));
         assert_eq!(host.news.len(), 2);
-        assert_eq!(host.news[1].1, "round 2");
+        // the next round: its notes
+        balance(&mut host, &breq(true, 2));
+        assert_eq!(host.news.len(), 3);
         // off: the game's own values back, nothing kept any more
         let (ok, said) = balance(&mut host, &breq(false, 2));
         assert!(ok, "{said}");
@@ -587,5 +952,90 @@ mod tests {
         // a refusal is said and retried
         let mut host = Host { autopatch: Some(original.into()), refuse: true, ..Host::default() };
         assert!(!balance(&mut host, &breq(true, 1)).0);
+    }
+
+    #[test]
+    fn a_patch_round_goes_into_the_games_own_notes() {
+        let mut host = Host { strict: true, news: vec![official("2027.4.1"), official("2027.5.0")], ..Host::default() };
+        let how = write_note(&mut host, 3, &note("2027.5.0", "2027.5.0", true)).unwrap();
+        assert_eq!(how, "written into the game's patch notes 2027.5.0");
+        assert_eq!(host.news.len(), 2, "no item of its own");
+        let item = &host.news[1];
+        assert_eq!(item["is_read"], false, "unread again");
+        let body = &item["ty"]["PatchNote"];
+        let champions: Vec<&str> = body["champion_patch_data"].as_array().unwrap().iter().map(|e| e[0].as_str().unwrap()).collect();
+        assert_eq!(champions, ["league_brand", "tft_maddie", "league_kaisa"], "the game's own champion kept");
+        assert_eq!(body["champion_patch_reasons"][1], json!(["tft_maddie", "pma_wr_74,pma_cap"]));
+        assert_eq!(body["game_rule_patch_reasons"], json!(["game_too_long_1"]), "its rule changes kept");
+        assert_eq!(host.news[0], official("2027.4.1"), "an older patch untouched");
+        // a champion already in the game's notes gets its lines added to them
+        let mut host = Host { news: vec![official("2027.5.0")], ..Host::default() };
+        let mut n = note("2027.5.0", "2027.5.0", true);
+        n.champions[0].0 = "league_brand".into();
+        write_note(&mut host, 3, &n).unwrap();
+        let body = &host.news[0]["ty"]["PatchNote"];
+        assert_eq!(body["champion_patch_data"][0][1].as_array().unwrap().len(), 2);
+        assert_eq!(body["champion_patch_reasons"][0][1], "early_game_dominant_2,pma_wr_74,pma_cap");
+        // no notes of the game for the patch: notes of its own
+        let mut host = Host { strict: true, news: vec![official("2027.4.1")], ..Host::default() };
+        assert_eq!(write_note(&mut host, 3, &note("2027.5.0", "2027.5.0", true)).unwrap(), "written as patch notes 2027.5.0");
+        assert_eq!(host.news.len(), 2);
+    }
+
+    #[test]
+    fn a_hotfix_is_patch_notes_of_its_own_in_the_games_form() {
+        // the newest notes of the game give the form (here: its own rule reasons a list)
+        let mut host = Host { strict: true, news: vec![official("2027.4.1")], ..Host::default() };
+        let how = write_note(&mut host, 3, &note("2027.4.1", "2027.4.1b", false)).unwrap();
+        assert_eq!(how, "written as patch notes 2027.4.1b");
+        let item = &host.news[1];
+        assert!(game_reads(item), "{item}");
+        assert_eq!(item["title"], "#asset/base/text/news?patch.title");
+        assert_eq!(item["title_bind"], json!([["Version", "2027.4.1b"]]));
+        assert_eq!(item["author"], crate::balance::AUTHOR);
+        assert_eq!(item["date"], "2027-09-20T13:00:00", "dated as the game dated the news");
+        let body = &item["ty"]["PatchNote"];
+        assert_eq!(body["version"], "2027.4.1", "the game's own patch");
+        assert_eq!(body["game_rule_patch_data"], json!([]));
+        assert_eq!(body["champion_patch_data"][0][1][0]["after_value"], "89.3");
+        // no notes of the game in the news yet: the 0.7 form is found among the others
+        let mut host = Host { strict: true, ..Host::default() };
+        assert_eq!(write_note(&mut host, 3, &note("2027.4.1", "2027.4.1b", false)).unwrap(), "written as patch notes 2027.4.1b");
+        assert!(game_reads(&host.news[0]));
+        // the patch-notes form refused: the plain news stays, readable
+        let mut host = Host { refuse_items: true, ..Host::default() };
+        let how = write_note(&mut host, 3, &note("2027.4.1", "2027.4.1b", false)).unwrap();
+        assert!(how.starts_with("as plain news 2027.4.1b"), "{how}");
+        assert_eq!(host.news[0]["title"], "智能BP 平衡补丁 2027.4.1b");
+        assert_eq!(host.news[0]["ty"]["Simple"]["content"], "【削弱】\n麦迪：…");
+    }
+
+    #[test]
+    fn the_cards_are_written_as_the_games() {
+        let card = Article {
+            title: "#asset/base/text/news?article.meta.pc02.title.0".into(),
+            title_bind: vec![("Champion".into(), "tft_maddie".into()), ("PatchChanges".into(), "[]".into())],
+            content: "#asset/base/text/news?article.meta.pc02.content.0".into(),
+            content_bind: vec![("Champion".into(), "tft_maddie".into()), ("ContentId".into(), "PC02".into())],
+            author: crate::balance::AUTHOR.into(),
+            plain_title: "麦迪在本次补丁中被削弱".into(),
+            plain_content: "…".into(),
+        };
+        let mut host = Host { strict: true, autopatch: Some(r#"{"major_strong_nerf_count":2,"meta_stale_high_threshold":4}"#.into()), news: vec![official("2027.4.1")], ..Host::default() };
+        let mut req = breq(true, 1);
+        req.articles = vec![card.clone(), Article { plain_title: "second".into(), ..card.clone() }];
+        let (ok, said) = balance(&mut host, &req);
+        assert!(ok && said.contains("2 news cards"), "{said}");
+        assert_eq!(host.news.len(), 4);
+        let item = &host.news[2];
+        assert!(game_reads(item), "{item}");
+        assert_eq!(item["title"], card.title);
+        assert_eq!(item["title_bind"], json!([["Champion", "tft_maddie"], ["PatchChanges", "[]"]]));
+        assert_eq!(item["ty"]["Simple"]["content"], card.content);
+        assert_eq!(item["ty"]["Simple"]["content_bind"][1], json!(["ContentId", "PC02"]));
+        // refused as a card: the plain news stays
+        let mut host = Host { refuse_items: true, ..Host::default() };
+        assert_eq!(write_articles(&mut host, 3, &[card]), "0 news cards, 1 as plain news");
+        assert_eq!(host.news[0]["title"], "麦迪在本次补丁中被削弱");
     }
 }

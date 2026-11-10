@@ -1,23 +1,32 @@
 //! Balance patches (2.8.0; the user 2026-11-11: 「现在能不能让meta控制版本平衡的补丁吧 现在系统自带的平衡补丁 英雄
-//! 削弱不痛不痒 加强也是 砍不到位 没有lol那种感觉」). On one save at patch 2027.4.1 the game's own patches had nerfed
-//! champions at 46% (Gwen, Nami, Brand) and ones with no games while Maddie sat at 73% with a 52% ban rate untouched,
-//! and its nerfs barely moved anyone (Zeri 64.4% -> 64.0%). With `balance=on` this mod makes the patches instead:
+//! 削弱不痛不痒 加强也是 砍不到位 没有lol那种感觉」, then 「我希望我们这套系统完全替代官方的 不要有死角」). On one save
+//! at patch 2027.4.1 the game's own patches had nerfed champions at 46% (Gwen, Nami, Brand) while Maddie sat at 73%
+//! with a 52% ban rate untouched. With `balance=on` this mod makes the patches instead, and they show wherever the
+//! game's did:
 //!
-//! - **A round per game patch**: when the game moves to a new patch (or, the game's own champion patches being off,
-//!   after [`ROUND_MATCHES`] more competition matches in one), the champions the model rates furthest outside
-//!   [`BAND`] - with [`MIN_EVIDENCE`] recent games or more, at most `balance_count` of them - change by [`PER_POINT`]
-//!   percent of power for every win-rate point outside the band, at most `balance_max` a round, at most [`CAP`] in
-//!   all (rounds add up, as in League: a champion still too strong is cut again next patch).
+//! - **When**: a round for every patch the game makes (its patch notes appear in the player's news, [`Due::Patch`]);
+//!   a first one when the setting is turned on, as a hotfix of the current patch (`2027.4.1b`, [`Due::First`]); and a
+//!   hotfix when the game made no patch for [`LATE_DAYS`] game days ([`Due::Late`]).
+//! - **What**: the champions the model rates furthest outside [`BAND`] - with [`MIN_EVIDENCE`] recent games or more,
+//!   at most `balance_count` of them - change by [`PER_POINT`] percent of power for every win-rate point outside the
+//!   band, at most `balance_max` a round, at most [`CAP`] in all (rounds add up, as in League: a champion still too
+//!   strong is cut again next patch).
 //! - **In every match**: a champion's power is a permanent buff ([`BUFF`]), half on damage (attack and magic power),
 //!   half on health ([`buff`]), put on it at the start and again on every respawn (a new entity).
 //! - **Every run alike**: a match is simulated more than once (the server's run is the result, the client plays it
 //!   again to show it, replays again later). The server's first run takes the newest round and keeps it in this
 //!   save's book under the ten champions (`ai_tactics`' key); every later run plays the kept round, and a run of a
 //!   match nothing was kept for plays none.
-//! - **Patch notes**: each round goes to the player's inbox (the server half, `apply_balance`), and to the model as
-//!   the patch's notes (the direction of each change), as the game's own notes do.
+//! - **The game's own notes**: a round's notes are written into the notes the game made for its patch (its own
+//!   champion changes being off), or are patch notes of their own for a hotfix (`server::write_note`) - so the
+//!   inbox, the patch history and the model read them as the game's. A champion's lines are the numbers it plays
+//!   with ([`rows`]: base attack, magic power, health and their growth, the game's numbers times the buff), its
+//!   reason the model's win rate ([`reason`], texts in `text/news.i18n`). The patch's news cards come as the game
+//!   writes them ([`articles`]: the most buffed and most nerfed champion, the player's athletes' signature champions),
+//!   and the stat panels of the ban/pick screen and the encyclopedia show the numbers with the power on
+//!   (`ui::balance_view`).
 //! - **The game's own champion patches off**: the server half sets the save's auto-patcher counts to zero while this
-//!   is on, keeping the save's own values to put back when it is turned off (`server::balance_autopatch`).
+//!   is on, keeping the save's own values to put back when it is turned off (`server::balance`).
 //!
 //! The book is one file a save in the mod folder (`balance-team<id>-<hash>.json`): every round (its changes and
 //! every champion's power after it) and the kept matches.
@@ -31,6 +40,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::meta::Meta;
 use crate::patchnotes::PatchNote;
+use crate::records::compare_versions;
+use crate::stats::Stats;
 use crate::{diag, paths};
 
 /// The buff that carries a champion's balance in a match.
@@ -43,8 +54,9 @@ pub const PER_POINT: f32 = 1.5;
 pub const CAP: i32 = 30;
 /// Recent games (each patch back counting half, the model's `evidence`) before a champion's win rate is trusted.
 pub const MIN_EVIDENCE: f32 = 30.0;
-/// Competition matches in one game patch after which another round is made in it.
-pub const ROUND_MATCHES: u32 = 600;
+/// Game days after a round without a new game patch before the next round comes as a hotfix of the same patch (the
+/// game makes one every 4-6 weeks; with its champion changes off it might make none).
+pub const LATE_DAYS: i64 = 60;
 /// Matches whose round is kept (the newest).
 const KEPT: usize = 4000;
 /// A run waits this long for all its champions before it settles with the ones there.
@@ -75,9 +87,18 @@ pub struct Change {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Round {
     pub id: u32,
-    /// The game's patch it was made in.
+    /// The game's patch it belongs to.
     pub version: String,
-    /// Competition matches of that patch when it was made.
+    /// The name its notes carry: the game's patch, or a hotfix of it (`2027.4.1b`).
+    #[serde(default)]
+    pub label: String,
+    /// Its notes go into the game's own notes of `version` (else they are patch notes of their own).
+    #[serde(default)]
+    pub merged: bool,
+    /// The game date it was made.
+    #[serde(default)]
+    pub date: Option<(i32, u32, u32)>,
+    /// Competition matches of the model's newest patch when it was made.
     pub matches: u32,
     pub changes: Vec<Change>,
     /// Every champion's power after it (percent; absent = 0).
@@ -121,21 +142,64 @@ pub fn decide(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rule
     out.into_iter().map(|(_, c)| c).collect()
 }
 
-/// The round after `last` for the model's `meta`, or None when none is due: the first one, one for a new game patch,
-/// or another in the same patch after [`ROUND_MATCHES`] more matches. A round that changes nobody is still a round
+/// Why a round is due (each with the game's patch it belongs to).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Due {
+    /// The game made this patch: the round goes into its notes.
+    Patch(String),
+    /// No round yet (the setting was just turned on): a hotfix of the game's current patch.
+    First(String),
+    /// [`LATE_DAYS`] game days without a new game patch: a hotfix of the current one.
+    Late(String),
+}
+
+impl Due {
+    pub fn version(&self) -> &str {
+        match self {
+            Due::Patch(v) | Due::First(v) | Due::Late(v) => v,
+        }
+    }
+}
+
+/// A game date as a day number (days from 1970-01-01, proleptic Gregorian).
+pub fn day_number((year, month, day): (i32, u32, u32)) -> i64 {
+    let (m, d) = (i64::from(month), i64::from(day));
+    let y = i64::from(year) - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Whether a round is due: `patch` is the game's newest patch (from its notes in the news), `today` the game date.
+pub fn due(rounds: &[Round], patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Due> {
+    let patch = patch.map(str::trim).filter(|p| !p.is_empty())?;
+    let Some(last) = rounds.last() else { return Some(Due::First(patch.to_string())) };
+    // a patch newer than every round's: the game moved on
+    if !rounds.iter().any(|r| r.version == patch) && compare_versions(patch, &last.version) == std::cmp::Ordering::Greater {
+        return Some(Due::Patch(patch.to_string()));
+    }
+    let (made, today) = (last.date?, today?);
+    (day_number(today) - day_number(made) >= LATE_DAYS).then(|| Due::Late(patch.to_string()))
+}
+
+/// The name of the next hotfix of `version`: `b`, `c`, ... after the hotfixes it already had (as League's 14.1b).
+pub fn hotfix_label(rounds: &[Round], version: &str) -> String {
+    let n = rounds.iter().filter(|r| r.version == version && !r.merged).count();
+    match u8::try_from(n).ok().filter(|n| *n < 25) {
+        Some(n) => format!("{version}{}", char::from(b'b' + n)),
+        None => format!("{version}-{}", n + 1),
+    }
+}
+
+/// The round `due` asks for, after `rounds`, from the model's `meta`. A round that changes nobody is still a round
 /// (it marks the patch as looked at).
-pub fn next_round(meta: &Meta, last: Option<&Round>, rules: Rules) -> Option<Round> {
-    if meta.current.is_empty() {
-        return None;
-    }
-    let due = match last {
-        None => true,
-        Some(r) if r.version != meta.current => true,
-        Some(r) => meta.current_matches >= r.matches + ROUND_MATCHES,
-    };
-    if !due {
-        return None;
-    }
+pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
+    let last = rounds.last();
+    let version = due.version().to_string();
+    let merged = matches!(due, Due::Patch(_));
+    let label = if merged { version.clone() } else { hotfix_label(rounds, &version) };
     let before = last.map(|r| r.power.clone()).unwrap_or_default();
     let candidates: Vec<Candidate<'_>> = meta
         .champions
@@ -151,13 +215,16 @@ pub fn next_round(meta: &Meta, last: Option<&Round>, rules: Rules) -> Option<Rou
             power.insert(c.champion.clone(), c.total);
         }
     }
-    Some(Round {
+    Round {
         id: last.map_or(1, |r| r.id + 1),
-        version: meta.current.clone(),
+        version,
+        label,
+        merged,
+        date: today,
         matches: meta.current_matches,
         changes,
         power,
-    })
+    }
 }
 
 /// The buff for a champion at `power` percent: half on damage (attack and magic power), the rest on health.
@@ -166,28 +233,213 @@ pub fn buff(power: i32) -> BuffV1 {
     BuffV1 { attack_mult: damage, magic_power_mult: damage, hp_mult: power - damage, ..BuffV1::named(BUFF) }
 }
 
-/// The patch notes of the rounds for the model: the first round of each game patch gives each champion it changed
-/// that patch's direction (+1 buffed, -1 nerfed), as the game's own notes do.
+/// What the buff does at `power` percent: (damage factor, health factor), as [`buff`] splits it.
+pub fn factors(power: i32) -> (f64, f64) {
+    let damage = power / 2;
+    (1.0 + f64::from(damage) / 100.0, 1.0 + f64::from(power - damage) / 100.0)
+}
+
+/// The patch notes of the rounds for the model: each round gives each champion it changed its direction (+1
+/// buffed, -1 nerfed) in its patch, as the game's own notes do (the client adds up the notes of a patch).
 pub fn notes_of(rounds: &[Round]) -> Vec<PatchNote> {
-    let mut out: Vec<PatchNote> = Vec::new();
-    for r in rounds {
-        if out.iter().any(|n| n.is_for(&r.version)) {
+    rounds
+        .iter()
+        .map(|r| PatchNote {
+            versions: vec![r.version.clone()],
+            version: Some(r.version.clone()),
+            changes: r.changes.iter().map(|c| (c.champion.clone(), c.step.signum())).collect(),
+            ..PatchNote::default()
+        })
+        .collect()
+}
+
+// ===================== the notes as the game writes them =====================
+
+/// The news' author: the patch notes and the patch cards about the league.
+pub const AUTHOR: &str = "智能BP / Patch Meta AI";
+
+/// One line of a champion's notes as the game writes them (`ChampionPatchData`, in its JSON field order).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Row {
+    pub key: String,
+    pub target_action: Option<String>,
+    pub pre_value: String,
+    pub after_value: String,
+    pub is_buff: bool,
+}
+
+/// The lines a change shows: (the game's text for it, stat index in [`Stats`], health (else damage), growth).
+const ROWS: [(&str, usize, bool, bool); 6] = [
+    ("#asset/base/text/champion?stat.attack", 0, false, false),
+    ("#asset/base/text/champion?stat.magic_power", 1, false, false),
+    ("#asset/base/text/champion?stat.hp", 2, true, false),
+    ("#asset/base/text/champion?patch_key.growth_attack", 0, false, true),
+    ("#asset/base/text/champion?patch_key.growth_magic_power", 1, false, true),
+    ("#asset/base/text/champion?patch_key.growth_hp", 2, true, true),
+];
+
+/// A number as the game's notes write it: whole when it is, else one decimal.
+pub fn number(x: f64) -> String {
+    if (x - x.round()).abs() < 0.05 {
+        format!("{}", x.round() as i64)
+    } else {
+        format!("{x:.1}")
+    }
+}
+
+/// A champion's lines for a change from `before` to `after` percent of power: its base attack, magic power and
+/// health and their growth per level as it plays with them (the game's numbers times the buff). Numbers the champion
+/// does not have (no magic power) or that do not move are left out.
+pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
+    let (d0, h0) = factors(before);
+    let (d1, h1) = factors(after);
+    let mut out = Vec::new();
+    for (key, i, health, growth) in ROWS {
+        let value = f64::from(if growth { stats.growth[i] } else { stats.base[i] });
+        if value <= 0.0 {
             continue;
         }
-        let changes = r.changes.iter().map(|c| (c.champion.clone(), c.step.signum())).collect();
-        out.push(PatchNote { versions: vec![r.version.clone()], changes });
+        let (f0, f1) = if health { (h0, h1) } else { (d0, d1) };
+        let (pre, after) = (number(value * f0), number(value * f1));
+        if pre == after {
+            continue;
+        }
+        out.push(Row { key: key.to_string(), target_action: None, pre_value: pre, after_value: after, is_buff: f1 > f0 });
     }
     out
 }
 
-/// The round's news: a title and its lines, champions by `label` (the game's names), in Chinese when those are.
+/// A change's reason as the game's notes give one: codes of `patch.reason.*` texts, comma-separated - the model's
+/// win rate (`pma_wr_<n>`, rounded away from the band), and whether the round's or the overall limit held it.
+pub fn reason(c: &Change, rules: Rules) -> String {
+    let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
+    let mut codes = vec![format!("pma_wr_{n}")];
+    if c.step.abs() >= rules.max_step {
+        codes.push("pma_cap".to_string());
+    }
+    if c.total.abs() >= CAP {
+        codes.push("pma_total".to_string());
+    }
+    codes.join(",")
+}
+
+/// A news card as the game writes them: a `Simple` item with text references and their binds.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Article {
+    pub title: String,
+    pub title_bind: Vec<(String, String)>,
+    pub content: String,
+    pub content_bind: Vec<(String, String)>,
+    pub author: String,
+    /// What the news says should the game not take the card's form.
+    pub plain_title: String,
+    pub plain_content: String,
+}
+
+/// An athlete of the player's team and their signature champion (the one they are most proficient with).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signature {
+    pub athlete: u32,
+    pub name: String,
+    pub champion: String,
+}
+
+/// The patch's news cards, as the game writes them after its own patches (the same texts and binds): the most
+/// buffed champion (`PC01`), the most nerfed (`PC02`), a buffed signature champion of the player's athletes (`PC05`)
+/// and a nerfed one (`PC06`, an alert). `lines` has each changed champion's lines and reason, `label` names
+/// champions for the plain fallback.
+pub fn articles(
+    round: &Round,
+    lines: &BTreeMap<String, (Vec<Row>, String)>,
+    team: &str,
+    signatures: &[Signature],
+    label: &dyn Fn(&str) -> String,
+) -> Vec<Article> {
+    let date = round.date.map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}")).unwrap_or_default();
+    let chinese = round.changes.iter().any(|c| label(&c.champion).chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
+    let changes_of = |champion: &str| -> Option<(String, String)> {
+        let (rows, reason) = lines.get(champion)?;
+        (!rows.is_empty()).then(|| (serde_json::to_string(rows).unwrap_or_default(), reason.clone()))
+    };
+    let bind = |k: &str, v: &str| (k.to_string(), v.to_string());
+    let mut out = Vec::new();
+    // the most buffed and the most nerfed champion of the round
+    let best = round.changes.iter().filter(|c| c.step > 0).max_by_key(|c| c.step);
+    let worst = round.changes.iter().filter(|c| c.step < 0).min_by_key(|c| c.step);
+    for (c, code, word) in [(best, "PC01", "buff"), (worst, "PC02", "nerf")] {
+        let Some(c) = c else { continue };
+        let Some((rows, reason)) = changes_of(&c.champion) else { continue };
+        let binds = vec![bind("Champion", &c.champion), bind("PatchChanges", &rows), bind("PatchReason", &reason), bind("Team", team)];
+        let (plain_title, plain_content) = plain(chinese, word == "buff", &label(&c.champion), None);
+        out.push(card(code, "article", format!("patch:{date}:{word}:{}", c.champion), &date, binds, AUTHOR, plain_title, plain_content));
+    }
+    // the player's athletes whose signature champion moved most, each way
+    let step_of = |s: &Signature| round.changes.iter().find(|c| c.champion == s.champion).map(|c| c.step);
+    let boosted = signatures.iter().filter(|s| step_of(s).is_some_and(|v| v > 0)).max_by_key(|s| step_of(s));
+    let hit = signatures.iter().filter(|s| step_of(s).is_some_and(|v| v < 0)).min_by_key(|s| step_of(s));
+    for (s, code, kind, word) in [(boosted, "PC05", "article", "boost"), (hit, "PC06", "alert", "risk")] {
+        let Some(s) = s else { continue };
+        let Some((rows, reason)) = changes_of(&s.champion) else { continue };
+        let binds = vec![
+            bind("Team", team),
+            bind("Athlete", &s.name),
+            bind("Champion", &s.champion),
+            bind("PatchChanges", &rows),
+            bind("PatchReason", &reason),
+        ];
+        let (plain_title, plain_content) = plain(chinese, word == "boost", &label(&s.champion), Some(&s.name));
+        let subject = format!("patch:{date}:{word}:{}:{}", s.athlete, s.champion);
+        out.push(card(code, kind, subject, &date, binds, team, plain_title, plain_content));
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn card(code: &str, kind: &str, subject: String, date: &str, binds: Vec<(String, String)>, author: &str, plain_title: String, plain_content: String) -> Article {
+    let key = code.to_lowercase();
+    let mut content_bind = binds.clone();
+    for (k, v) in [("ContentId", code), ("SubjectId", subject.as_str()), ("DateKey", date), ("Scope", "patch"), ("Severity", kind)] {
+        content_bind.push((k.to_string(), v.to_string()));
+    }
+    Article {
+        title: format!("#asset/base/text/news?{kind}.meta.{key}.title.0"),
+        title_bind: binds,
+        content: format!("#asset/base/text/news?{kind}.meta.{key}.content.0"),
+        content_bind,
+        author: author.to_string(),
+        plain_title,
+        plain_content,
+    }
+}
+
+/// A card's plain fallback (the game did not take the card's form).
+fn plain(chinese: bool, buffed: bool, champion: &str, athlete: Option<&str>) -> (String, String) {
+    match (chinese, athlete) {
+        (true, None) => {
+            let word = if buffed { "加强" } else { "削弱" };
+            (format!("{champion}在本次补丁中被{word}"), format!("智能BP 的平衡补丁{word}了{champion}。"))
+        }
+        (true, Some(a)) => {
+            let word = if buffed { "加强" } else { "削弱" };
+            (format!("{a}选手的本命英雄{champion}被{word}"), format!("智能BP 的平衡补丁{word}了{a}选手的本命英雄{champion}。"))
+        }
+        (false, None) => {
+            let word = if buffed { "buffed" } else { "nerfed" };
+            (format!("{champion} {word} this patch"), format!("Patch Meta AI's balance patch {word} {champion}."))
+        }
+        (false, Some(a)) => {
+            let word = if buffed { "buffed" } else { "nerfed" };
+            (format!("{a}'s signature {champion} {word}"), format!("Patch Meta AI's balance patch {word} {champion}, {a}'s signature champion."))
+        }
+    }
+}
+
+/// The round's notes as plain news (what the inbox shows should the game not take the patch-notes form): a title
+/// and its lines, champions by `label` (the game's names), in Chinese when those are.
 pub fn news(round: &Round, label: &dyn Fn(&str) -> String) -> (String, String) {
     let chinese = round.changes.iter().any(|c| label(&c.champion).chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
-    let title = if chinese {
-        format!("智能BP 平衡补丁 {}（第 {} 轮）", round.version, round.id)
-    } else {
-        format!("Patch Meta AI balance patch {} (round {})", round.version, round.id)
-    };
+    let name = if round.label.is_empty() { round.version.as_str() } else { round.label.as_str() };
+    let title = if chinese { format!("智能BP 平衡补丁 {name}") } else { format!("Patch Meta AI balance patch {name}") };
     let mut lines = Vec::new();
     if round.changes.is_empty() {
         lines.push(if chinese {
@@ -254,6 +506,24 @@ struct Store {
     /// written at most every [`WRITE_EVERY`], and at once for a new round or a closed save).
     unwritten: bool,
     written_at: Option<std::time::Instant>,
+    /// The newest round as the screens show it.
+    view: Option<Arc<View>>,
+}
+
+/// The newest round as the screens show it: every champion's power, and this round's steps.
+#[derive(Debug, Default, PartialEq)]
+pub struct View {
+    pub id: u32,
+    pub power: Arc<BTreeMap<String, i32>>,
+    pub steps: BTreeMap<String, i32>,
+}
+
+fn view_of(round: &Round, power: &Arc<BTreeMap<String, i32>>) -> Arc<View> {
+    Arc::new(View {
+        id: round.id,
+        power: Arc::clone(power),
+        steps: round.changes.iter().map(|c| (c.champion.clone(), c.step)).collect(),
+    })
 }
 
 /// The book is written at most this often while matches are kept.
@@ -283,7 +553,9 @@ fn open_file(file: PathBuf) {
     let mut st = store();
     *st = Store { file: Some(file), ..Store::default() };
     for r in book.rounds {
-        st.powers.insert(r.id, Arc::new(r.power.clone()));
+        let power = Arc::new(r.power.clone());
+        st.view = Some(view_of(&r, &power));
+        st.powers.insert(r.id, power);
         st.rounds.push(r);
     }
     for (key, id) in book.kept {
@@ -320,9 +592,26 @@ pub fn rounds() -> Vec<Round> {
     store().rounds.clone()
 }
 
-/// This save's newest round (each frame asks: no copy of the whole book).
+/// This save's newest round.
 pub fn latest() -> Option<Round> {
     store().rounds.last().cloned()
+}
+
+/// The newest round as the screens show it (each frame asks: a pointer, no copy).
+pub fn view() -> Option<Arc<View>> {
+    store().view.clone()
+}
+
+/// Whether a round is due on this save ([`due`]).
+pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Due> {
+    let st = store();
+    st.file.as_ref()?;
+    due(&st.rounds, patch, today)
+}
+
+/// The round `due` asks for on this save ([`make_round`]); not in the book until [`publish`]ed.
+pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
+    make_round(meta, &store().rounds, rules, due, today)
 }
 
 /// A new round: in the book from now on (new matches play it).
@@ -331,7 +620,9 @@ pub fn publish(round: Round) {
     if st.file.is_none() {
         return;
     }
-    st.powers.insert(round.id, Arc::new(round.power.clone()));
+    let power = Arc::new(round.power.clone());
+    st.view = Some(view_of(&round, &power));
+    st.powers.insert(round.id, power);
     st.rounds.push(round);
     write(&mut st);
 }
@@ -521,31 +812,153 @@ mod tests {
         crate::meta::Champion { name: name.into(), strength: logit(win / 100.0), evidence, ..crate::meta::Champion::default() }
     }
 
-    #[test]
-    fn a_round_is_due_on_a_new_patch_or_many_matches_later() {
-        let meta = Meta {
+    fn meta() -> Meta {
+        Meta {
             current: "2027.4.1".into(),
             current_matches: 100,
             champions: vec![champ("maddie", 73.3, 221.0), champ("fine", 50.0, 300.0), champ("weak", 44.0, 80.0)],
             ..Meta::default()
-        };
-        let first = next_round(&meta, None, RULES).expect("the first round");
-        assert_eq!((first.id, first.version.as_str(), first.matches), (1, "2027.4.1", 100));
-        assert_eq!(first.power.get("maddie"), Some(&-10));
-        assert_eq!(first.power.get("weak"), Some(&6));
-        assert!(!first.power.contains_key("fine"));
-        // the same patch, a few matches later: none due
-        let later = Meta { current_matches: 300, ..meta.clone() };
-        assert!(next_round(&later, Some(&first), RULES).is_none());
-        // many matches later (the game's own patches off): another, adding up
-        let much_later = Meta { current_matches: 100 + ROUND_MATCHES, ..meta.clone() };
-        let second = next_round(&much_later, Some(&first), RULES).unwrap();
-        assert_eq!((second.id, second.power.get("maddie")), (2, Some(&-20)));
-        // a new game patch: due at once
-        let next_patch = Meta { current: "2027.5.0".into(), current_matches: 0, ..meta };
-        assert_eq!(next_round(&next_patch, Some(&first), RULES).unwrap().version, "2027.5.0");
+        }
+    }
+
+    #[test]
+    fn the_first_round_is_a_hotfix_of_the_current_patch_then_one_per_game_patch() {
+        let today = Some((2027, 9, 20));
         // no patch known yet: none
-        assert!(next_round(&Meta::default(), None, RULES).is_none());
+        assert_eq!(due(&[], None, today), None);
+        // the setting just turned on: a hotfix of the game's patch
+        let first_due = due(&[], Some("2027.4.1"), today).unwrap();
+        assert_eq!(first_due, Due::First("2027.4.1".into()));
+        let first = make_round(&meta(), &[], RULES, &first_due, today);
+        assert_eq!((first.id, first.version.as_str(), first.label.as_str(), first.merged), (1, "2027.4.1", "2027.4.1b", false));
+        assert_eq!((first.power.get("maddie"), first.power.get("weak"), first.power.get("fine")), (Some(&-10), Some(&6), None));
+        let rounds = vec![first];
+        // the same patch, days later: none
+        assert_eq!(due(&rounds, Some("2027.4.1"), Some((2027, 10, 30))), None);
+        // the game's next patch: into its notes, adding up
+        let next = due(&rounds, Some("2027.5.0"), Some((2027, 10, 1))).unwrap();
+        assert_eq!(next, Due::Patch("2027.5.0".into()));
+        let second = make_round(&meta(), &rounds, RULES, &next, Some((2027, 10, 1)));
+        assert_eq!((second.id, second.label.as_str(), second.merged, second.power.get("maddie")), (2, "2027.5.0", true, Some(&-20)));
+        // an older patch's notes seen again are no new patch
+        let rounds = vec![rounds[0].clone(), second];
+        assert_eq!(due(&rounds, Some("2027.4.1"), Some((2027, 10, 2))), None);
+        // no game patch for LATE_DAYS: a hotfix of the current one (its first: b)
+        assert_eq!(due(&rounds, Some("2027.5.0"), Some((2027, 11, 29))), None, "59 days");
+        let late = due(&rounds, Some("2027.5.0"), Some((2027, 11, 30))).unwrap();
+        assert_eq!(late, Due::Late("2027.5.0".into()));
+        let third = make_round(&meta(), &rounds, RULES, &late, Some((2027, 11, 30)));
+        assert_eq!((third.label.as_str(), third.merged), ("2027.5.0b", false));
+        // a round of a book from before the dates: no hotfix by age
+        let mut old = rounds[1].clone();
+        old.date = None;
+        assert_eq!(due(&[old], Some("2027.5.0"), Some((2029, 1, 1))), None);
+    }
+
+    #[test]
+    fn hotfixes_are_lettered_like_leagues() {
+        let r = |version: &str, merged: bool| Round { version: version.into(), merged, ..Round::default() };
+        assert_eq!(hotfix_label(&[], "14.1"), "14.1b");
+        assert_eq!(hotfix_label(&[r("14.1", true)], "14.1"), "14.1b");
+        assert_eq!(hotfix_label(&[r("14.1", true), r("14.1", false), r("14.2", false)], "14.1"), "14.1c");
+        let many: Vec<Round> = (0..25).map(|_| r("1.1", false)).collect();
+        assert_eq!(hotfix_label(&many, "1.1"), "1.1-26");
+        assert_eq!(day_number((1970, 1, 1)), 0);
+        assert_eq!(day_number((2027, 3, 1)) - day_number((2027, 2, 28)), 1);
+        assert_eq!(day_number((2028, 3, 1)) - day_number((2028, 2, 28)), 2, "a leap year");
+    }
+
+    #[test]
+    fn the_lines_are_the_numbers_a_champion_plays_with() {
+        // attack 94, magic power 0, health 1180; growth 6 / 0 / 90
+        let stats = Stats { category: None, base: [94.0, 0.0, 1180.0, 30.0, 30.0, 60.0], growth: [6.0, 0.0, 90.0, 3.0, 1.0, 0.0] };
+        let got = rows(&stats, 0, -10);
+        let lines: Vec<(&str, &str, &str, bool)> =
+            got.iter().map(|r| (r.key.rsplit('?').next().unwrap(), r.pre_value.as_str(), r.after_value.as_str(), r.is_buff)).collect();
+        assert_eq!(
+            lines,
+            [
+                ("stat.attack", "94", "89.3", false),
+                ("stat.hp", "1180", "1121", false),
+                ("patch_key.growth_attack", "6", "5.7", false),
+                ("patch_key.growth_hp", "90", "85.5", false),
+            ]
+        );
+        // a later round from -10 to -4: from the old numbers back up
+        let back = rows(&stats, -10, -4);
+        assert_eq!((back[0].pre_value.as_str(), back[0].after_value.as_str(), back[0].is_buff), ("89.3", "92.1", true));
+        assert!(rows(&stats, 5, 5).is_empty());
+        // the JSON the game writes for them (the same field order)
+        assert_eq!(
+            serde_json::to_string(&got[0]).unwrap(),
+            r##"{"key":"#asset/base/text/champion?stat.attack","target_action":null,"pre_value":"94","after_value":"89.3","is_buff":false}"##
+        );
+        assert_eq!((number(1118.16), number(5.0), number(4.96), number(0.33)), ("1118.2".into(), "5".into(), "5".into(), "0.3".into()));
+    }
+
+    #[test]
+    fn the_reason_is_the_win_rate_and_the_limits() {
+        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total };
+        assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_cap");
+        assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53", "rounded away from the band");
+        assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44");
+        assert_eq!(reason(&c(70.0, -5, -30), RULES), "pma_wr_70,pma_total");
+    }
+
+    #[test]
+    fn the_cards_are_the_games_after_a_patch() {
+        let round = Round {
+            id: 3,
+            version: "2027.5.0".into(),
+            label: "2027.5.0".into(),
+            merged: true,
+            date: Some((2027, 10, 1)),
+            changes: vec![
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10 },
+                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20 },
+                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10 },
+            ],
+            ..Round::default()
+        };
+        let row = Row { key: "#asset/base/text/champion?stat.attack".into(), target_action: None, pre_value: "94".into(), after_value: "89.3".into(), is_buff: false };
+        let mut lines = BTreeMap::new();
+        for c in &round.changes {
+            lines.insert(c.champion.clone(), (vec![Row { is_buff: c.step > 0, ..row.clone() }], reason(c, RULES)));
+        }
+        let signatures = vec![
+            Signature { athlete: 2240, name: "OneJey".into(), champion: "league_warwick".into() },
+            Signature { athlete: 565, name: "Faker".into(), champion: "league_ahri".into() },
+        ];
+        let label = |c: &str| if c == "tft_maddie" { "麦迪".to_string() } else { c.to_string() };
+        let cards = articles(&round, &lines, "Bark Knights", &signatures, &label);
+        let codes: Vec<&str> = cards.iter().map(|a| a.content_bind.iter().find(|(k, _)| k == "ContentId").unwrap().1.as_str()).collect();
+        // the most buffed, the most nerfed (the first of the equal ones, as the round lists them), the hit signature
+        assert_eq!(codes, ["PC01", "PC02", "PC06"]);
+        let pc02 = &cards[1];
+        assert_eq!(pc02.title, "#asset/base/text/news?article.meta.pc02.title.0");
+        assert_eq!(pc02.content, "#asset/base/text/news?article.meta.pc02.content.0");
+        assert_eq!(pc02.author, AUTHOR);
+        let keys: Vec<&str> = pc02.title_bind.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["Champion", "PatchChanges", "PatchReason", "Team"]);
+        assert_eq!(pc02.title_bind[0].1, "tft_maddie");
+        assert!(pc02.title_bind[1].1.starts_with(r##"[{"key":"#asset/base/text/champion?stat.attack""##), "{}", pc02.title_bind[1].1);
+        assert_eq!(pc02.title_bind[2].1, "pma_wr_74,pma_cap");
+        let tail: Vec<(&str, &str)> = pc02.content_bind[4..].iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(
+            tail,
+            [("ContentId", "PC02"), ("SubjectId", "patch:2027-10-01:nerf:tft_maddie"), ("DateKey", "2027-10-01"), ("Scope", "patch"), ("Severity", "article")]
+        );
+        assert_eq!(pc02.plain_title, "麦迪在本次补丁中被削弱");
+        let pc06 = &cards[2];
+        assert_eq!(pc06.title, "#asset/base/text/news?alert.meta.pc06.title.0");
+        assert_eq!(pc06.author, "Bark Knights");
+        let keys: Vec<&str> = pc06.title_bind.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["Team", "Athlete", "Champion", "PatchChanges", "PatchReason"]);
+        assert!(pc06.content_bind.contains(&("SubjectId".into(), "patch:2027-10-01:risk:2240:league_warwick".into())));
+        assert!(pc06.content_bind.contains(&("Severity".into(), "alert".into())));
+        // a champion with no lines (its numbers do not move) gets no card
+        lines.insert("league_kaisa".into(), (Vec::new(), String::new()));
+        assert!(!articles(&round, &lines, "T", &[], &label).iter().any(|a| a.title.contains("pc01")));
     }
 
     #[test]
@@ -556,19 +969,29 @@ mod tests {
         let _ = std::fs::remove_file(&file);
         // no save open: nothing
         assert_eq!(round_for("k".into(), true, true), None);
+        assert_eq!(due_now(Some("1.1"), None), None);
         open_file(file.clone());
         // a save with no round: nothing played, nothing kept
         assert_eq!(round_for("k".into(), true, true), None);
+        assert_eq!(due_now(Some("1.1"), None), Some(Due::First("1.1".into())));
         let mut power = BTreeMap::new();
         power.insert("maddie".to_string(), -10);
         publish(Round { id: 1, version: "1.1".into(), power: power.clone(), ..Round::default() });
+        assert_eq!(view().map(|v| (v.id, v.power.get("maddie").copied())), Some((1, Some(-10))));
         // the server's run takes round 1; the client's run of the same match plays it too
         assert_eq!(round_for("k".into(), true, true).as_deref(), Some(&power));
         assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power));
         // a later round does not change a match already played
         let mut power2 = BTreeMap::new();
         power2.insert("maddie".to_string(), -20);
-        publish(Round { id: 2, version: "1.2".into(), power: power2.clone(), ..Round::default() });
+        publish(Round {
+            id: 2,
+            version: "1.2".into(),
+            power: power2.clone(),
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20 }],
+            ..Round::default()
+        });
+        assert_eq!(view().map(|v| v.steps.get("maddie").copied()), Some(Some(-10)));
         assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power), "a replay plays its own round");
         // a run of a match nothing was kept for (from before): none
         assert_eq!(round_for("other".into(), false, true), None);
@@ -577,8 +1000,10 @@ mod tests {
         assert_eq!(round_for("off".into(), false, true), None);
         // the book survives the session
         close();
+        assert_eq!(view(), None);
         open_file(file.clone());
         assert_eq!(rounds().len(), 2);
+        assert_eq!(view().map(|v| v.id), Some(2));
         assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power));
         assert_eq!(notes().len(), 2);
         let _ = std::fs::remove_file(&file);
@@ -606,12 +1031,14 @@ mod tests {
         let b = buff(-15);
         assert_eq!((b.attack_mult, b.magic_power_mult, b.hp_mult), (-7, -7, -8));
         assert_eq!(b.name(), BUFF);
+        let (d, h) = factors(-15);
+        assert!((d - 0.93).abs() < 1e-9 && (h - 0.92).abs() < 1e-9, "{d} {h}");
         let b = buff(6);
         assert_eq!((b.attack_mult, b.magic_power_mult, b.hp_mult), (3, 3, 3));
     }
 
     #[test]
-    fn a_patch_takes_its_first_round_as_its_notes() {
+    fn each_round_is_a_note_of_its_patch() {
         let round = |id: u32, version: &str, changes: Vec<(&str, i32)>| Round {
             id,
             version: version.into(),
@@ -622,16 +1049,18 @@ mod tests {
             ..Round::default()
         };
         let notes = notes_of(&[round(1, "1.2", vec![("a", -5), ("b", 4)]), round(2, "1.2", vec![("c", -3)]), round(3, "1.3", vec![("a", -2)])]);
-        assert_eq!(notes.len(), 2);
-        assert!(notes[0].is_for("1.2") && notes[0].direction("a") == -1 && notes[0].direction("b") == 1 && notes[0].direction("c") == 0);
-        assert!(notes[1].is_for("1.3") && notes[1].direction("a") == -1);
+        assert_eq!(notes.len(), 3);
+        assert!(notes[0].is_for("1.2") && notes[0].direction("a") == -1 && notes[0].direction("b") == 1);
+        assert!(notes[1].is_for("1.2") && notes[1].direction("c") == -1);
+        assert_eq!(notes[2].version.as_deref(), Some("1.3"));
     }
 
     #[test]
-    fn the_news_lists_nerfs_then_buffs_in_the_games_language() {
+    fn the_plain_news_lists_nerfs_then_buffs_in_the_games_language() {
         let round = Round {
             id: 2,
             version: "2027.4.1".into(),
+            label: "2027.4.1b".into(),
             changes: vec![
                 Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10 },
                 Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6 },
@@ -640,10 +1069,10 @@ mod tests {
         };
         let cn = |n: &str| if n == "tft_maddie" { "麦迪".to_string() } else { "某英雄".to_string() };
         let (title, body) = news(&round, &cn);
-        assert_eq!(title, "智能BP 平衡补丁 2027.4.1（第 2 轮）");
+        assert_eq!(title, "智能BP 平衡补丁 2027.4.1b");
         assert!(body.starts_with("【削弱】\n麦迪：胜率 73.3%（目标 48%–52%）→ 强度 -10%（攻击/法强 -5%，生命 -5%），累计 -10%"), "{body}");
         assert!(body.contains("【加强】\n某英雄：胜率 44.0%"), "{body}");
         let (title, body) = news(&round, &|n: &str| n.to_string());
-        assert!(title.starts_with("Patch Meta AI balance patch 2027.4.1") && body.starts_with("[Nerfs]"), "{title} / {body}");
+        assert!(title == "Patch Meta AI balance patch 2027.4.1b" && body.starts_with("[Nerfs]"), "{title} / {body}");
     }
 }

@@ -44,17 +44,17 @@ fn pct(v: f32) -> f32 {
 
 /// The newest balance round (`balance`, 2.8.0), on a line of its own after the backtest's ("" without one).
 fn balance_line(labels: &Labels) -> String {
-    let rounds = crate::balance::rounds();
-    let Some(r) = rounds.last() else { return String::new() };
+    let Some(r) = crate::balance::latest() else { return String::new() };
     let list: Vec<String> = r
         .changes
         .iter()
         .map(|c| format!("{} {:+}% ({:+}% in all)", labels.champion(&c.champion), c.step, c.total))
         .collect();
     format!(
-        "\nbalance round {} for patch {}: {}",
+        "\nbalance round {} ({}{}): {}",
         r.id,
-        r.version,
+        if r.label.is_empty() { &r.version } else { &r.label },
+        if r.merged { ", in the game's patch notes" } else { "" },
         if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
     )
 }

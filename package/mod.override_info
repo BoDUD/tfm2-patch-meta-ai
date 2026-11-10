@@ -2,5 +2,9 @@
   "asset/base/text/ui": {
     "remapping": "asset/patch_meta_ai/text/ui",
     "type": "merge"
+  },
+  "asset/base/text/news": {
+    "remapping": "asset/patch_meta_ai/text/news",
+    "type": "merge"
   }
 }

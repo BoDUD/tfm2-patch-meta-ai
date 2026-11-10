@@ -61,8 +61,8 @@ pub struct Config {
     /// Teams drafted by the model (AI teams with `ai_bp`, the player's after an auto BP) also
     /// play the strategy the model rates best for their five champions.
     pub ai_tactics: bool,
-    /// This mod makes the balance patches (`balance`, 2.8.0): a round per game patch, the game's own champion
-    /// patches off while it is on.
+    /// This mod makes the balance patches (`balance`, 2.8.0): a round per game patch (written into the game's own
+    /// patch notes), the game's own champion patches off while it is on.
     pub balance: bool,
     /// Champions a round changes at most, and its step at most (percent of power).
     pub balance_count: usize,
@@ -617,16 +617,21 @@ ai_variety=1
 ; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
 ;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。「收官」由各队教练自己选。
 ai_tactics=off
-; balance : this mod makes the balance patches instead of the game. On every new patch the
-;           champions the model rates furthest outside a 48-52% win rate (with enough games,
-;           at most balance_count) get 1.5% of power stronger or weaker for every point outside
-;           (at most balance_max a patch, 30% in all; half on attack / magic power, half on
-;           health), in every match. The notes go to your inbox. While this is on the game's
-;           own champion patches are off (its settings are put back when this is turned off).
-; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。每个新版本，模型认为胜率离 48%–52% 最远的英雄
-;           （场次够的，最多 balance_count 个）每偏 1 个点调 1.5% 的强度（单版最多 balance_max，
-;           累计最多 30%；一半在攻击/法强，一半在生命），所有比赛生效，补丁说明发到收件箱。
-;           开着时游戏自带的英雄补丁关掉（关掉本项时恢复游戏原来的设置）。
+; balance : this mod makes the balance patches instead of the game. On every patch the game
+;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
+;           furthest outside a 48-52% win rate (with enough games, at most balance_count) get
+;           1.5% of power stronger or weaker for every point outside (at most balance_max a
+;           patch, 30% in all; half on attack / magic power, half on health), in every match.
+;           The changes are the game's own patch notes (inbox, patch history), with the patch's
+;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
+;           While this is on the game's own champion patches are off (its settings are put back
+;           when this is turned off).
+; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
+;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个）
+;           每偏 1 个点调 1.5% 的强度（单版最多 balance_max，累计最多 30%；一半在攻击/法强，
+;           一半在生命），所有比赛生效。改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
+;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
+;           （关掉本项时恢复游戏原来的设置）。
 balance=off
 balance_count=10
 balance_max=10
