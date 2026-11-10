@@ -61,6 +61,12 @@ pub struct Config {
     /// Teams drafted by the model (AI teams with `ai_bp`, the player's after an auto BP) also
     /// play the strategy the model rates best for their five champions.
     pub ai_tactics: bool,
+    /// This mod makes the balance patches (`balance`, 2.8.0): a round per game patch, the game's own champion
+    /// patches off while it is on.
+    pub balance: bool,
+    /// Champions a round changes at most, and its step at most (percent of power).
+    pub balance_count: usize,
+    pub balance_max: i32,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -140,6 +146,9 @@ impl Default for Config {
             ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
+            balance: false,
+            balance_count: 10,
+            balance_max: 10,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -271,6 +280,9 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_bp" | "ai_draft" => cfg.ai_bp = flag(value)?,
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
+        "balance" => cfg.balance = flag(value)?,
+        "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 40.0) as usize,
+        "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, 30.0) as i32,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
             cfg.recency = None;
@@ -508,7 +520,8 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
+         balance={} balance_count={} balance_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -552,7 +565,10 @@ pub fn summary(c: &Config) -> String {
         if c.lane_tags { "on" } else { "off" },
         c.panel_opacity,
         if c.meta_page { "on" } else { "off" },
-        if c.explore { "on" } else { "off" }
+        if c.explore { "on" } else { "off" },
+        if c.balance { "on" } else { "off" },
+        c.balance_count,
+        c.balance_max
     )
 }
 
@@ -601,6 +617,19 @@ ai_variety=1
 ; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
 ;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。「收官」由各队教练自己选。
 ai_tactics=off
+; balance : this mod makes the balance patches instead of the game. On every new patch the
+;           champions the model rates furthest outside a 48-52% win rate (with enough games,
+;           at most balance_count) get 1.5% of power stronger or weaker for every point outside
+;           (at most balance_max a patch, 30% in all; half on attack / magic power, half on
+;           health), in every match. The notes go to your inbox. While this is on the game's
+;           own champion patches are off (its settings are put back when this is turned off).
+; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。每个新版本，模型认为胜率离 48%–52% 最远的英雄
+;           （场次够的，最多 balance_count 个）每偏 1 个点调 1.5% 的强度（单版最多 balance_max，
+;           累计最多 30%；一半在攻击/法强，一半在生命），所有比赛生效，补丁说明发到收件箱。
+;           开着时游戏自带的英雄补丁关掉（关掉本项时恢复游戏原来的设置）。
+balance=off
+balance_count=10
+balance_max=10
 tier_list=auto
 
 [model]

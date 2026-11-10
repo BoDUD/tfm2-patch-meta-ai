@@ -2,6 +2,10 @@
 //! `champion_tiers` (records can only be changed on the management server; the change reaches
 //! the client with the next in-game day).
 //!
+//! The balance patches' server half (2.8.0, `apply_balance`): with `balance` on, the save's own auto-patcher makes no
+//! champion change (every count zero; its values kept in the save to put back when `balance` is turned off), and
+//! each new round's notes go to the player's inbox once.
+//!
 //! Game 0.6 stores `champion_tiers` as `{"<champion>": "S" | "A" | "B" | "C" | "D" | "NoTier"}`.
 //! A write the game's schema rejects changes nothing, so when the whole object is refused this
 //! tries the same list without `NoTier`, then champion by champion, and says in `diag.log` what
@@ -10,7 +14,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
-use mod_api_stable::{CommandResultV1, StableCommand, StableServerCtx, StableServerExtension};
+use mod_api_stable::{CommandResultV1, SettingTargetV1, StableCommand, StableServerCtx, StableServerExtension};
 use serde_json::{Map, Value};
 
 use crate::diag;
@@ -19,6 +23,14 @@ use crate::records::{kind, top_keys};
 pub const APPLY_TIERS: &str = "apply_tiers";
 pub const RESULT_EVENT: &str = "apply_tiers_result";
 pub const FIELD: &str = "champion_tiers";
+/// The balance patches (2.8.0): the request, the answer.
+pub const APPLY_BALANCE: &str = "apply_balance";
+pub const BALANCE_RESULT: &str = "apply_balance_result";
+/// The save's own auto-patcher values while the balance has them off, and the newest round put in the news.
+const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
+const NEWS_DONE: &str = "pma_balance_news";
+/// The news' author.
+const AUTHOR: &str = "智能BP / Patch Meta AI";
 
 pub struct ServerExt;
 
@@ -31,6 +43,19 @@ pub fn reset_for_tests() {
 
 impl StableServerExtension for ServerExt {
     fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
+        if cmd.command == APPLY_BALANCE {
+            let reply = cmd.reply_target();
+            let (state, ok, detail) = match BalanceRequest::parse(cmd.payload, cmd.sender_team_id) {
+                Ok(req) => {
+                    let (ok, detail) = balance(ctx, &req);
+                    (format!("{}/{}", u8::from(req.off), req.round), ok, detail)
+                }
+                Err(why) => (String::new(), false, why),
+            };
+            let message = format!("{state}\t{}\t{detail}", if ok { "ok" } else { "fail" });
+            ctx.emit_event(reply, BALANCE_RESULT, message.as_bytes());
+            return CommandResultV1::Handled;
+        }
         if cmd.command != APPLY_TIERS {
             return CommandResultV1::Pass;
         }
@@ -237,6 +262,142 @@ fn probe(docs: &impl TeamDocs, team: usize, existing: Option<&Value>) {
     diag::log(&format!("[server] probe: team {team} {FIELD} is {text}"));
 }
 
+// ===================== the balance patches (2.8.0) =====================
+
+/// What the client sends: `v1`, team id, `1` (the game's champion patches off) or `0` (put back), the newest round,
+/// its news title, then the news lines.
+#[derive(Debug, PartialEq)]
+pub struct BalanceRequest {
+    pub team: usize,
+    pub off: bool,
+    pub round: u32,
+    pub title: String,
+    pub content: String,
+}
+
+impl BalanceRequest {
+    pub fn parse(payload: &[u8], sender_team: Option<usize>) -> Result<BalanceRequest, String> {
+        let text = String::from_utf8_lossy(payload);
+        let mut lines = text.split('\n');
+        if lines.next().map(str::trim) != Some("v1") {
+            return Err("unknown format".to_string());
+        }
+        let team = lines.next().and_then(|l| l.trim().parse::<usize>().ok()).or(sender_team).ok_or("no team id")?;
+        let off = lines.next().map(str::trim) == Some("1");
+        let round = lines.next().and_then(|l| l.trim().parse::<u32>().ok()).unwrap_or(0);
+        let title = lines.next().unwrap_or("").trim().to_string();
+        let content = lines.collect::<Vec<_>>().join("\n");
+        Ok(BalanceRequest { team, off, round, title, content })
+    }
+}
+
+/// The part of the server context the balance needs (so tests can run it without a game).
+pub trait BalanceHost {
+    fn autopatch(&self) -> Option<String>;
+    fn set_autopatch(&mut self, json: &str) -> bool;
+    fn saved(&self, key: &str) -> Option<String>;
+    fn set_saved(&mut self, key: &str, value: Option<&str>) -> bool;
+    fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool;
+}
+
+impl BalanceHost for StableServerCtx<'_> {
+    fn autopatch(&self) -> Option<String> {
+        self.setting_get_json(SettingTargetV1::AutoPatch, "")
+    }
+    fn set_autopatch(&mut self, json: &str) -> bool {
+        self.setting_set_json(SettingTargetV1::AutoPatch, "", json)
+    }
+    fn saved(&self, key: &str) -> Option<String> {
+        self.save_get_string(key)
+    }
+    fn set_saved(&mut self, key: &str, value: Option<&str>) -> bool {
+        match value {
+            Some(v) => self.save_set_string(key, v),
+            None => self.save_remove_key(key),
+        }
+    }
+    fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool {
+        self.news_push(team, title, content, AUTHOR)
+    }
+}
+
+/// The auto-patcher's settings with no champion change: every `*_count` zero. A document of zeros reads as unset (the
+/// game's defaults), so a threshold stays as it was - or, all of them zero too, one is set where it changes nothing.
+pub fn champion_patches_off(doc: &Value) -> Option<Value> {
+    let Value::Object(map) = doc else { return None };
+    let mut out = map.clone();
+    for (k, v) in out.iter_mut() {
+        if k.ends_with("_count") && v.is_number() {
+            *v = Value::from(0);
+        }
+    }
+    let all_zero = out.values().all(|v| v.as_f64() == Some(0.0));
+    if all_zero {
+        let key = ["repeat_high_streak_threshold", "repeat_medium_streak_threshold", "meta_stale_high_threshold"]
+            .into_iter()
+            .find(|k| out.contains_key(*k))
+            .map(str::to_string)
+            .or_else(|| out.keys().find(|k| !k.ends_with("_count")).cloned())?;
+        out.insert(key, Value::from(99));
+    }
+    Some(Value::Object(out))
+}
+
+/// One request: the game's champion patches off (its values kept) or put back, and the round's news once.
+pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, String) {
+    let mut said = Vec::new();
+    let mut ok = true;
+    if req.off {
+        match host.autopatch().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+            Some(doc) => match champion_patches_off(&doc) {
+                Some(off) if off == doc => said.push("the game's champion patches already off".to_string()),
+                Some(off) => {
+                    if host.saved(AUTOPATCH_KEPT).is_none() {
+                        host.set_saved(AUTOPATCH_KEPT, Some(&doc.to_string()));
+                    }
+                    if host.set_autopatch(&off.to_string()) {
+                        diag::log(&format!("[balance] the game's auto-patcher was {doc}; its champion counts now zero: {off}"));
+                        said.push("the game's champion patches turned off".to_string());
+                    } else {
+                        ok = false;
+                        said.push(format!("the game refused the auto-patcher settings {off}"));
+                    }
+                }
+                None => {
+                    ok = false;
+                    said.push(format!("the auto-patcher settings are not an object: {doc}"));
+                }
+            },
+            None => {
+                ok = false;
+                said.push("the auto-patcher settings are not readable".to_string());
+            }
+        }
+        let done = host.saved(NEWS_DONE).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+        if req.round > done && !req.title.is_empty() {
+            if host.push_news(req.team, &req.title, &req.content) {
+                host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
+                said.push(format!("round {} in the news", req.round));
+            } else {
+                ok = false;
+                said.push(format!("the news of round {} was refused", req.round));
+            }
+        }
+    } else if let Some(kept) = host.saved(AUTOPATCH_KEPT) {
+        if host.set_autopatch(&kept) {
+            host.set_saved(AUTOPATCH_KEPT, None);
+            diag::log(&format!("[balance] the game's auto-patcher put back: {kept}"));
+            said.push("the game's champion patches put back".to_string());
+        } else {
+            ok = false;
+            said.push("the game refused its own auto-patcher settings back".to_string());
+        }
+    } else {
+        said.push("nothing to put back".to_string());
+    }
+    (ok, said.join("; "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +490,102 @@ mod tests {
         assert!(out.ok, "{}", out.detail);
         assert!(out.detail.contains("1/3 written one by one") && out.detail.contains("ninja=S"), "{}", out.detail);
         assert_eq!(t.doc[FIELD]["fighter"], "B");
+    }
+
+    #[derive(Default)]
+    struct Host {
+        autopatch: Option<String>,
+        saved: BTreeMap<String, String>,
+        news: Vec<(usize, String, String)>,
+        refuse: bool,
+    }
+
+    impl BalanceHost for Host {
+        fn autopatch(&self) -> Option<String> {
+            self.autopatch.clone()
+        }
+        fn set_autopatch(&mut self, json: &str) -> bool {
+            if self.refuse {
+                return false;
+            }
+            self.autopatch = Some(json.to_string());
+            true
+        }
+        fn saved(&self, key: &str) -> Option<String> {
+            self.saved.get(key).cloned()
+        }
+        fn set_saved(&mut self, key: &str, value: Option<&str>) -> bool {
+            match value {
+                Some(v) => self.saved.insert(key.to_string(), v.to_string()),
+                None => self.saved.remove(key),
+            };
+            true
+        }
+        fn push_news(&mut self, team: usize, title: &str, content: &str) -> bool {
+            self.news.push((team, title.to_string(), content.to_string()));
+            true
+        }
+    }
+
+    fn breq(off: bool, round: u32) -> BalanceRequest {
+        BalanceRequest { team: 3, off, round, title: format!("round {round}"), content: "a\nb".into() }
+    }
+
+    #[test]
+    fn the_balance_request_round_trips() {
+        let payload = "v1\n3\n1\n2\n智能BP 平衡补丁 2027.4.1（第 2 轮）\n【削弱】\n麦迪：…";
+        let req = BalanceRequest::parse(payload.as_bytes(), None).unwrap();
+        assert_eq!((req.team, req.off, req.round), (3, true, 2));
+        assert_eq!(req.title, "智能BP 平衡补丁 2027.4.1（第 2 轮）");
+        assert_eq!(req.content, "【削弱】\n麦迪：…");
+        assert!(BalanceRequest::parse(b"v9\n3", None).is_err());
+    }
+
+    #[test]
+    fn the_counts_go_to_zero_and_a_threshold_stays() {
+        let doc: Value = serde_json::from_str(
+            r#"{"major_strong_nerf_count":2,"minor_weak_buff_count":3,"meta_stale_high_threshold":4,"repeat_high_streak_threshold":0}"#,
+        )
+        .unwrap();
+        let off = champion_patches_off(&doc).unwrap();
+        assert_eq!(off["major_strong_nerf_count"], 0);
+        assert_eq!(off["minor_weak_buff_count"], 0);
+        assert_eq!(off["meta_stale_high_threshold"], 4, "kept: the document is not all zeros");
+        // all zeros (the game's defaults): a threshold is set so it does not read as unset
+        let zeros: Value = serde_json::from_str(r#"{"major_strong_nerf_count":0,"repeat_high_streak_threshold":0}"#).unwrap();
+        let off = champion_patches_off(&zeros).unwrap();
+        assert_eq!(off["repeat_high_streak_threshold"], 99);
+        assert!(champion_patches_off(&Value::from(3)).is_none());
+    }
+
+    #[test]
+    fn on_keeps_the_games_values_and_news_once_off_puts_them_back() {
+        let original = r#"{"major_strong_nerf_count":2,"meta_stale_high_threshold":4}"#;
+        let mut host = Host { autopatch: Some(original.into()), ..Host::default() };
+        let (ok, said) = balance(&mut host, &breq(true, 1));
+        assert!(ok, "{said}");
+        assert!(host.autopatch.as_deref().unwrap().contains(r#""major_strong_nerf_count":0"#));
+        let kept: Value = serde_json::from_str(host.saved.get(AUTOPATCH_KEPT).unwrap()).unwrap();
+        assert_eq!(kept, serde_json::from_str::<Value>(original).unwrap(), "the game's own values kept");
+        assert_eq!(host.news.len(), 1);
+        // the same round again (a new session): no second news, the values kept from the first time
+        let (ok, said) = balance(&mut host, &breq(true, 1));
+        assert!(ok && said.contains("already off"), "{said}");
+        assert_eq!(host.news.len(), 1);
+        // the next round: its news
+        balance(&mut host, &breq(true, 2));
+        assert_eq!(host.news.len(), 2);
+        assert_eq!(host.news[1].1, "round 2");
+        // off: the game's own values back, nothing kept any more
+        let (ok, said) = balance(&mut host, &breq(false, 2));
+        assert!(ok, "{said}");
+        let back: Value = serde_json::from_str(host.autopatch.as_deref().unwrap()).unwrap();
+        assert_eq!(back["major_strong_nerf_count"], 2);
+        assert!(!host.saved.contains_key(AUTOPATCH_KEPT));
+        let (_, said) = balance(&mut host, &breq(false, 2));
+        assert_eq!(said, "nothing to put back");
+        // a refusal is said and retried
+        let mut host = Host { autopatch: Some(original.into()), refuse: true, ..Host::default() };
+        assert!(!balance(&mut host, &breq(true, 1)).0);
     }
 }

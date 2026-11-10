@@ -203,6 +203,8 @@ struct State {
     /// The tier plan was built after every listed record had been read.
     plan_complete: bool,
     tiers: TierSync,
+    /// The balance patches' state on the server (2.8.0).
+    balance: BalanceSync,
     names: Names,
     worker: Option<Worker>,
     /// Rebuilds submitted, and the one a result has to match to count.
@@ -254,6 +256,7 @@ impl State {
             files_written_at: None,
             last_summary: String::new(),
             plan_complete: false,
+            balance: BalanceSync::default(),
             tiers: TierSync::default(),
             names: Names::default(),
             worker: None,
@@ -302,6 +305,7 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
             }
             *st = State::new();
             shared::clear();
+            crate::balance::close();
         }
         return;
     }
@@ -309,7 +313,7 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
     config::refresh(now);
     let cfg = config::get();
     // the model is needed by any of the features, not only the two that change the game
-    if !cfg.ban_pick_on() && !cfg.tier_list_on() && !cfg.draft_overlay && !cfg.report {
+    if !cfg.ban_pick_on() && !cfg.tier_list_on() && !cfg.draft_overlay && !cfg.report && !cfg.balance {
         if shared::get().is_some() {
             shared::clear();
         }
@@ -358,6 +362,8 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
                     st.cache_pending = Some(games);
                 }
             }
+            // this save's balance patches (2.8.0)
+            crate::balance::open(identity.0, &identity.1);
             st.save = Some(identity);
         }
     }
@@ -416,10 +422,12 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     // the tier list goes out once it was built from the whole backlog, not after every
     // partial rebuild while the save is still being read
+    let events = game.take_events();
     if cfg.tier_list_on() {
         let complete = st.plan_complete;
-        sync_tiers(st, game, team, now, complete);
+        sync_tiers(st, game, team, now, complete, &events);
     }
+    sync_balance(st, game, cfg, team, now, &events);
 }
 
 fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
@@ -914,7 +922,11 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         names: st.names.clone(),
         champions: st.champions.clone(),
         stats: st.stats.clone(),
-        notes: st.notes.clone(),
+        notes: {
+            let mut notes = st.notes.clone();
+            notes.extend(crate::balance::notes());
+            notes
+        },
         current,
         settings: cfg.model(),
         backtest,
@@ -1077,13 +1089,13 @@ const MAX_RESENDS: u32 = 3;
 /// Shortest time between two tier lists sent to the server.
 const SEND_GAP: Duration = Duration::from_secs(10);
 
-fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, plan_complete: bool) {
+fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, plan_complete: bool, events: &[(String, Vec<u8>)]) {
     let sync = &mut st.tiers;
-    for (event, payload) in game.take_events() {
+    for (event, payload) in events {
         if event != RESULT_EVENT {
             continue;
         }
-        let text = String::from_utf8_lossy(&payload);
+        let text = String::from_utf8_lossy(payload);
         let mut parts = text.splitn(3, '\t');
         let (hash, ok, detail) = (parts.next().unwrap_or(""), parts.next() == Some("ok"), parts.next().unwrap_or(""));
         let Some((sent, _)) = sync.waiting else { continue };
@@ -1149,6 +1161,101 @@ fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, p
         sync.failures += 1;
         sync.retry_at = Some(now + backoff(sync.failures));
         diag::log_once("send-failed", "could not send the tier list to the server (will retry)");
+    }
+}
+
+/// The balance patches on the server (2.8.0): what it confirmed (the game's champion patches off, the newest round
+/// in the news), the request waiting for its answer, retries.
+#[derive(Default)]
+struct BalanceSync {
+    acked: Option<(bool, u32)>,
+    waiting: Option<(bool, u32, Instant)>,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+/// The balance patches (`balance`): a new round when one is due (from a model built on the whole backlog), and the
+/// server told - the game's own champion patches off while this is on (put back when it is off) and each new
+/// round's news in the player's inbox.
+fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, events: &[(String, Vec<u8>)]) {
+    for (event, payload) in events {
+        if event != crate::server::BALANCE_RESULT {
+            continue;
+        }
+        let text = String::from_utf8_lossy(payload);
+        let mut parts = text.splitn(3, '\t');
+        let (state, ok, detail) = (parts.next().unwrap_or(""), parts.next() == Some("ok"), parts.next().unwrap_or(""));
+        let Some((off, round, _)) = st.balance.waiting else { continue };
+        if state != format!("{}/{round}", u8::from(off)) {
+            continue;
+        }
+        st.balance.waiting = None;
+        if ok {
+            st.balance.acked = Some((off, round));
+            st.balance.failures = 0;
+            diag::log(&format!("[balance] the server: {detail}"));
+        } else {
+            st.balance.failures += 1;
+            st.balance.retry_at = Some(now + backoff(st.balance.failures));
+            diag::log(&format!("[balance] the server refused ({detail}); trying again later"));
+        }
+    }
+    if let Some((_, _, at)) = st.balance.waiting {
+        if now.duration_since(at) > REPLY_TIMEOUT {
+            st.balance.waiting = None;
+            st.balance.failures += 1;
+            st.balance.retry_at = Some(now + backoff(st.balance.failures));
+            diag::log("[balance] no answer from the server; trying again later");
+        }
+    }
+    // a new round when one is due
+    if cfg.balance && st.plan_complete {
+        if let Some(snapshot) = shared::get() {
+            let latest = crate::balance::latest();
+            let rules = crate::balance::Rules { count: cfg.balance_count, max_step: cfg.balance_max };
+            if let Some(round) = crate::balance::next_round(&snapshot.meta, latest.as_ref(), rules) {
+                let list: Vec<String> = round.changes.iter().map(|c| format!("{} {:+} ({:.1}%)", c.champion, c.step, c.win)).collect();
+                diag::log(&format!(
+                    "[balance] round {} for patch {} ({} matches): {}",
+                    round.id,
+                    round.version,
+                    round.matches,
+                    if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
+                ));
+                crate::balance::publish(round);
+                // the model takes the round as the patch's notes
+                st.dirty = true;
+            }
+        }
+    }
+    // the server: nothing to say on a save that never had a round with this off
+    let Some(newest) = crate::balance::latest() else {
+        if !cfg.balance {
+            return;
+        }
+        // on, no round yet: the game's champion patches off already
+        return send_balance(st, game, team, now, (true, 0), None);
+    };
+    let want = if cfg.balance { (true, newest.id) } else { (false, st.balance.acked.map_or(newest.id, |a| a.1)) };
+    if st.balance.acked == Some(want) {
+        return;
+    }
+    let news = cfg.balance.then(|| crate::balance::news(&newest, &|n: &str| st.labels.champion(n)));
+    send_balance(st, game, team, now, want, news);
+}
+
+fn send_balance(st: &mut State, game: &mut impl Game, team: usize, now: Instant, want: (bool, u32), news: Option<(String, String)>) {
+    if st.balance.acked == Some(want) || st.balance.waiting.is_some() || !due(st.balance.retry_at, now) {
+        return;
+    }
+    let (title, content) = news.unwrap_or_default();
+    let payload = format!("v1\n{team}\n{}\n{}\n{}\n{}", u8::from(want.0), want.1, title.replace('\n', " "), content);
+    if game.send_command(crate::server::APPLY_BALANCE, payload.as_bytes()) {
+        st.balance.waiting = Some((want.0, want.1, now));
+    } else {
+        st.balance.failures += 1;
+        st.balance.retry_at = Some(now + backoff(st.balance.failures));
+        diag::log_once("balance-send-failed", "[balance] could not send to the server (will retry)");
     }
 }
 

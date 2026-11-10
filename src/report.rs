@@ -42,11 +42,28 @@ fn pct(v: f32) -> f32 {
     (v * 1000.0).round() / 10.0
 }
 
+/// The newest balance round (`balance`, 2.8.0), on a line of its own after the backtest's ("" without one).
+fn balance_line(labels: &Labels) -> String {
+    let rounds = crate::balance::rounds();
+    let Some(r) = rounds.last() else { return String::new() };
+    let list: Vec<String> = r
+        .changes
+        .iter()
+        .map(|c| format!("{} {:+}% ({:+}% in all)", labels.champion(&c.champion), c.step, c.total))
+        .collect();
+    format!(
+        "\nbalance round {} for patch {}: {}",
+        r.id,
+        r.version,
+        if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
+    )
+}
+
 pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summary: &str, bt: Option<&Backtest>) -> String {
     let mut rows: Vec<_> = meta.champions.iter().collect();
     rows.sort_by(|a, b| b.cautious().partial_cmp(&a.cautious()).unwrap_or(std::cmp::Ordering::Equal));
     let mut out = format!(
-        "{} {} - patch {}\n{summary}\n{}\n\n\
+        "{} {} - patch {}\n{summary}\n{}{}\n\n\
          tier   = tier from the model (- = not enough recent games)\n\
          win%   = estimated win rate this patch with average team-mates and players, +- one sd\n\
          prev   = the same in the patch before\n\
@@ -56,6 +73,7 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
         crate::VERSION,
         meta.current,
         bt.map_or(String::new(), backtest_line),
+        balance_line(labels),
     );
     out.push_str(&format!(
         "{:<22} {:>4} {:>12} {:>6} {:>11} {:>6} {:>5} {:>5}  {:<29} {}\n",
