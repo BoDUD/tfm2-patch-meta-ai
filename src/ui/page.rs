@@ -1,6 +1,7 @@
-//! The Meta Analysis page: an entry of its own in the management screen's left menu (under
-//! the gaming house), opening a full page over the right-hand content in the look of the
-//! game's statistics screen:
+//! The Meta Analysis page: an entry of its own in the management screen's left menu (under its
+//! last category, or - the menu full since game 0.7.1 added the gaming house - in the right half of
+//! its bottom row, beside the home button), opening a full page over the right-hand content in the
+//! look of the game's statistics screen:
 //!
 //! - **Champions**: every champion this patch - tier, estimated win rate, change since the last
 //!   patch, games, pick / ban / presence, best lanes, last balance change. Headers sort, the
@@ -49,6 +50,10 @@ const SCREEN: &str = "main.pma_page.screen";
 const BODY: &str = "main.pma_page.screen.body";
 const LIST: &str = "main.pma_page.screen.body.data.list.contents";
 const LEFT_MENU: &str = "main.top.left";
+/// The classic menu's home button, anchored at the bottom of the panel.
+const MENU_HOME: &str = "main.top.left.home";
+/// The classic entry as a row of its own: a separator and a 48 px button.
+const NAV_H: u32 = 52;
 const RIGHT: &str = "main.top.right";
 /// Only in the new UI's left menu (game 0.7.0).
 const NEW_MENU: &str = "main.top.left.team_header";
@@ -320,6 +325,8 @@ pub struct MetaPage {
     /// new UI's title bar.
     menu: Menu,
     nav_at: Option<Slot>,
+    /// Where the entry was put in the classic left menu (2.7.15).
+    classic_at: Option<Classic>,
     next_place: u64,
     registered: HashSet<String>,
 }
@@ -351,6 +358,56 @@ struct Slot {
     x: i32,
     y: i32,
     compact: bool,
+}
+
+/// Where the entry is in the classic left menu (2.7.15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Classic {
+    /// A row of its own under the menu's last category, from this `y`.
+    Below(i32),
+    /// The right half of the menu's bottom row (the home button's icon and name are on its left): x, y,
+    /// width, height.
+    Beside(i32, i32, u32, u32),
+}
+
+/// Where the entry goes in the classic left menu. The menu is a column of categories with the home
+/// button anchored at the bottom: a row of its own under the last category when the gap above the
+/// home button holds one (game 0.7.0: y 969); game 0.7.1 added the gaming house (战队基地,
+/// `house_category`) and the column reaches the home button, so the entry takes the right half of the
+/// home button's row (2.7.15; the user: 「版本分析和战队基地的那个ui重合了」 - it was drawn over the
+/// house). None until the menu is laid out: no rectangles yet.
+fn classic_slot(ui: &impl Ui) -> Option<Classic> {
+    let bottom = ui
+        .children(LEFT_MENU)
+        .iter()
+        .filter(|c| c.as_str() != "home")
+        .filter_map(|c| ui.rect(&format!("{LEFT_MENU}.{c}")))
+        .filter(|r| r.2 > 0.0 && r.3 > 0.0)
+        .map(|r| r.1 + r.3)
+        .fold(0.0_f32, f32::max);
+    if bottom <= 0.0 {
+        return None;
+    }
+    let below = (bottom + 2.0).round() as i32;
+    match ui.rect(MENU_HOME).filter(|r| r.2 > 0.0 && r.3 > 0.0) {
+        Some((x, y, w, h)) if y < (below + NAV_H as i32) as f32 => {
+            let half = (w / 2.0).round();
+            Some(Classic::Beside((x + half).round() as i32, y.round() as i32, (w - half) as u32, h.round() as u32))
+        }
+        _ => Some(Classic::Below(below)),
+    }
+}
+
+/// The classic menu's nodes as the game laid them out (diag.log, once): name and rectangle.
+fn describe_left_menu(ui: &impl Ui) -> String {
+    ui.children(LEFT_MENU)
+        .iter()
+        .map(|c| {
+            let r = ui.rect(&format!("{LEFT_MENU}.{c}")).unwrap_or_default();
+            format!("{c} ({:.0},{:.0} {:.0}x{:.0})", r.0, r.1, r.2, r.3)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Where a label's text ends: its rectangle, cut to what its text needs when the text is written
@@ -452,6 +509,7 @@ impl Default for MetaPage {
             nav_lit: None,
             menu: Menu::Classic,
             nav_at: None,
+            classic_at: None,
             next_place: 0,
             registered: HashSet::new(),
         }
@@ -519,7 +577,12 @@ impl MetaPage {
                 self.next_place = frame + HEAL_EVERY;
                 bar_nav_source(&text, at)
             } else {
-                nav_source(&text)
+                // the menu is laid out a frame after the screen too
+                let Some(at) = classic_slot(ui) else { return };
+                crate::diag::log_once("page-left-menu", &format!("[page] left menu: {} -> {at:?}", describe_left_menu(ui)));
+                self.classic_at = Some(at);
+                self.next_place = frame + HEAL_EVERY;
+                nav_source(&text, at)
             };
             if !ui.spawn("main", &source) {
                 return;
@@ -543,6 +606,13 @@ impl MetaPage {
                 }
                 self.nav_at = Some(at);
                 ui.set_properties(NAV, &format!("x: {}px; y: {}px;", at.x, at.y));
+            }
+        } else if menu == Menu::Classic && frame >= self.next_place {
+            self.next_place = frame + HEAL_EVERY;
+            if classic_slot(ui).is_some_and(|at| self.classic_at != Some(at)) {
+                // the menu laid out otherwise: made again in its new place on the next frame
+                ui.remove(NAV);
+                return;
             }
         }
 
@@ -882,12 +952,37 @@ fn nav_style(lit: bool) -> String {
     format!("btn: {{ color: {}; }} hover: {{ btn: {{ color: {}; }} }}", color(fill), color(if lit { BORDER } else { 0x23253380 }))
 }
 
-/// The left-menu entry: a separator and a button laid out like the game's menu entries (icon at
-/// 24, text at 56), under the house. Not the game's `main_left_button` runner: game code expects
-/// every one of those to belong to one of its own screens and panics on any other.
-fn nav_source(text: &str) -> String {
+/// The left-menu entry. A row of its own ([`Classic::Below`]): a separator and a button laid out like
+/// the game's menu entries (icon at 24, text at 56). Beside the home button ([`Classic::Beside`]): a
+/// thin divider and a button over the right half of that row, its name shrunk to fit. Not the game's
+/// `main_left_button` runner: game code expects every one of those to belong to one of its own
+/// screens and panics on any other.
+fn nav_source(text: &str, at: Classic) -> String {
+    let (x, y, w, h) = match at {
+        Classic::Below(y) => (0, y, 264, NAV_H),
+        Classic::Beside(x, y, w, h) => (x, y, w, h),
+    };
+    if let Classic::Beside(..) = at {
+        return format!(
+            "pma_nav:empty {{ x: {x}px; y: {y}px; width: {w}px; height: {h}px; \
+             #bar:color {{ x: 0px; y: 12px; width: 1px; height: {}px; color: #a6a6a6ff; ignore_event: true; }} \
+             #button:color_icon_button {{ x: 1px; width: {}px; height: {h}px; {} \
+             hover_sound: \"asset/base/sound/sfx/UI_mouse_hover\"; click_sound: \"asset/base/sound/sfx/UI_mouse_click\"; \
+             #icon:image {{ x: 12px; y: {}px; width: 24px; height: 24px; ignore_event: true; color: #a5a5abff; \
+             source: \"asset/base/ui/icons/chart\"; }} \
+             #text:label {{ @\"asset/base/style/main#label\"; x: 44px; y: {}px; width: {}px; height: 20px; align_x: Left; \
+             align_y: Center; size: 18; fit_width: true; ignore_event: true; color: #a5a5abff; text: {}; }} }} }}",
+            h.saturating_sub(24),
+            w.saturating_sub(1),
+            nav_style(false),
+            h.saturating_sub(24) / 2,
+            h.saturating_sub(20) / 2,
+            w.saturating_sub(52),
+            quote(text)
+        );
+    }
     format!(
-        "pma_nav:empty {{ x: 0px; y: 969px; width: 264px; height: 52px; \
+        "pma_nav:empty {{ x: {x}px; y: {y}px; width: {w}px; height: {h}px; \
          #bar:color {{ x: 24px; y: 0px; width: 215px; height: 1px; color: #a6a6a6ff; ignore_event: true; }} \
          #button:color_icon_button {{ y: 4px; width: 264px; height: 48px; {} \
          hover_sound: \"asset/base/sound/sfx/UI_mouse_hover\"; click_sound: \"asset/base/sound/sfx/UI_mouse_click\"; \
@@ -1546,9 +1641,14 @@ mod tests {
         let mut ui = FakeUi::default();
         ui.add("main", "main_ui");
         ui.add("main.top.left", "color");
-        ui.add("main.top.left.etc_category", "empty");
+        // the classic menu as game 0.7.1 lays it out: the column down to the gaming house, the home
+        // button anchored at the bottom
+        ui.add("main.top.left.etc_category", "empty").rect = (0.0, 811.0, 264.0, 152.0);
         ui.add("main.top.left.etc_category.statistics", "main_left_button");
+        ui.add("main.top.left.bar6", "color").rect = (24.0, 966.0, 215.0, 1.0);
+        ui.add("main.top.left.house_category", "empty").rect = (0.0, 970.0, 264.0, 48.0);
         ui.add("main.top.left.house_category.house", "main_left_button");
+        ui.add(MENU_HOME, "empty").rect = (0.0, 1032.0, 264.0, 48.0);
         ui.add(RIGHT, "empty");
         ui
     }
@@ -1807,11 +1907,55 @@ mod tests {
         let mut ui = management();
         let mut page = MetaPage::default();
         frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
-        assert!(ui.spawned[0].1.starts_with("pma_nav:empty { x: 0px; y: 969px; width: 264px; height: 52px;"));
+        // game 0.7.1's menu is full down to the home button: the right half of its row (2.7.15)
+        assert!(ui.spawned[0].1.starts_with("pma_nav:empty { x: 132px; y: 1032px; width: 132px; height: 48px;"), "{}", ui.spawned[0].1);
         ui.click(&format!("{NAV}.button"));
         frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
         let frame_src = &ui.spawned.iter().find(|(_, src)| src.starts_with("pma_page")).unwrap().1;
         assert!(frame_src.starts_with("pma_page:color { x: 264px; y: 0px; width: 1656px; height: 992px;"), "{frame_src}");
+    }
+
+    #[test]
+    fn the_classic_entry_takes_the_free_place_in_the_left_menu() {
+        let _serial = crate::tests::serial();
+        let _ = take_clicks();
+        let s = snapshot();
+        let context = Context::default();
+        let nav = |ui: &FakeUi| ui.spawned.iter().rev().find(|(_, src)| src.starts_with("pma_nav")).map(|(_, src)| src.clone()).unwrap();
+
+        // game 0.7.0: no gaming house, a gap above the home button - a row of its own under the last bar
+        let mut ui = management();
+        ui.nodes.remove("main.top.left.house_category");
+        ui.nodes.remove("main.top.left.house_category.house");
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        assert!(nav(&ui).starts_with("pma_nav:empty { x: 0px; y: 969px; width: 264px; height: 52px;"), "{}", nav(&ui));
+        assert!(nav(&ui).contains("#bar:color { x: 24px; y: 0px; width: 215px;"), "the separator over the row");
+
+        // the menu not laid out yet: no entry until it is
+        let mut ui = management();
+        for path in ["main.top.left.etc_category", "main.top.left.bar6", "main.top.left.house_category", MENU_HOME] {
+            ui.nodes.get_mut(path).unwrap().rect = (0.0, 0.0, 0.0, 0.0);
+        }
+        let mut page = MetaPage::default();
+        frame(&mut page, &mut ui, 1, &s, &context, "Main/Home");
+        assert!(!ui.exists(NAV), "no place yet");
+        ui.nodes.get_mut("main.top.left.etc_category").unwrap().rect = (0.0, 811.0, 264.0, 152.0);
+        ui.nodes.get_mut("main.top.left.bar6").unwrap().rect = (24.0, 966.0, 215.0, 1.0);
+        ui.nodes.get_mut("main.top.left.house_category").unwrap().rect = (0.0, 970.0, 264.0, 48.0);
+        ui.nodes.get_mut(MENU_HOME).unwrap().rect = (0.0, 1032.0, 264.0, 48.0);
+        frame(&mut page, &mut ui, 2, &s, &context, "Main/Home");
+        assert!(nav(&ui).starts_with("pma_nav:empty { x: 132px; y: 1032px; width: 132px; height: 48px;"), "{}", nav(&ui));
+        // beside the home button: a divider, the name shrunk to fit the half row
+        assert!(nav(&ui).contains("#bar:color { x: 0px; y: 12px; width: 1px; height: 24px;"), "{}", nav(&ui));
+        assert!(nav(&ui).contains("width: 80px; height: 20px;") && nav(&ui).contains("fit_width: true"), "{}", nav(&ui));
+
+        // the menu laid out otherwise later (the gaming house hidden): the entry moves to the free row
+        ui.nodes.get_mut("main.top.left.house_category").unwrap().rect = (0.0, 0.0, 0.0, 0.0);
+        frame(&mut page, &mut ui, 2 + HEAL_EVERY, &s, &context, "Main/Home");
+        assert!(!ui.exists(NAV), "taken away to be made again");
+        frame(&mut page, &mut ui, 3 + HEAL_EVERY, &s, &context, "Main/Home");
+        assert!(nav(&ui).starts_with("pma_nav:empty { x: 0px; y: 969px;"), "{}", nav(&ui));
     }
 
     #[test]
