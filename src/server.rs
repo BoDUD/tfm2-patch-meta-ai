@@ -14,14 +14,17 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use mod_api_stable::{CommandResultV1, SettingTargetV1, StableCommand, StableServerCtx, StableServerExtension};
+use mod_api_stable::{
+    CommandResultV1, SettingTargetV1, StableCommand, StableEventTarget, StableServerCtx, StableServerExtension,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::balance::{Article, Row};
 use crate::diag;
-use crate::records::{kind, top_keys};
+use crate::records::{compare_versions, kind, top_keys};
 
 pub const APPLY_TIERS: &str = "apply_tiers";
 pub const RESULT_EVENT: &str = "apply_tiers_result";
@@ -29,9 +32,17 @@ pub const FIELD: &str = "champion_tiers";
 /// The balance patches (2.8.0): the request, the answer.
 pub const APPLY_BALANCE: &str = "apply_balance";
 pub const BALANCE_RESULT: &str = "apply_balance_result";
-/// The save's own auto-patcher values while the balance has them off, and the newest round put in the news.
+/// The round made ahead for the game's next patch (2.8.1, [`Prepared`]; an empty payload withdraws it), and the
+/// server's word that it wrote it (`<round>\tok|fail\t<what it did>`).
+pub const PREPARE_BALANCE: &str = "prepare_balance";
+pub const PREPARED_WRITTEN: &str = "prepared_balance_written";
+/// The patch a prepared round carries until the game names it.
+pub const NEXT_PATCH: &str = "{NEXT_PATCH}";
+/// The save's own auto-patcher values while the balance has them off, the newest round put in the news, and the
+/// author the mod's news items were last renamed to.
 const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
 const NEWS_DONE: &str = "pma_balance_news";
+const AUTHOR_DONE: &str = "pma_balance_author";
 
 pub struct ServerExt;
 
@@ -40,10 +51,30 @@ static PROBED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 pub fn reset_for_tests() {
     *PROBED.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    *WATCH.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 impl StableServerExtension for ServerExt {
+    fn on_server_start(&self, _ctx: &mut StableServerCtx<'_>) {
+        // a new server (another save): nothing prepared for it yet
+        *WATCH.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn after_management_tick(&self, ctx: &mut StableServerCtx<'_>) {
+        if let Some((target, message)) = watch(ctx) {
+            ctx.emit_event(target, PREPARED_WRITTEN, message.as_bytes());
+        }
+    }
+
     fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
+        if cmd.command == PREPARE_BALANCE {
+            match (cmd.payload.is_empty(), Prepared::parse(cmd.payload)) {
+                (true, _) => arm(None, cmd.reply_target()),
+                (false, Ok(prepared)) => arm(Some(prepared), cmd.reply_target()),
+                (false, Err(why)) => diag::log(&format!("[balance] a prepared round the server cannot read: {why}")),
+            }
+            return CommandResultV1::Handled;
+        }
         if cmd.command == APPLY_BALANCE {
             let reply = cmd.reply_target();
             let (state, ok, detail) = match BalanceRequest::parse(cmd.payload) {
@@ -268,7 +299,7 @@ fn probe(docs: &impl TeamDocs, team: usize, existing: Option<&Value>) {
 /// What the client sends (JSON): the team, whether the game's champion patches are to be off (else put back), the
 /// newest round, and that round's notes and news cards. The client sends it again until the server answers; the
 /// notes and cards are written once (the newest round written is kept in the save).
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BalanceRequest {
     pub team: usize,
     pub off: bool,
@@ -282,7 +313,7 @@ pub struct BalanceRequest {
 /// A round's notes: for the game's patch `version`, named `label`; `merge`d into the game's own notes of that patch
 /// (else patch notes of their own); each champion's lines and reason codes; and the plain news (`title`, `content`)
 /// the inbox keeps should the game take the notes in neither form.
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NoteRequest {
     pub version: String,
     pub label: String,
@@ -312,6 +343,8 @@ pub trait BalanceHost {
     fn push_news(&mut self, team: usize, title: &str, content: &str, author: &str) -> bool;
     /// The team's news list (JSON).
     fn news(&self, team: usize) -> Option<String>;
+    /// One item of the team's news (None past its end).
+    fn news_item(&self, team: usize, index: usize) -> Option<String>;
     /// Replaces one item of the team's news (the game reads the whole record again and refuses what it cannot
     /// read, changing nothing).
     fn set_news_item(&mut self, team: usize, index: usize, json: &str) -> bool;
@@ -339,9 +372,171 @@ impl BalanceHost for StableServerCtx<'_> {
     fn news(&self, team: usize) -> Option<String> {
         self.team_get_json(team, "news")
     }
+    fn news_item(&self, team: usize, index: usize) -> Option<String> {
+        self.team_get_json(team, &format!("news.{index}"))
+    }
     fn set_news_item(&mut self, team: usize, index: usize, json: &str) -> bool {
         self.team_set_json(team, &format!("news.{index}"), json)
     }
+}
+
+// ===================== the round made ahead (2.8.1) =====================
+//
+// The server's changes to records reach the client's screens with a later in-game day: notes changed after the
+// management tick the game wrote them in show the inbox the game's own notes first - with its champion changes off,
+// empty (the user's 2027.4.2: 「这里看起来有bug？」). So while the game's next patch is near, the client makes the
+// round ahead and hands it over, and the server writes it in the tick the game's notes appear in.
+
+/// A round made ahead: for the game's first patch newer than `after`, its version and label [`NEXT_PATCH`] until then.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Prepared {
+    /// The save's book it was made on (`balance::book`): written on that save only.
+    pub book: String,
+    pub after: String,
+    pub round: crate::balance::Round,
+    pub request: BalanceRequest,
+}
+
+impl Prepared {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn parse(payload: &[u8]) -> Result<Prepared, String> {
+        serde_json::from_slice(payload).map_err(|e| format!("not a prepared round ({e})"))
+    }
+
+    /// The round and its request for the game's patch `version`.
+    pub fn named(&self, version: &str) -> Result<(crate::balance::Round, BalanceRequest), String> {
+        let named = Prepared::parse(self.encode().replace(NEXT_PATCH, version).as_bytes())?;
+        Ok((named.round, named.request))
+    }
+}
+
+/// The prepared round the server watches the news for, and what watching costs.
+struct Watch {
+    prepared: Prepared,
+    reply: StableEventTarget,
+    /// The news list's length when last looked at (None: to be read whole).
+    len: Option<usize>,
+    ticks: u32,
+    spent: Duration,
+    worst: Duration,
+    since: Instant,
+    logged_tick: bool,
+}
+
+static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
+/// How often the cost of watching is written to `diag.log` while a round is prepared.
+const WATCH_LOG_EVERY: Duration = Duration::from_secs(60);
+/// New news items read one by one in a tick at most (a tick adds a few).
+const NEW_ITEMS_MAX: usize = 64;
+
+/// A round handed over (None: withdrawn - no game patch near).
+pub fn arm(prepared: Option<Prepared>, reply: StableEventTarget) {
+    let mut guard = WATCH.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(prepared) = prepared else {
+        if guard.take().is_some() {
+            diag::log("[balance] the prepared round withdrawn (no game patch near)");
+        }
+        return;
+    };
+    let old = guard.take();
+    let same_team = old.as_ref().is_some_and(|w| w.prepared.request.team == prepared.request.team);
+    if old.as_ref().is_none_or(|w| w.prepared.round.id != prepared.round.id || w.prepared.after != prepared.after) {
+        let list: Vec<String> = prepared.round.changes.iter().map(|c| format!("{} {:+}", c.champion, c.step)).collect();
+        diag::log(&format!(
+            "[balance] round {} prepared for the game's first patch after {}: {}; written in the tick its notes appear",
+            prepared.round.id,
+            prepared.after,
+            if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
+        ));
+    }
+    let mut watch = Watch {
+        prepared,
+        reply,
+        len: None,
+        ticks: 0,
+        spent: Duration::ZERO,
+        worst: Duration::ZERO,
+        since: Instant::now(),
+        logged_tick: false,
+    };
+    if let Some(old) = old.filter(|_| same_team) {
+        (watch.len, watch.ticks, watch.spent, watch.worst, watch.since, watch.logged_tick) =
+            (old.len, old.ticks, old.spent, old.worst, old.since, old.logged_tick);
+    }
+    *guard = Some(watch);
+}
+
+/// Every management tick: with a round prepared, the news' end looked at, and the game's patch notes newer than the
+/// round's `after` given it now - the book, the notes, the cards. Some(the client's event) when that happened.
+pub fn watch(host: &mut impl BalanceHost) -> Option<(StableEventTarget, String)> {
+    let mut guard = WATCH.lock().unwrap_or_else(PoisonError::into_inner);
+    let w = guard.as_mut()?;
+    if !w.logged_tick {
+        w.logged_tick = true;
+        diag::log("[balance] the server watches the news for the game's patch (management ticks reach the mod)");
+    }
+    let started = Instant::now();
+    let found = find_patch(host, w.prepared.request.team, &w.prepared.after, &mut w.len);
+    let spent = started.elapsed();
+    w.ticks += 1;
+    w.spent += spent;
+    w.worst = w.worst.max(spent);
+    if w.since.elapsed() >= WATCH_LOG_EVERY {
+        diag::log(&format!(
+            "[balance] watching for the game's patch: {} management ticks in {:.0} s, the news looked at in {:.2} ms on average ({:.2} ms at worst)",
+            w.ticks,
+            w.since.elapsed().as_secs_f32(),
+            w.spent.as_secs_f64() * 1000.0 / f64::from(w.ticks.max(1)),
+            w.worst.as_secs_f64() * 1000.0
+        ));
+        (w.ticks, w.spent, w.worst, w.since) = (0, Duration::ZERO, Duration::ZERO, Instant::now());
+    }
+    let version = found?;
+    let watch = guard.take()?;
+    drop(guard);
+    let (ok, detail) = write_prepared(host, &watch.prepared, &version);
+    diag::log(&format!("[balance] {detail}"));
+    Some((watch.reply, format!("{}\t{}\t{detail}", watch.prepared.round.id, if ok { "ok" } else { "fail" })))
+}
+
+/// The version of the game's patch notes newer than `after` among the news items from `len` on (the whole list read
+/// the first time: notes there already count too - the patch came before the round did).
+fn find_patch(host: &impl BalanceHost, team: usize, after: &str, len: &mut Option<usize>) -> Option<String> {
+    let newer = |item: &Value| {
+        patch_version(item).filter(|v| compare_versions(v, after) == std::cmp::Ordering::Greater).map(str::to_string)
+    };
+    let Some(mut at) = *len else {
+        let items = news_items(host, team).ok()?;
+        *len = Some(items.len());
+        return items.iter().rev().find_map(newer);
+    };
+    let mut found = None;
+    for _ in 0..NEW_ITEMS_MAX {
+        let Some(json) = host.news_item(team, at) else { break };
+        at += 1;
+        if found.is_none() {
+            found = serde_json::from_str::<Value>(&json).ok().as_ref().and_then(newer);
+        }
+    }
+    *len = Some(at);
+    found
+}
+
+/// The prepared round named for the game's patch `version`: in the book, then its notes and cards in the news.
+fn write_prepared(host: &mut impl BalanceHost, prepared: &Prepared, version: &str) -> (bool, String) {
+    let (round, req) = match prepared.named(version) {
+        Ok(named) => named,
+        Err(why) => return (false, format!("the prepared round for {version} unusable: {why}")),
+    };
+    let id = round.id;
+    if let Err(why) = crate::balance::publish_prepared(round, &prepared.book) {
+        return (false, format!("the prepared round {id} not written into {version}: {why}"));
+    }
+    let (ok, said) = balance(host, &req);
+    (ok, format!("round {id} written in the tick the game's patch notes {version} appeared: {said}"))
 }
 
 /// The auto-patcher's settings with no champion change: every `*_count` zero. A document of zeros reads as unset (the
@@ -417,6 +612,15 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
             }
         }
+        // the mod's news items under its old name: its name now (once a save)
+        if host.saved(AUTHOR_DONE).as_deref() != Some(crate::balance::AUTHOR) {
+            if let Some(n) = rename_authors(host, req.team) {
+                if n > 0 {
+                    said.push(format!("{n} news items now by {}", crate::balance::AUTHOR));
+                }
+                host.set_saved(AUTHOR_DONE, Some(crate::balance::AUTHOR));
+            }
+        }
     } else if let Some(kept) = host.saved(AUTOPATCH_KEPT) {
         if host.set_autopatch(&kept) {
             host.set_saved(AUTOPATCH_KEPT, None);
@@ -430,6 +634,24 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
         said.push("nothing to put back".to_string());
     }
     (ok, said.join("; "))
+}
+
+/// The news items by one of the mod's old names (`balance::OLD_AUTHORS`) given its name now; how many (None: the
+/// news not readable).
+fn rename_authors(host: &mut impl BalanceHost, team: usize) -> Option<usize> {
+    let items = news_items(host, team).ok()?;
+    let mut renamed = 0;
+    for (i, item) in items.into_iter().enumerate() {
+        let Value::Object(mut map) = item else { continue };
+        if !map.get("author").and_then(Value::as_str).is_some_and(|a| crate::balance::OLD_AUTHORS.contains(&a)) {
+            continue;
+        }
+        map.insert("author".to_string(), json!(crate::balance::AUTHOR));
+        if host.set_news_item(team, i, &Value::Object(map).to_string()) {
+            renamed += 1;
+        }
+    }
+    Some(renamed)
 }
 
 /// The team's news items.
@@ -807,6 +1029,9 @@ mod tests {
         fn news(&self, _team: usize) -> Option<String> {
             Some(Value::Array(self.news.clone()).to_string())
         }
+        fn news_item(&self, _team: usize, index: usize) -> Option<String> {
+            self.news.get(index).map(Value::to_string)
+        }
         fn set_news_item(&mut self, _team: usize, index: usize, json: &str) -> bool {
             let Ok(item) = serde_json::from_str::<Value>(json) else { return false };
             if self.refuse_items || (self.strict && !game_reads(&item)) {
@@ -874,7 +1099,7 @@ mod tests {
                 ("tft_maddie".into(), vec![line("#asset/base/text/champion?stat.attack", "94", "89.3")], "pma_wr_74,pma_cap".into()),
                 ("league_kaisa".into(), vec![line("#asset/base/text/champion?stat.hp", "900", "945")], "pma_wr_35".into()),
             ],
-            title: format!("智能BP 平衡补丁 {label}"),
+            title: format!("电竞大脑平衡补丁 {label}"),
             content: "【削弱】\n麦迪：…".into(),
         }
     }
@@ -1006,8 +1231,103 @@ mod tests {
         let mut host = Host { refuse_items: true, ..Host::default() };
         let how = write_note(&mut host, 3, &note("2027.4.1", "2027.4.1b", false)).unwrap();
         assert!(how.starts_with("as plain news 2027.4.1b"), "{how}");
-        assert_eq!(host.news[0]["title"], "智能BP 平衡补丁 2027.4.1b");
+        assert_eq!(host.news[0]["title"], "电竞大脑平衡补丁 2027.4.1b");
         assert_eq!(host.news[0]["ty"]["Simple"]["content"], "【削弱】\n麦迪：…");
+    }
+
+    #[test]
+    fn a_prepared_round_is_written_in_the_tick_the_games_notes_appear() {
+        use crate::balance::{Change, Round};
+        let _serial = crate::tests::serial();
+        crate::balance::reset_for_tests();
+        reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_prepared_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::balance::open_for_tests(file.clone());
+        crate::balance::publish(Round { id: 1, version: "2027.4.1".into(), label: "2027.4.1b".into(), ..Round::default() });
+        let mut host = Host {
+            strict: true,
+            autopatch: Some(r#"{"major_strong_nerf_count":0,"meta_stale_high_threshold":4}"#.into()),
+            news: vec![official("2027.4.1")],
+            ..Host::default()
+        };
+        // made ahead for the game's first patch after 2027.4.1
+        let prepared = |id: u32, after: &str| {
+            let mut request = breq(true, id);
+            request.note = Some(note(NEXT_PATCH, NEXT_PATCH, true));
+            let round = Round {
+                id,
+                version: NEXT_PATCH.into(),
+                label: NEXT_PATCH.into(),
+                merged: true,
+                changes: vec![Change { champion: "tft_maddie".into(), win: 74.0, evidence: 99.0, step: -10, total: -20 }],
+                power: [("tft_maddie".to_string(), -20)].into_iter().collect(),
+                ..Round::default()
+            };
+            Prepared { book: crate::balance::book().unwrap(), after: after.into(), round, request }
+        };
+        let p = prepared(2, "2027.4.1");
+        assert_eq!(Prepared::parse(p.encode().as_bytes()).unwrap(), p, "through the command");
+        arm(Some(p), StableEventTarget::Team(3));
+        // ticks with nothing of the patch: nothing written (the first reads the whole list)
+        assert!(watch(&mut host).is_none());
+        host.news.push(json!({"author": "x", "date": "2027-10-02T00:00:00", "is_favorite": false, "is_read": false,
+                              "is_sent": true, "title": "t", "title_bind": [], "ty": "StartTeam"}));
+        assert!(watch(&mut host).is_none());
+        assert_eq!(crate::balance::latest().map(|r| r.id), Some(1));
+        // the game's patch notes appear: the round goes into the book and into them in the same tick
+        host.news.push(official("2027.4.2"));
+        let (target, message) = watch(&mut host).expect("written");
+        assert_eq!(target, StableEventTarget::Team(3));
+        assert!(message.starts_with("2\tok\tround 2 written in the tick the game's patch notes 2027.4.2 appeared"), "{message}");
+        let r = crate::balance::latest().unwrap();
+        assert_eq!((r.id, r.version.as_str(), r.label.as_str(), r.merged), (2, "2027.4.2", "2027.4.2", true));
+        let item = &host.news[2];
+        assert!(game_reads(item), "{item}");
+        let champions: Vec<&str> = item["ty"]["PatchNote"]["champion_patch_data"].as_array().unwrap().iter().map(|e| e[0].as_str().unwrap()).collect();
+        assert_eq!(champions, ["league_brand", "tft_maddie", "league_kaisa"]);
+        assert_eq!(host.saved.get(NEWS_DONE).map(String::as_str), Some("2"));
+        assert!(watch(&mut host).is_none(), "nothing prepared any more");
+        // made before the book moved on: not written
+        arm(Some(prepared(2, "2027.4.2")), StableEventTarget::Team(3));
+        host.news.push(official("2027.4.3"));
+        let (_, message) = watch(&mut host).expect("said");
+        assert!(message.starts_with("2\tfail\t") && message.contains("the book's next is 3"), "{message}");
+        assert_eq!(crate::balance::latest().map(|r| r.id), Some(2));
+        // made on another save: not written into this one
+        let mut other = prepared(3, "2027.4.3");
+        other.book = "another save's book".into();
+        arm(Some(other), StableEventTarget::Team(3));
+        host.news.push(official("2027.4.4"));
+        let (_, message) = watch(&mut host).expect("said");
+        assert!(message.starts_with("3\tfail\t") && message.contains("made on another save"), "{message}");
+        assert_eq!(host.saved.get(NEWS_DONE).map(String::as_str), Some("2"), "nothing written");
+        // withdrawn: nothing watched
+        arm(Some(prepared(3, "2027.4.3")), StableEventTarget::Team(3));
+        arm(None, StableEventTarget::Team(3));
+        host.news.push(official("2027.4.5"));
+        assert!(watch(&mut host).is_none());
+        crate::balance::reset_for_tests();
+        reset_for_tests();
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_mods_news_under_its_old_name_get_its_name_once() {
+        let old = json!({"author": crate::balance::OLD_AUTHORS[0], "date": "2027-10-01T00:00:00", "is_favorite": false,
+                         "is_read": true, "is_sent": true, "title": "t", "title_bind": [], "ty": "StartTeam"});
+        let mut host = Host {
+            autopatch: Some(r#"{"major_strong_nerf_count":0,"meta_stale_high_threshold":4}"#.into()),
+            news: vec![official("2027.4.1"), old.clone(), old],
+            ..Host::default()
+        };
+        let (ok, said) = balance(&mut host, &BalanceRequest { team: 3, off: true, ..BalanceRequest::default() });
+        assert!(ok && said.contains("2 news items now by 电竞大脑 / Patch Meta AI"), "{said}");
+        assert_eq!((host.news[1]["author"].as_str(), host.news[2]["author"].as_str()), (Some(crate::balance::AUTHOR), Some(crate::balance::AUTHOR)));
+        assert_eq!(host.news[0]["author"], "Team Samoyed", "the game's own left alone");
+        host.news[1]["author"] = json!(crate::balance::OLD_AUTHORS[0]);
+        let (_, said) = balance(&mut host, &BalanceRequest { team: 3, off: true, ..BalanceRequest::default() });
+        assert!(!said.contains("news items now by"), "once a save: {said}");
     }
 
     #[test]

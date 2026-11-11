@@ -10,7 +10,7 @@
 //! fewer entries. Also accepted: an object `{"champion": [...]}` and
 //! `{"champion": "...", "changes": [...]}` entries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -23,15 +23,25 @@ pub struct PatchNote {
     pub versions: Vec<String>,
     /// The note's own `version` field (the game's patch it is for).
     pub version: Option<String>,
-    /// Written by this mod's balance patches.
+    /// Written by this mod's balance patches (a hotfix's own notes).
     pub ours: bool,
     /// Champion -> buffed lines minus nerfed lines.
     pub changes: BTreeMap<String, i32>,
+    /// Champions whose lines the balance patches wrote (their reason a `pma_` code), in the game's notes too.
+    pub balance: BTreeSet<String>,
 }
 
 impl PatchNote {
     pub fn is_for(&self, version: &str) -> bool {
         self.versions.iter().any(|v| v == version)
+    }
+
+    /// The note without the balance patches' lines (the game's own changes only).
+    pub fn game_only(&self) -> PatchNote {
+        let mut note = self.clone();
+        note.changes.retain(|c, _| !self.balance.contains(c));
+        note.balance.clear();
+        note
     }
 
     /// Buff (+1), nerf (-1) or neither (0) for one champion.
@@ -102,6 +112,7 @@ pub fn combine(notes: Vec<PatchNote>) -> Vec<PatchNote> {
             }
         }
         merged.ours |= note.ours;
+        merged.balance.extend(note.balance);
         for (champion, lines) in note.changes {
             *merged.changes.entry(champion).or_insert(0) += lines.signum();
         }
@@ -122,12 +133,41 @@ fn patch_note(item: &Value) -> Option<PatchNote> {
     if let Some(v) = &version {
         versions.push(v.clone());
     }
-    let ours = item.get("author").and_then(Value::as_str) == Some(crate::balance::AUTHOR);
+    let ours = item.get("author").and_then(Value::as_str).is_some_and(crate::balance::is_ours);
     let mut changes = BTreeMap::new();
     if let Some(data) = data {
         champion_changes(data, &mut changes);
     }
-    Some(PatchNote { versions, version, ours, changes })
+    let mut balance = BTreeSet::new();
+    if let Some(reasons) = find_key(item, "champion_patch_reasons") {
+        balance_champions(reasons, &mut balance);
+    }
+    Some(PatchNote { versions, version, ours, changes, balance })
+}
+
+/// The champions of `champion_patch_reasons` (a list of `[champion, "code,code"]` or a map) with a balance-patch
+/// reason (`pma_` codes, `balance::reason`).
+fn balance_champions(reasons: &Value, out: &mut BTreeSet<String>) {
+    let ours = |codes: &Value| codes.as_str().is_some_and(|s| s.split(',').any(|c| c.trim().starts_with("pma_")));
+    match reasons {
+        Value::Array(entries) => {
+            for entry in entries {
+                if let (Some(name), Some(codes)) = (entry.get(0).and_then(Value::as_str), entry.get(1)) {
+                    if ours(codes) {
+                        out.insert(name.to_string());
+                    }
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (name, codes) in map {
+                if ours(codes) {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether a key or a string value contains `needle`.
@@ -269,6 +309,30 @@ mod tests {
         // the game buffed maddie, the balance patch nerfed her: no direction left; brand stays nerfed
         assert_eq!((combined[0].direction("tft_maddie"), combined[0].direction("league_brand")), (0, -1));
         assert!(combined[0].ours && combined[0].is_for("2027.4.1b"));
+    }
+
+    #[test]
+    fn the_balance_lines_in_the_games_notes_are_told_apart() {
+        // the game's 2027.4.2 notes (its champion changes off) with a round merged in, next to one of its own
+        let item = r##"{"author": "Team Samoyed", "title": "#asset/base/text/news?patch.title", "title_bind": [["Version", "2027.4.2"]],
+            "ty": {"PatchNote": {"version": "2027.4.2", "added_champion": [], "champion_patch_data": [
+                ["league_brand", [{"key": "k", "target_action": null, "pre_value": "94", "after_value": "75", "is_buff": false}]],
+                ["tft_maddie", [{"key": "k", "target_action": null, "pre_value": "2", "after_value": "1", "is_buff": false}]],
+                ["league_kaisa", [{"key": "k", "target_action": null, "pre_value": "1", "after_value": "2", "is_buff": true}]]],
+                "champion_patch_reasons": [["league_brand", "early_game_dominant_2"], ["tft_maddie", "pma_wr_77,pma_cap"],
+                                           ["league_kaisa", "pma_wr_28"]],
+                "game_rule_patch_data": [], "game_rule_patch_reasons": []}}}"##;
+        let note = parse_item(item).unwrap();
+        assert!(!note.ours, "the game's own notes");
+        assert_eq!(note.balance.iter().map(String::as_str).collect::<Vec<_>>(), ["league_kaisa", "tft_maddie"]);
+        let game = note.game_only();
+        assert_eq!(game.changes.keys().map(String::as_str).collect::<Vec<_>>(), ["league_brand"]);
+        assert!(game.balance.is_empty() && game.is_for("2027.4.2"));
+        // a map of reasons, and the mod's notes under its new name
+        let item = r#"{"author": "电竞大脑 / Patch Meta AI", "ty": {"PatchNote": {"version": "1.1",
+            "champion_patch_data": {"a": [{"is_buff": true}]}, "champion_patch_reasons": {"a": "pma_wr_30", "b": "x"}}}}"#;
+        let note = parse_item(item).unwrap();
+        assert!(note.ours && note.balance.contains("a") && !note.balance.contains("b"));
     }
 
     #[test]

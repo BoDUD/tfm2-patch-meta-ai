@@ -983,18 +983,27 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         names: st.names.clone(),
         champions: st.champions.clone(),
         stats: st.stats.clone(),
-        // the game's notes and the balance patches' (in the news, or not yet there) as one note a patch
-        notes: {
-            let mut notes = st.notes.clone();
-            notes.extend(crate::balance::notes());
-            patchnotes::combine(notes)
-        },
+        notes: model_notes(&st.notes),
         current,
         settings: cfg.model(),
         backtest,
     };
     let threaded = game.threaded();
     st.worker.get_or_insert_with(|| Worker::new(threaded)).submit(job);
+}
+
+/// The patch notes the model learns from, one note a patch: the game's own from the news, and this save's balance
+/// rounds from its book - their lines in the news (a hotfix's own notes, the lines merged into the game's) left out
+/// so a round counts once. A save with no book keeps the news as it is.
+fn model_notes(news: &[PatchNote]) -> Vec<PatchNote> {
+    let rounds = crate::balance::notes();
+    let mut notes: Vec<PatchNote> = if rounds.is_empty() {
+        news.to_vec()
+    } else {
+        news.iter().filter(|n| !n.ours).map(PatchNote::game_only).collect()
+    };
+    notes.extend(rounds);
+    patchnotes::combine(notes)
 }
 
 /// Picks up a finished fit: publishes it for the draft hook, plans the tier list, prepares the
@@ -1031,7 +1040,8 @@ fn collect(st: &mut State, cfg: &Config, team: usize) {
     }
     st.plan_complete = complete;
 
-    let note = st.notes.iter().rev().find(|n| n.is_for(&meta.current));
+    let notes = model_notes(&st.notes);
+    let note = notes.iter().rev().find(|n| n.is_for(&meta.current));
     let summary = format!(
         "patch {} (kept {}): competition {} matches this patch, {} kept; solo rank {}; patch notes {}; \
          ranked {}/{} champions{}",
@@ -1240,6 +1250,94 @@ struct BalanceSync {
     news_tail: Option<String>,
     probe_at: Option<Instant>,
     patch: Option<String>,
+    /// The round made ahead for the game's next patch as last handed to the server (2.8.1), what it was made from (the
+    /// model's snapshot, the game day), and the next patch day in the schedule as of a day.
+    prepared: Option<String>,
+    prepared_from: Option<(usize, Date)>,
+    next_patch: Option<(Date, Option<Date>)>,
+}
+
+type Date = (i32, u32, u32);
+
+/// Game days before the game's scheduled patch that its round is made ahead and handed to the server.
+const PREPARE_DAYS: i64 = 2;
+/// The year schedule's events that are game patches.
+const PATCH_EVENTS: [&str; 3] = ["MinorPatch", "MajorPatch", "SeasonPatch"];
+
+/// The first day on or after `today` with a game patch in the year schedules (`[{"schedules": [["2027-10-03",
+/// "MinorPatch"], ...]}, ...]`; an event may be a name or a one-key object).
+fn next_patch_day(schedule: &str, today: Date) -> Option<Date> {
+    let doc: Value = serde_json::from_str(schedule).ok()?;
+    let years: Vec<&Value> = match &doc {
+        Value::Array(years) => years.iter().collect(),
+        other => vec![other],
+    };
+    let from = crate::balance::day_number(today);
+    years
+        .iter()
+        .filter_map(|y| y.get("schedules").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|entry| {
+            let is_patch = match entry.get(1)? {
+                Value::String(name) => PATCH_EVENTS.contains(&name.as_str()),
+                Value::Object(map) => map.keys().any(|k| PATCH_EVENTS.contains(&k.as_str())),
+                _ => false,
+            };
+            let mut parts = entry.get(0)?.as_str()?.get(..10)?.split('-');
+            let day: Date = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+            (is_patch && crate::balance::day_number(day) >= from).then_some(day)
+        })
+        .min_by_key(|d| crate::balance::day_number(*d))
+}
+
+/// The round for the game's next scheduled patch, made ahead while that patch is [`PREPARE_DAYS`] days off or nearer
+/// and handed to the server, which writes it in the management tick the game's patch notes appear in (its changes
+/// made later reach the screens only with a later day: the inbox showed the game's own empty notes first). Withdrawn
+/// when no patch is near.
+fn prepare_next(st: &mut State, game: &mut impl Game, team: usize, snapshot: &Arc<shared::Snapshot>, rules: crate::balance::Rules, patch: Option<&str>) {
+    let today = game.game_date();
+    let next = match (today, st.balance.next_patch) {
+        (Some(t), Some((day, next))) if day == t => next,
+        (Some(t), _) => {
+            let next = game.schedule_json("").and_then(|s| next_patch_day(&s, t));
+            st.balance.next_patch = Some((t, next));
+            next
+        }
+        (None, _) => None,
+    };
+    let near = match (today, next) {
+        (Some(t), Some(d)) => crate::balance::day_number(d) - crate::balance::day_number(t) <= PREPARE_DAYS,
+        _ => false,
+    };
+    let (Some(today), Some(day), true) = (today, next, near) else {
+        withdraw_prepared(st, game);
+        return;
+    };
+    let from = (Arc::as_ptr(snapshot) as usize, today);
+    if st.balance.prepared_from == Some(from) {
+        return;
+    }
+    st.balance.prepared_from = Some(from);
+    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day));
+    // the patch it is for: the first newer than every patch known (the book's, the news', the matches')
+    let mut after = crate::balance::latest().map(|r| r.version).unwrap_or_default();
+    if let Some(p) = patch.filter(|p| compare_versions(p, &after) == std::cmp::Ordering::Greater) {
+        after = p.to_string();
+    }
+    let Some(book) = crate::balance::book() else { return };
+    let request = balance_request(st, team, &round, rules);
+    let payload = crate::server::Prepared { book, after, round, request }.encode();
+    if st.balance.prepared.as_deref() != Some(payload.as_str()) && game.send_command(crate::server::PREPARE_BALANCE, payload.as_bytes()) {
+        st.balance.prepared = Some(payload);
+    }
+}
+
+/// The prepared round taken back from the server (no patch near, the setting off).
+fn withdraw_prepared(st: &mut State, game: &mut impl Game) {
+    st.balance.prepared_from = None;
+    if st.balance.prepared.is_some() && game.send_command(crate::server::PREPARE_BALANCE, b"") {
+        st.balance.prepared = None;
+    }
 }
 
 /// The balance patches (`balance`): the news watched for the game's patches, a new round when one is due (from a
@@ -1247,6 +1345,23 @@ struct BalanceSync {
 /// (put back when it is off), and each new round's notes and news cards written into the player's news.
 fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, events: &[(String, Vec<u8>)]) {
     for (event, payload) in events {
+        if event == crate::server::PREPARED_WRITTEN {
+            // the server wrote the round made ahead into the game's patch: in the book, the news and the screens
+            let text = String::from_utf8_lossy(payload);
+            let mut parts = text.splitn(3, '\t');
+            let (round, ok, detail) = (parts.next().and_then(|r| r.parse::<u32>().ok()), parts.next() == Some("ok"), parts.next().unwrap_or(""));
+            diag::log(&format!("[balance] the server: {detail}"));
+            st.balance.prepared = None;
+            st.balance.prepared_from = None;
+            if let (true, Some(round)) = (ok, round) {
+                st.balance.acked = Some((true, round));
+                st.balance.failures = 0;
+            }
+            st.balance.probe_at = None;
+            st.balance.news_len = None;
+            st.dirty = true;
+            continue;
+        }
         if event != crate::server::BALANCE_RESULT {
             continue;
         }
@@ -1309,12 +1424,17 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                         due,
                         if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
                     ));
+                    log_held(&round);
                     crate::balance::publish(round);
-                    // the model takes the round as the patch's notes
+                    // the model takes the round as the patch's notes; a round made ahead is made again after it
                     st.dirty = true;
+                    st.balance.prepared_from = None;
                 }
+                prepare_next(st, game, team, &snapshot, rules, patch.as_deref());
             }
         }
+    } else {
+        withdraw_prepared(st, game);
     }
     // the server: nothing to say on a save that never had a round with this off
     let newest = crate::balance::latest();
@@ -1338,6 +1458,14 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         st.balance.failures += 1;
         st.balance.retry_at = Some(now + backoff(st.balance.failures));
         diag::log_once("balance-send-failed", "[balance] could not send to the server (will retry)");
+    }
+}
+
+/// The champions a round left for later (outside the band, too few games with their new numbers), in the log.
+fn log_held(round: &crate::balance::Round) {
+    if !round.held.is_empty() {
+        let held: Vec<String> = round.held.iter().map(|(c, g)| format!("{c} ({g:.0} games)")).collect();
+        diag::log(&format!("[balance] round {} leaves for later (too few games since their last change): {}", round.id, held.join(", ")));
     }
 }
 
@@ -1816,5 +1944,19 @@ mod tests {
         g.news = Value::Array(items.clone()).to_string();
         probe_news(&mut st, &mut g, 4);
         assert_eq!(st.balance.news_len, Some(3));
+    }
+
+    #[test]
+    fn the_next_patch_day_comes_from_the_year_schedules() {
+        let schedule = r#"[
+            {"id": 1, "schedules": [["2027-09-15", "MinorPatch"], ["2027-10-01", {"LeagueMatch": {"index": 0, "round": 0}}],
+                                    ["2027-10-03", "MinorPatch"], ["2027-12-30", {"SeasonPatch": {}}]]},
+            {"id": 2, "schedules": [["2028-01-01", "StartRecruit"], ["2028-02-01", "MajorPatch"]]}]"#;
+        assert_eq!(next_patch_day(schedule, (2027, 10, 1)), Some((2027, 10, 3)));
+        assert_eq!(next_patch_day(schedule, (2027, 10, 3)), Some((2027, 10, 3)), "the day itself");
+        assert_eq!(next_patch_day(schedule, (2027, 10, 4)), Some((2027, 12, 30)));
+        assert_eq!(next_patch_day(schedule, (2028, 1, 1)), Some((2028, 2, 1)));
+        assert_eq!(next_patch_day(schedule, (2028, 2, 2)), None);
+        assert_eq!(next_patch_day("{", (2027, 1, 1)), None);
     }
 }

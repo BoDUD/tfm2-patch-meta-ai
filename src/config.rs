@@ -606,7 +606,7 @@ ai_bp=off
 ;              (more for champions the model is unsure of), so every champion gets its chances
 ;              and the AI is hard to predict - but a ban or pick may fall at most this many
 ;              win-rate points below the model's best. 0 = always the best, 1 = default, up to 5.
-; ai_variety : AI 智能BP 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
+; ai_variety : AI 战队的 BP 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
 ;              上场，AI 也不好猜；但每一手最多比模型认为的最佳选择差这么多胜率点。
 ;              0 = 永远选最佳，1 = 默认，最大 5。
 ai_variety=1
@@ -622,6 +622,7 @@ ai_tactics=off
 ;           furthest outside a 48-52% win rate (with enough games, at most balance_count) get
 ;           1.5% of power stronger or weaker for every point outside (at most balance_max a
 ;           patch, 30% in all; half on attack / magic power, half on health), in every match.
+;           A champion changed waits for 30 games with its new numbers before the next change.
 ;           The changes are the game's own patch notes (inbox, patch history), with the patch's
 ;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
 ;           While this is on the game's own champion patches are off (its settings are put back
@@ -629,7 +630,8 @@ ai_tactics=off
 ; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
 ;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个）
 ;           每偏 1 个点调 1.5% 的强度（单版最多 balance_max，累计最多 30%；一半在攻击/法强，
-;           一半在生命），所有比赛生效。改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
+;           一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场才会再改。
+;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
 ;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
 ;           （关掉本项时恢复游戏原来的设置）。
 balance=off
