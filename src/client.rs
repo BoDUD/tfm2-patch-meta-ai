@@ -32,6 +32,15 @@ pub trait Game: Source {
     fn player_team(&mut self) -> Option<usize>;
     fn team_name(&mut self, team: usize) -> Option<String>;
     fn champion_names(&mut self) -> Vec<String>;
+    /// How many champions the game lists, and the name of one - one question to the game each (`champion_names` asks
+    /// 2 x champions + 1 in one call, and a question about the list takes tens of milliseconds on a save with hundreds
+    /// of champions: `champions`). None: this host is not asked that way.
+    fn champion_count(&mut self) -> Option<usize> {
+        None
+    }
+    fn champion_name_at(&mut self, _index: usize) -> Option<String> {
+        None
+    }
     fn game_date(&mut self) -> Option<(i32, u32, u32)>;
     fn send_command(&mut self, command: &str, payload: &[u8]) -> bool;
     fn take_events(&mut self) -> Vec<(String, Vec<u8>)>;
@@ -47,7 +56,7 @@ pub trait Game: Source {
     fn champion_stats(&mut self, _name: &str) -> Option<crate::stats::Stats> {
         None
     }
-    /// Both of the above from one question to the game (its answer about a champion takes tens of milliseconds).
+    /// Both of the above from one question to the game.
     fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
         (self.champion_damage(name), self.champion_stats(name))
     }
@@ -97,6 +106,12 @@ impl Game for ClientGame<'_, '_> {
     }
     fn champion_names(&mut self) -> Vec<String> {
         self.ctx.champion_names()
+    }
+    fn champion_count(&mut self) -> Option<usize> {
+        crate::champions::count(self.ctx)
+    }
+    fn champion_name_at(&mut self, index: usize) -> Option<String> {
+        crate::champions::name_at(self.ctx, index)
     }
     fn game_date(&mut self) -> Option<(i32, u32, u32)> {
         self.ctx.game_date()
@@ -237,8 +252,14 @@ struct State {
     /// Every champion's stats (read with the champion list).
     stats: Arc<HashMap<String, crate::stats::Stats>>,
     champions: Vec<String>,
-    /// The game's champions while they are being read, a few a frame (`read_champions`).
+    /// The game's champions while they are being read, a little a frame (`read_champions`); since when the save
+    /// has had no team name yet; and the file the lists are kept in.
     champion_read: Option<ChampionRead>,
+    nameless_since: Option<Instant>,
+    champions_file: std::path::PathBuf,
+    /// When this state began (a save opened), and when the game is next asked for champions it did not list.
+    opened: Instant,
+    champions_retry_at: Option<Instant>,
     /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
     /// the file is this save's; whether that was settled; when the file was last written and
     /// with how many matches.
@@ -292,6 +313,10 @@ impl State {
             stats: Arc::new(HashMap::new()),
             champions: Vec::new(),
             champion_read: None,
+            nameless_since: None,
+            champions_file: crate::champions::file(),
+            opened: Instant::now(),
+            champions_retry_at: None,
             cache_pending: None,
             cache_checked: false,
             cache_written: None,
@@ -311,58 +336,200 @@ fn lock() -> MutexGuard<'static, Option<State>> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The game's champions being read: their names, how far the reading is, and the stats read.
+/// The game's champions being read: their names (the list kept from an earlier session, or the game's own as it
+/// is asked name by name), how far the reading of their data is, and what was read.
 struct ChampionRead {
     names: Vec<String>,
+    /// The game's count, when it said one.
+    count: Option<usize>,
+    /// The next name to ask the game for (None: the names are all there).
+    listing: Option<usize>,
+    /// The names are the list kept from an earlier session (the game's own, should one of them have no data).
+    kept: bool,
     next: usize,
+    without_data: usize,
     stats: HashMap<String, crate::stats::Stats>,
+    /// What the game's answers took: about the list, about the champions.
+    list_time: Duration,
+    data_time: Duration,
+}
+
+impl ChampionRead {
+    fn new(names: Vec<String>, count: Option<usize>, listing: Option<usize>, kept: bool, list_time: Duration) -> Self {
+        Self { names, count, listing, kept, next: 0, without_data: 0, stats: HashMap::new(), list_time, data_time: Duration::ZERO }
+    }
 }
 
 /// A frame's time for reading champions (one champion at least).
 const CHAMPION_BUDGET: Duration = Duration::from_millis(4);
+/// How long the champions wait for the save's team name (it comes a moment after the team, and the state starts
+/// over with it).
+const NAME_WAIT: Duration = Duration::from_secs(5);
 
-/// The champions' damage types, stats and names, a few a frame (2.8.2): the game's answer about one champion takes
-/// tens of milliseconds, and all 284 asked in one frame froze it for 12-17 s when a save was opened (the server's
-/// answers in that time came too late, too). True while the reading goes on: the model waits for it.
+fn millis(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Where the champions come from when a save opens (2.8.3; what each way costs is in `diag.log`). The game is asked
+/// how many it lists - one question. The list kept from an earlier session of this save is taken when it has that
+/// many names; else the game is asked for its names, one a frame. A host that is not asked that way lists them all
+/// at once, as before. None: the game lists none (`rebuild` rates the ones seen in matches).
+fn start_champions(st: &State, game: &mut impl Game) -> Option<ChampionRead> {
+    let asked = Instant::now();
+    let Some(count) = game.champion_count() else {
+        let names = game.champion_names();
+        let took = asked.elapsed();
+        if !names.is_empty() {
+            diag::log(&format!("[probe] champion list: {} names, all asked at once ({:.0} ms)", names.len(), millis(took)));
+        }
+        return (!names.is_empty()).then(|| ChampionRead::new(names, None, None, false, took));
+    };
+    let counted = asked.elapsed();
+    if count == 0 {
+        return None;
+    }
+    let save = st.save.as_ref().map(|(team, name)| crate::cache::stem(*team, name)).unwrap_or_default();
+    // the kept list of this save, when it has as many names and the game's first and last name are its own (two
+    // questions more)
+    let kept = crate::champions::load(&st.champions_file, &save).filter(|names| {
+        names.len() == count && [0, count - 1].iter().all(|i| game.champion_name_at(*i).as_ref() == names.get(*i))
+    });
+    let took = asked.elapsed();
+    diag::log(&format!(
+        "[probe] champion list: the game counts {count} (that question took {:.0} ms, {:.0} ms with the look at the kept list); {}",
+        millis(counted),
+        millis(took),
+        if kept.is_some() { "the list kept from an earlier session is taken" } else { "its names are asked one a frame" }
+    ));
+    Some(match kept {
+        Some(names) => ChampionRead::new(names, Some(count), None, true, took),
+        None => ChampionRead::new(Vec::with_capacity(count), Some(count), Some(0), false, took),
+    })
+}
+
+/// The champions' names, damage types and stats when a save opens, a little a frame (2.8.2 spread the stats; 2.8.3
+/// the list itself, which was the slow part - `champions`). True while the model has to wait for them.
 fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
     if !st.champions.is_empty() {
         return false;
     }
+    // the save's name comes a moment after its team, and the state starts over with it: not before
+    if st.champion_read.is_none() && st.save.as_ref().is_some_and(|(_, name)| name.is_empty()) {
+        let since = *st.nameless_since.get_or_insert_with(Instant::now);
+        if since.elapsed() < NAME_WAIT {
+            return true;
+        }
+    }
     let mut read = match st.champion_read.take() {
         Some(read) => read,
         None => {
-            let names = game.champion_names();
-            if names.is_empty() {
-                // the host lists none: `rebuild` rates the champions seen in matches
+            // the game lists none (yet): asked again a second later, not every frame
+            if !due(st.champions_retry_at, Instant::now()) {
                 return false;
             }
-            ChampionRead { names, next: 0, stats: HashMap::new() }
+            match start_champions(st, game) {
+                Some(read) => read,
+                None => {
+                    st.champions_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                    return false;
+                }
+            }
         }
     };
-    let started = Instant::now();
+    let frame = Instant::now();
+    // the game's own list: one name a frame (a question about the list is the slow one)
+    if let (Some(at), Some(count)) = (read.listing, read.count) {
+        if at < count {
+            let asked = Instant::now();
+            if let Some(name) = game.champion_name_at(at) {
+                read.names.push(name);
+            }
+            read.list_time += asked.elapsed();
+            read.listing = Some(at + 1);
+        }
+        if read.listing.is_some_and(|at| at >= count) {
+            read.listing = None;
+            if read.names.len() < count {
+                // a name the game did not give this way: its list all at once, as the SDK asks it
+                let asked = Instant::now();
+                let names = game.champion_names();
+                read.list_time += asked.elapsed();
+                diag::log(&format!(
+                    "[probe] champion list: {} of {count} names came one by one; all asked at once ({} names, {:.0} ms)",
+                    read.names.len(),
+                    names.len(),
+                    millis(asked.elapsed())
+                ));
+                if names.len() > read.names.len() {
+                    read = ChampionRead::new(names, None, None, false, read.list_time);
+                }
+            }
+        }
+    }
     while read.next < read.names.len() {
         let name = &read.names[read.next];
         read.next += 1;
+        let asked = Instant::now();
         let (damage, stats) = game.champion_data(name);
+        let label = game.champion_label(name);
+        read.data_time += asked.elapsed();
+        if damage.is_none() && stats.is_none() {
+            read.without_data += 1;
+        }
         if let Some(d) = damage {
             st.damage.insert(st.names.id(name), d);
         }
         if let Some(s) = stats {
             read.stats.insert(name.clone(), s);
         }
-        if let Some(label) = game.champion_label(name) {
+        if let Some(label) = label {
             st.labels.champions.insert(name.clone(), label);
         }
-        if started.elapsed() >= CHAMPION_BUDGET {
+        if frame.elapsed() >= CHAMPION_BUDGET {
             break;
         }
     }
-    if read.next < read.names.len() {
+    if read.listing.is_some() || read.next < read.names.len() {
         st.champion_read = Some(read);
         return true;
     }
+    // a kept list with a name the game has no data for (while it has for others) is behind the game's: its own
+    // names, then
+    let behind = read.kept && read.without_data > 0 && read.without_data < read.names.len();
+    if let (true, Some(count)) = (behind, read.count) {
+        diag::log(&format!(
+            "[probe] champion list: {} of the kept names are not the game's any more; its names are asked one a frame",
+            read.without_data
+        ));
+        st.champion_read = Some(ChampionRead::new(Vec::with_capacity(count), Some(count), Some(0), false, read.list_time));
+        return true;
+    }
     st.labels.team_name = game.team_name(team).unwrap_or_default();
-    diag::log(&format!("[probe] stats read for {} of {} champions", read.stats.len(), read.names.len()));
+    diag::log(&format!(
+        "[probe] stats read for {} of {} champions (the game took {:.0} ms about the list, {:.0} ms about the champions)",
+        read.stats.len(),
+        read.names.len(),
+        millis(read.list_time),
+        millis(read.data_time)
+    ));
+    // the game's own list, asked name by name: kept for the next session of this save
+    if !read.kept && read.count.is_some() {
+        if let Some((team, name)) = &st.save {
+            let save = crate::cache::stem(*team, name);
+            if let Some(before) = crate::champions::load(&st.champions_file, &save) {
+                let (added, gone) = crate::champions::difference(&before, &read.names);
+                let some = |list: &[String]| list.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+                diag::log(&format!(
+                    "[probe] champion list: {} new since the kept one ({}), {} gone ({})",
+                    added.len(),
+                    some(&added),
+                    gone.len(),
+                    some(&gone)
+                ));
+            }
+            crate::champions::store(&st.champions_file, &save, &read.names);
+        }
+    }
     st.stats = Arc::new(read.stats);
     st.champions = read.names;
     st.dirty = true;
@@ -472,6 +639,19 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
                 st.comp.listed, st.solo.listed
             ),
         );
+        // a save may list no match for a while after it opens (no model until it does: 2.8.2's log had a draft
+        // "with no model ready" a minute after a load): when its first ones come is said once
+        if st.comp.listed + st.solo.listed > 0 {
+            diag::log_once(
+                "listed-some",
+                &format!(
+                    "records listed: {} competition, {} solo rank - the first {:.0} s after the save opened",
+                    st.comp.listed,
+                    st.solo.listed,
+                    st.opened.elapsed().as_secs_f32()
+                ),
+            );
+        }
     }
 
     read_records(st, game, cfg);
@@ -942,15 +1122,11 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
     };
     let Some(current) = current else { return };
 
-    // the champion list, names and damage types (once per save)
+    // the game lists no champions (`read_champions` reads its list when it does): the ones seen in matches are rated
     if st.champions.is_empty() {
-        let mut champions = game.champion_names();
-        if champions.is_empty() {
-            // the host does not list champions: rate the ones seen in matches
-            champions = st.comp.versions.values().flat_map(|v| v.champs.keys().cloned()).collect();
-            champions.sort();
-            champions.dedup();
-        }
+        let mut champions: Vec<String> = st.comp.versions.values().flat_map(|v| v.champs.keys().cloned()).collect();
+        champions.sort();
+        champions.dedup();
         let mut stats = HashMap::new();
         for name in &champions {
             let id = st.names.id(name);
@@ -1691,6 +1867,12 @@ mod tests {
         balance_sent: Vec<String>,
         champion_delay: Duration,
         champions_asked: u32,
+        /// The game answers about its champion list a question at a time (as the real one), and how many names it
+        /// was asked for.
+        counts: bool,
+        names_asked: u32,
+        /// It counts its champions but gives no name one by one.
+        nameless: bool,
     }
 
     impl Source for FakeGame {
@@ -1781,12 +1963,21 @@ mod tests {
         fn threaded(&self) -> bool {
             self.threaded
         }
-        fn champion_data(&mut self, _name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+        fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
             self.champions_asked += 1;
             if !self.champion_delay.is_zero() {
                 std::thread::sleep(self.champion_delay);
             }
-            (None, None)
+            // (data only where a test looks at it: for the champions the game lists)
+            let known = self.counts && self.champions.iter().any(|c| c == name);
+            (known.then_some(Damage::Mixed), None)
+        }
+        fn champion_count(&mut self) -> Option<usize> {
+            self.counts.then_some(self.champions.len())
+        }
+        fn champion_name_at(&mut self, index: usize) -> Option<String> {
+            self.names_asked += 1;
+            self.champions.get(index).filter(|_| !self.nameless).cloned()
         }
     }
 
@@ -2128,6 +2319,74 @@ mod tests {
         // read once a save
         assert!(!read_champions(&mut st, &mut g, 4));
         assert_eq!(g.champions_asked, 10);
+    }
+
+    #[test]
+    fn the_champion_list_is_asked_a_name_a_frame_and_kept_for_the_next_session() {
+        let file = std::env::temp_dir().join(format!("pma_champion_list_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let session = |name: &str| {
+            let mut st = State::new();
+            st.save = Some((4, name.to_string()));
+            st.champions_file = file.clone();
+            st
+        };
+        let game = |extra: &[&str]| {
+            let mut g = save();
+            g.counts = true;
+            g.champions.extend(extra.iter().map(|c| c.to_string()));
+            g
+        };
+        let all = |st: &mut State, g: &mut FakeGame| {
+            let mut frames = 1;
+            while read_champions(st, g, 4) {
+                frames += 1;
+                assert!(frames < 100);
+            }
+            frames
+        };
+        // a save's first session: the game says how many, then its names one a frame
+        let (mut g, mut st) = (game(&[]), session("Mods FC"));
+        assert!(read_champions(&mut st, &mut g, 4));
+        assert_eq!((g.names_asked, g.champions_asked), (1, 1), "one name and its data a frame");
+        assert_eq!(1 + all(&mut st, &mut g), 10, "ten champions, ten frames");
+        assert_eq!((g.names_asked, st.champions.clone(), st.dirty), (10, g.champions.clone(), true));
+        assert_eq!(st.damage.len(), 10);
+        // the next session: the kept list, no name asked, the data in one frame
+        let (mut g, mut st) = (game(&[]), session("Mods FC"));
+        assert_eq!(all(&mut st, &mut g), 1);
+        assert_eq!((g.names_asked, g.champions_asked, st.champions.len()), (2, 10, 10), "its first and last name checked");
+        // a mod added a champion (the game counts one more): its names again
+        let (mut g, mut st) = (game(&["k"]), session("Mods FC"));
+        assert_eq!(all(&mut st, &mut g), 11);
+        assert_eq!((g.names_asked, st.champions.len()), (11, 11));
+        // the last one renamed (the count the same): not the game's last name, its names again
+        let (mut g, mut st) = (game(&["k2"]), session("Mods FC"));
+        all(&mut st, &mut g);
+        assert_eq!(g.names_asked, 2 + 11);
+        assert!(st.champions.contains(&"k2".to_string()) && !st.champions.contains(&"k".to_string()), "{:?}", st.champions);
+        // one in the middle renamed: a kept name has no data, the game's names again
+        let (mut g, mut st) = (game(&["k2"]), session("Mods FC"));
+        g.champions[5] = "f2".into();
+        all(&mut st, &mut g);
+        assert_eq!(g.names_asked, 2 + 11);
+        assert!(st.champions.contains(&"f2".to_string()) && !st.champions.contains(&"f".to_string()), "{:?}", st.champions);
+        // another save keeps a list of its own
+        let (mut g, mut st) = (game(&[]), session("Other FC"));
+        all(&mut st, &mut g);
+        assert_eq!(g.names_asked, 10);
+        assert_eq!(crate::champions::load(&file, &crate::cache::stem(4, "Mods FC")).map(|l| l.len()), Some(11));
+        // a game that counts its champions but gives no name one by one: its list all at once in the end, none kept
+        let (mut g, mut st) = (game(&[]), session("Third FC"));
+        g.nameless = true;
+        assert_eq!(all(&mut st, &mut g), 10);
+        assert_eq!(st.champions.len(), 10);
+        assert_eq!(crate::champions::load(&file, &crate::cache::stem(4, "Third FC")), None);
+        // the save's team name is not there yet (the state starts over when it comes): nothing asked
+        let (mut g, mut st) = (game(&[]), session(""));
+        assert!(read_champions(&mut st, &mut g, 4));
+        assert_eq!((g.names_asked, g.champions_asked), (0, 0));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

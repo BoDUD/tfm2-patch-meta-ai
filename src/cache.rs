@@ -46,12 +46,17 @@ struct Stored {
     l: Option<f32>,
 }
 
-/// The file for a save: the player's team id and a hash of its name.
-pub fn path(team: usize, team_name: &str) -> PathBuf {
+/// A save's name in the mod's files: the player's team id and a hash of its name.
+pub fn stem(team: usize, team_name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     team_name.hash(&mut h);
-    paths::mod_dir().join(DIR).join(format!("team{team}-{:08x}.json", h.finish() as u32))
+    format!("team{team}-{:08x}", h.finish() as u32)
+}
+
+/// The file for a save ([`stem`]).
+pub fn path(team: usize, team_name: &str) -> PathBuf {
+    paths::mod_dir().join(DIR).join(format!("{}.json", stem(team, team_name)))
 }
 
 pub fn encode<'a>(games: impl Iterator<Item = (&'a u64, &'a Game)>, names: &Names) -> String {

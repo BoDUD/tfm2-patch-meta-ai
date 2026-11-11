@@ -21,6 +21,7 @@ pub mod advisor;
 pub mod ai_tactics;
 pub mod balance;
 pub mod cache;
+mod champions;
 mod client;
 pub mod compat;
 pub mod config;
