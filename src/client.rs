@@ -260,6 +260,8 @@ struct State {
     /// When this state began (a save opened), and when the game is next asked for champions it did not list.
     opened: Instant,
     champions_retry_at: Option<Instant>,
+    /// The save's own id (kept in the save, `server::save_id`), once the server said it: its history file's name.
+    save_id: Option<String>,
     /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
     /// the file is this save's; whether that was settled; when the file was last written and
     /// with how many matches.
@@ -317,6 +319,7 @@ impl State {
             champions_file: crate::champions::file(),
             opened: Instant::now(),
             champions_retry_at: None,
+            save_id: None,
             cache_pending: None,
             cache_checked: false,
             cache_written: None,
@@ -344,10 +347,15 @@ struct ChampionRead {
     count: Option<usize>,
     /// The next name to ask the game for (None: the names are all there).
     listing: Option<usize>,
-    /// The names are the list kept from an earlier session (the game's own, should one of them have no data).
+    /// The names are the list kept from an earlier session, and whether the game's count and its first and last
+    /// name agreed with it.
     kept: bool,
+    agreed: bool,
+    /// The game's own list is asked behind a list already in use (the kept one, which did not agree).
+    behind: bool,
     next: usize,
-    without_data: usize,
+    /// Names the game had no data for.
+    lacking: Vec<String>,
     stats: HashMap<String, crate::stats::Stats>,
     /// What the game's answers took: about the list, about the champions.
     list_time: Duration,
@@ -355,13 +363,31 @@ struct ChampionRead {
 }
 
 impl ChampionRead {
-    fn new(names: Vec<String>, count: Option<usize>, listing: Option<usize>, kept: bool, list_time: Duration) -> Self {
-        Self { names, count, listing, kept, next: 0, without_data: 0, stats: HashMap::new(), list_time, data_time: Duration::ZERO }
+    fn new(names: Vec<String>, count: Option<usize>, listing: Option<usize>, list_time: Duration) -> Self {
+        Self {
+            names,
+            count,
+            listing,
+            kept: false,
+            agreed: false,
+            behind: false,
+            next: 0,
+            lacking: Vec::new(),
+            stats: HashMap::new(),
+            list_time,
+            data_time: Duration::ZERO,
+        }
+    }
+
+    /// The game's own list, asked name by name.
+    fn listing(count: usize, behind: bool, list_time: Duration) -> Self {
+        Self { behind, ..Self::new(Vec::with_capacity(count), Some(count), Some(0), list_time) }
     }
 }
 
-/// A frame's time for reading champions (one champion at least).
-const CHAMPION_BUDGET: Duration = Duration::from_millis(4);
+/// A frame's time for reading champions (one champion at least): they are read once, when a save opens, and the
+/// model waits for them.
+const CHAMPION_BUDGET: Duration = Duration::from_millis(8);
 /// How long the champions wait for the save's team name (it comes a moment after the team, and the state starts
 /// over with it).
 const NAME_WAIT: Duration = Duration::from_secs(5);
@@ -371,9 +397,11 @@ fn millis(d: Duration) -> f64 {
 }
 
 /// Where the champions come from when a save opens (2.8.3; what each way costs is in `diag.log`). The game is asked
-/// how many it lists - one question. The list kept from an earlier session of this save is taken when it has that
-/// many names; else the game is asked for its names, one a frame. A host that is not asked that way lists them all
-/// at once, as before. None: the game lists none (`rebuild` rates the ones seen in matches).
+/// how many it lists - one question. The list kept from an earlier session of this save is taken, so the model has
+/// its champions at once; when the game's count or its first or last name are not the list's (a mod added a
+/// champion), the game's own names are asked behind it, one a frame. A save without a kept list waits for the
+/// game's names. A host that is not asked that way lists them all at once, as before. None: the game lists none
+/// (`rebuild` rates the ones seen in matches).
 fn start_champions(st: &State, game: &mut impl Game) -> Option<ChampionRead> {
     let asked = Instant::now();
     let Some(count) = game.champion_count() else {
@@ -382,16 +410,17 @@ fn start_champions(st: &State, game: &mut impl Game) -> Option<ChampionRead> {
         if !names.is_empty() {
             diag::log(&format!("[probe] champion list: {} names, all asked at once ({:.0} ms)", names.len(), millis(took)));
         }
-        return (!names.is_empty()).then(|| ChampionRead::new(names, None, None, false, took));
+        return (!names.is_empty()).then(|| ChampionRead::new(names, None, None, took));
     };
     let counted = asked.elapsed();
     if count == 0 {
         return None;
     }
     let save = st.save.as_ref().map(|(team, name)| crate::cache::stem(*team, name)).unwrap_or_default();
-    // the kept list of this save, when it has as many names and the game's first and last name are its own (two
+    let kept = crate::champions::load(&st.champions_file, &save);
+    // the kept list is the game's when it has as many names and the game's first and last are its own (two
     // questions more)
-    let kept = crate::champions::load(&st.champions_file, &save).filter(|names| {
+    let agreed = kept.as_ref().is_some_and(|names| {
         names.len() == count && [0, count - 1].iter().all(|i| game.champion_name_at(*i).as_ref() == names.get(*i))
     });
     let took = asked.elapsed();
@@ -399,18 +428,23 @@ fn start_champions(st: &State, game: &mut impl Game) -> Option<ChampionRead> {
         "[probe] champion list: the game counts {count} (that question took {:.0} ms, {:.0} ms with the look at the kept list); {}",
         millis(counted),
         millis(took),
-        if kept.is_some() { "the list kept from an earlier session is taken" } else { "its names are asked one a frame" }
+        match (&kept, agreed) {
+            (Some(_), true) => "the list kept from an earlier session is taken".to_string(),
+            (Some(names), false) => format!("the kept list ({} names) is taken for now, the game's names are asked behind it", names.len()),
+            (None, _) => "its names are asked one a frame".to_string(),
+        }
     ));
     Some(match kept {
-        Some(names) => ChampionRead::new(names, Some(count), None, true, took),
-        None => ChampionRead::new(Vec::with_capacity(count), Some(count), Some(0), false, took),
+        Some(names) => ChampionRead { kept: true, agreed, ..ChampionRead::new(names, Some(count), None, took) },
+        None => ChampionRead::listing(count, false, took),
     })
 }
 
 /// The champions' names, damage types and stats when a save opens, a little a frame (2.8.2 spread the stats; 2.8.3
 /// the list itself, which was the slow part - `champions`). True while the model has to wait for them.
 fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
-    if !st.champions.is_empty() {
+    let first = st.champions.is_empty();
+    if !first && st.champion_read.is_none() {
         return false;
     }
     // the save's name comes a moment after its team, and the state starts over with it: not before
@@ -461,7 +495,7 @@ fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
                     millis(asked.elapsed())
                 ));
                 if names.len() > read.names.len() {
-                    read = ChampionRead::new(names, None, None, false, read.list_time);
+                    read = ChampionRead { behind: read.behind, ..ChampionRead::new(names, None, None, read.list_time) };
                 }
             }
         }
@@ -474,7 +508,7 @@ fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
         let label = game.champion_label(name);
         read.data_time += asked.elapsed();
         if damage.is_none() && stats.is_none() {
-            read.without_data += 1;
+            read.lacking.push(name.clone());
         }
         if let Some(d) = damage {
             st.damage.insert(st.names.id(name), d);
@@ -491,32 +525,47 @@ fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
     }
     if read.listing.is_some() || read.next < read.names.len() {
         st.champion_read = Some(read);
-        return true;
+        return first;
     }
-    // a kept list with a name the game has no data for (while it has for others) is behind the game's: its own
-    // names, then
-    let behind = read.kept && read.without_data > 0 && read.without_data < read.names.len();
-    if let (true, Some(count)) = (behind, read.count) {
-        diag::log(&format!(
-            "[probe] champion list: {} of the kept names are not the game's any more; its names are asked one a frame",
-            read.without_data
-        ));
-        st.champion_read = Some(ChampionRead::new(Vec::with_capacity(count), Some(count), Some(0), false, read.list_time));
-        return true;
-    }
+    use_champions(st, game, team, read);
+    false
+}
+
+/// A list whose champions were all read: in use from now on. A kept list that did not agree with the game, or has
+/// names the game has no data for (while it has for others), is behind the game's: its own names are asked next,
+/// behind the kept ones.
+fn use_champions(st: &mut State, game: &mut impl Game, team: usize, mut read: ChampionRead) {
     st.labels.team_name = game.team_name(team).unwrap_or_default();
-    diag::log(&format!(
-        "[probe] stats read for {} of {} champions (the game took {:.0} ms about the list, {:.0} ms about the champions)",
-        read.stats.len(),
-        read.names.len(),
-        millis(read.list_time),
-        millis(read.data_time)
-    ));
-    // the game's own list, asked name by name: kept for the next session of this save
-    if !read.kept && read.count.is_some() {
-        if let Some((team, name)) = &st.save {
-            let save = crate::cache::stem(*team, name);
-            if let Some(before) = crate::champions::load(&st.champions_file, &save) {
+    let save = st.save.as_ref().map(|(team, name)| crate::cache::stem(*team, name));
+    if read.kept {
+        // names the game knows nothing of any more are left out (unless it has data for none: a host without)
+        let gone = if read.lacking.len() < read.names.len() { std::mem::take(&mut read.lacking) } else { Vec::new() };
+        read.names.retain(|n| !gone.contains(n));
+        diag::log(&format!(
+            "[probe] stats read for {} of {} champions of the kept list (the game took {:.0} ms about the list, {:.0} ms about the champions)",
+            read.stats.len(),
+            read.names.len(),
+            millis(read.list_time),
+            millis(read.data_time)
+        ));
+        if let (true, Some(count)) = (!read.agreed || !gone.is_empty(), read.count) {
+            diag::log(&format!(
+                "[probe] champion list: the kept list is behind the game's ({} of its names gone); the game's names are asked one a frame",
+                gone.len()
+            ));
+            st.champion_read = Some(ChampionRead::listing(count, true, Duration::ZERO));
+        }
+    } else {
+        diag::log(&format!(
+            "[probe] stats read for {} of {} champions (the game took {:.0} ms about the list, {:.0} ms about the champions)",
+            read.stats.len(),
+            read.names.len(),
+            millis(read.list_time),
+            millis(read.data_time)
+        ));
+        // the game's own list, asked name by name: kept for the next session of this save
+        if let (Some(_), Some(save)) = (read.count, &save) {
+            if let Some(before) = crate::champions::load(&st.champions_file, save) {
                 let (added, gone) = crate::champions::difference(&before, &read.names);
                 let some = |list: &[String]| list.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
                 diag::log(&format!(
@@ -527,13 +576,16 @@ fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
                     some(&gone)
                 ));
             }
-            crate::champions::store(&st.champions_file, &save, &read.names);
+            crate::champions::store(&st.champions_file, save, &read.names);
+        }
+        if read.behind && read.names == st.champions {
+            // the list in use was the game's after all
+            return;
         }
     }
     st.stats = Arc::new(read.stats);
     st.champions = read.names;
     st.dirty = true;
-    false
 }
 
 pub fn reset_for_tests() {
@@ -584,6 +636,15 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         read_athletes(st, game);
     }
     if idle_scene(scene) {
+        // a match begun right after a save was opened: the first model is carried on with on the line-up screens,
+        // and a fit that ends on any screen is published - the draft that follows needs it
+        if let Some((team, _)) = st.save.clone() {
+            let before_match = matches!(scene, Some(ClientSceneKindV1::Lineup) | Some(ClientSceneKindV1::StadiumEntrance));
+            if before_match && shared::get().is_none() {
+                first_model(st, game, cfg, team, now);
+            }
+            collect(st, cfg, team);
+        }
         return;
     }
     // which save is open (another one may have been loaded without leaving the game scene)
@@ -668,7 +729,10 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         st.next_rebuild = Some(now + REBUILD_EVERY);
         st.dirty = false;
         st.rebuilt_with = Some(Arc::clone(cfg));
-        rebuild(st, game, cfg, team, now, caught_up);
+        if !rebuild(st, game, cfg, team, now, caught_up) {
+            // nothing to fit yet: the first matches (or the kept history) are not waited another five seconds for
+            st.next_rebuild = None;
+        }
     }
     collect(st, cfg, team);
     save_cache(st, team, now, caught_up);
@@ -693,6 +757,21 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
         sync_tiers(st, game, team, now, complete, &events);
     }
     sync_balance(st, game, cfg, team, now, &events);
+}
+
+/// The save's first model where the management screens were left before it was there: the champions read on, the
+/// fit begun (`run` does the same on its own screens).
+fn first_model(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, team: usize, now: Instant) {
+    let reading = read_champions(st, game, team);
+    if st.dirty && !reading && due(st.next_rebuild, now) {
+        st.next_rebuild = Some(now + REBUILD_EVERY);
+        st.dirty = false;
+        st.rebuilt_with = Some(Arc::clone(cfg));
+        let caught_up = st.comp.pending() == 0 && st.solo.pending() == 0;
+        if !rebuild(st, game, cfg, team, now, caught_up) {
+            st.next_rebuild = None;
+        }
+    }
 }
 
 fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
@@ -832,6 +911,29 @@ fn settle_cache(st: &mut State) {
     }
 }
 
+/// The save's matches from earlier sessions kept under its own id (2.8.3): the save's for sure, so they are taken
+/// at once - a save just opened may list no match of its own for a while, and a match played right then was
+/// drafted with no model (`the AI drafted with no model ready`). The file named by team and name (2.8.2 and
+/// before), still waiting for the save's own matches to confirm it, is not needed then.
+fn adopt_history(st: &mut State) {
+    let Some(id) = st.save_id.clone() else { return };
+    if !cache_on() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(crate::cache::path_of(&id)) else { return };
+    let mut merged = 0;
+    for (key, game) in crate::cache::decode(&text, &mut st.names) {
+        let scanner = if game.solo { &mut st.solo } else { &mut st.comp };
+        merged += scanner.adopt(key, game, &st.names) as usize;
+    }
+    st.cache_pending = None;
+    st.cache_checked = true;
+    diag::log(&format!("[cache] {merged} matches of this save from earlier sessions (kept under its id {id}): taken at once"));
+    if merged > 0 {
+        st.dirty = true;
+    }
+}
+
 /// The history file is rewritten at most this often.
 const CACHE_EVERY: Duration = Duration::from_secs(120);
 
@@ -854,7 +956,11 @@ fn save_cache(st: &mut State, team: usize, now: Instant, caught_up: bool) {
         return;
     }
     st.cache_written = Some((now, count));
-    let path = crate::cache::path(team, st.save.as_ref().map_or("", |s| s.1.as_str()));
+    // under the save's own id when it has one (taken at once next time), else by its team and name
+    let path = match &st.save_id {
+        Some(id) => crate::cache::path_of(id),
+        None => crate::cache::path(team, st.save.as_ref().map_or("", |s| s.1.as_str())),
+    };
     let mut games: Vec<(u64, Arc<Match>)> = st.comp.games.iter().chain(&st.solo.games).map(|(k, g)| (*k, g.clone())).collect();
     // oldest first, so the file keeps the newest when it is trimmed
     // matches kept from earlier sessions have no record id (0): their patch orders them
@@ -1103,7 +1209,8 @@ fn probe_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
     changed
 }
 
-fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, caught_up: bool) {
+/// True when a model was sent to be fitted (false: no patch known yet - nothing to fit).
+fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, caught_up: bool) -> bool {
     // the patch notes (re-read every 5 minutes; they change once per in-game patch)
     let played_newest = st.comp.current_version().or_else(|| st.solo.current_version());
     if due(st.news_read_at.map(|t| t + NEWS_EVERY), now) || played_newest != st.news_version {
@@ -1120,7 +1227,13 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
             record_current.clone()
         }
     };
-    let Some(current) = current else { return };
+    // no match known (a save just opened may list none for a while): the patch its notes or its balance book name,
+    // so that a model - League's knowledge, the champions' stats - is there for a match played right away
+    let current = current.or_else(|| {
+        let noted = st.notes.iter().filter_map(|n| n.version.clone()).max_by(|a, b| compare_versions(a, b));
+        noted.or_else(|| crate::balance::latest().map(|r| r.version))
+    });
+    let Some(current) = current else { return false };
 
     // the game lists no champions (`read_champions` reads its list when it does): the ones seen in matches are rated
     if st.champions.is_empty() {
@@ -1245,6 +1358,7 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
     };
     let threaded = game.threaded();
     st.worker.get_or_insert_with(|| Worker::new(threaded)).submit(job);
+    true
 }
 
 /// The patch notes the model learns from, one note a patch: the game's own from the news, and this save's balance
@@ -1629,9 +1743,14 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
             continue;
         }
         if event == crate::server::BOOK_RESULT {
-            // which book the save has (`<id>\t<newest round in its news>`; no id: none)
+            // which book the save has, and its own id (`<book>\t<newest round in its news>\t<save>`; no book: none)
             let text = String::from_utf8_lossy(payload);
-            let (id, done) = text.split_once('\t').unwrap_or((text.as_ref(), "0"));
+            let mut parts = text.split('\t');
+            let (id, done, save) = (parts.next().unwrap_or(""), parts.next().unwrap_or("0"), parts.next().unwrap_or(""));
+            if st.save_id.is_none() && !save.is_empty() {
+                st.save_id = Some(save.to_string());
+                adopt_history(st);
+            }
             if st.balance.book.is_none() {
                 if !id.is_empty() {
                     let name = st.save.as_ref().map(|s| s.1.clone()).unwrap_or_default();
@@ -1708,9 +1827,12 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                 st.dirty = true;
             }
         }
-        // a new round when one is due: the game's new patch, the first one, or a late hotfix
-        if st.plan_complete {
-            if let Some(snapshot) = shared::get() {
+        // a new round when one is due: the game's new patch, the first one, or a late hotfix - from a model that has
+        // matches (one of League's knowledge alone, right after a save opened, would use the patch up on nobody), the
+        // kept history taken or turned down
+        let settled = st.cache_checked || st.cache_pending.is_none();
+        if st.plan_complete && settled {
+            if let Some(snapshot) = shared::get().filter(|s| s.meta.matches + s.meta.solo_matches > 0) {
                 let today = game.game_date();
                 // the game's patch: its newest patch notes, or the newest patch matches were played in when that is newer
                 // (a patch the game made without notes)
@@ -1873,6 +1995,8 @@ mod tests {
         names_asked: u32,
         /// It counts its champions but gives no name one by one.
         nameless: bool,
+        /// The save's own id as the server says it (none: a server that gives none).
+        save_id: String,
     }
 
     impl Source for FakeGame {
@@ -1937,7 +2061,7 @@ mod tests {
         fn send_command(&mut self, command: &str, payload: &[u8]) -> bool {
             if command == server::BALANCE_BOOK {
                 // which book the save has (none unless a test gives it one)
-                let answer = format!("{}\t{}", self.book.0, self.book.1);
+                let answer = format!("{}\t{}\t{}", self.book.0, self.book.1, self.save_id);
                 self.events.push((server::BOOK_RESULT.to_string(), answer.into_bytes()));
                 return true;
             }
@@ -2101,6 +2225,88 @@ mod tests {
         assert_eq!(shared::get().unwrap().meta.matches, 300, "only its own 300");
         CACHE_ON.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_saves_history_under_its_own_id_is_there_as_soon_as_it_opens() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        CACHE_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(crate::paths::mod_dir().join(crate::cache::DIR));
+        // session 1: the save says its id; its 300 matches are read and written under it
+        let mut g = save();
+        g.save_id = "abcdef0123456789".into();
+        let mut now = frames(&mut g, 400, Instant::now());
+        now += Duration::from_secs(1);
+        frames(&mut g, 5, now);
+        let file = crate::cache::path_of("abcdef0123456789");
+        for _ in 0..200 {
+            if file.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(file.exists(), "history written under the save's id");
+        assert!(!crate::cache::path(g.team, &g.team_name).exists(), "not by team and name any more");
+        // session 2: the save lists no match at all (as one just opened does): the model is there within frames
+        crate::reset_for_tests();
+        tick(&mut g, false, now);
+        g.replays.clear();
+        frames(&mut g, 5, now + Duration::from_secs(10));
+        assert_eq!(shared::get().expect("a model").meta.matches, 300, "its matches taken at once");
+        // another save with the same team and name has an id of its own: not its matches
+        crate::reset_for_tests();
+        tick(&mut g, false, now);
+        g.save_id = "ffff000011112222".into();
+        frames(&mut g, 30, now + Duration::from_secs(20));
+        assert!(shared::get().is_none(), "no match of its own, none taken");
+        CACHE_ON.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_save_that_lists_no_match_has_a_model_from_the_patch_its_notes_name() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        let mut g = save();
+        g.replays.clear();
+        // no match and no patch known: nothing a model could be of
+        frames(&mut g, 20, Instant::now());
+        assert!(shared::get().is_none());
+        // the news names the patch (the game's notes of 0.7): League's knowledge and the stats, for that patch
+        crate::reset_for_tests();
+        tick(&mut g, false, Instant::now());
+        g.news = Value::Array(vec![patch_item("2027.4.0", "e")]).to_string();
+        frames(&mut g, 20, Instant::now());
+        let snapshot = shared::get().expect("a model");
+        assert_eq!((snapshot.meta.current.as_str(), snapshot.meta.matches), ("2027.4.0", 0));
+        assert!(g.sent.is_empty(), "no tier list of nothing");
+    }
+
+    #[test]
+    fn a_match_begun_right_after_a_save_opened_still_gets_its_model() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        let mut g = save();
+        // the champions take ten frames to read; the player is on the line-up screen after three
+        g.champion_delay = CHAMPION_BUDGET * 2;
+        let now = frames(&mut g, 3, Instant::now());
+        assert!(shared::get().is_none(), "the champions are still being read");
+        g.scene = Some(ClientSceneKindV1::Lineup);
+        let now = frames(&mut g, 4, now);
+        assert!(shared::get().is_none());
+        let asked = g.champions_asked;
+        assert!(asked > 3, "read on with on the line-up screen: {asked}");
+        frames(&mut g, 12, now);
+        assert!(shared::get().is_some_and(|s| s.meta.matches > 0), "the model was fitted and published there");
+        // around the match itself nothing is begun (a model that is not there yet is left for after it)
+        crate::reset_for_tests();
+        let mut g = save();
+        g.champion_delay = CHAMPION_BUDGET * 2;
+        let now = frames(&mut g, 3, Instant::now());
+        g.scene = Some(ClientSceneKindV1::Match);
+        frames(&mut g, 30, now);
+        assert!(shared::get().is_none());
     }
 
     #[test]
@@ -2356,21 +2562,44 @@ mod tests {
         let (mut g, mut st) = (game(&[]), session("Mods FC"));
         assert_eq!(all(&mut st, &mut g), 1);
         assert_eq!((g.names_asked, g.champions_asked, st.champions.len()), (2, 10, 10), "its first and last name checked");
-        // a mod added a champion (the game counts one more): its names again
+        // a mod added a champion (the game counts one more): the kept list for now - the model does not wait - and
+        // the game's names behind it, one a frame
         let (mut g, mut st) = (game(&["k"]), session("Mods FC"));
-        assert_eq!(all(&mut st, &mut g), 11);
-        assert_eq!((g.names_asked, st.champions.len()), (11, 11));
-        // the last one renamed (the count the same): not the game's last name, its names again
+        assert!(!read_champions(&mut st, &mut g, 4), "the kept list is in use after a frame");
+        assert_eq!((st.champions.len(), st.dirty, g.names_asked), (10, true, 0));
+        st.dirty = false;
+        let mut frames = 0;
+        while st.champion_read.is_some() {
+            assert!(!read_champions(&mut st, &mut g, 4), "nobody waits for the names asked behind it");
+            frames += 1;
+            assert!(frames < 100);
+        }
+        assert_eq!((frames, g.names_asked, st.champions.len(), st.dirty), (11, 11, 11, true), "then the game's own list");
+        // the last one renamed (the count the same): the game's last name is not the kept one - its names again
         let (mut g, mut st) = (game(&["k2"]), session("Mods FC"));
         all(&mut st, &mut g);
+        assert_eq!(st.champions.len(), 10, "the kept list for now, without k: the game has no data for it");
+        while st.champion_read.is_some() {
+            read_champions(&mut st, &mut g, 4);
+        }
         assert_eq!(g.names_asked, 2 + 11);
         assert!(st.champions.contains(&"k2".to_string()) && !st.champions.contains(&"k".to_string()), "{:?}", st.champions);
-        // one in the middle renamed: a kept name has no data, the game's names again
+        // one in the middle renamed: the count and both ends agree, but a kept name has no data - left out for now,
+        // and the game's names asked behind
+        let (mut g, mut st) = (game(&["k2"]), session("Mods FC"));
+        g.champions[5] = "f2".into();
+        assert!(!read_champions(&mut st, &mut g, 4));
+        assert_eq!(st.champions.len(), 10, "without f, which the game has no data for");
+        while st.champion_read.is_some() {
+            read_champions(&mut st, &mut g, 4);
+        }
+        assert_eq!(g.names_asked, 2 + 11);
+        assert!(st.champions.contains(&"f2".to_string()) && !st.champions.contains(&"f".to_string()), "{:?}", st.champions);
+        // the game's names asked behind a list that was right: nothing changes
         let (mut g, mut st) = (game(&["k2"]), session("Mods FC"));
         g.champions[5] = "f2".into();
         all(&mut st, &mut g);
-        assert_eq!(g.names_asked, 2 + 11);
-        assert!(st.champions.contains(&"f2".to_string()) && !st.champions.contains(&"f".to_string()), "{:?}", st.champions);
+        assert!(st.champion_read.is_none() && g.names_asked == 2, "the kept list agreed");
         // another save keeps a list of its own
         let (mut g, mut st) = (game(&[]), session("Other FC"));
         all(&mut st, &mut g);

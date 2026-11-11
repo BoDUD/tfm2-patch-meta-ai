@@ -39,7 +39,8 @@ pub const PREPARED_WRITTEN: &str = "prepared_balance_written";
 /// The patch a prepared round carries until the game names it.
 pub const NEXT_PATCH: &str = "{NEXT_PATCH}";
 /// The save's book (2.8.2): the client asks for its id (payload `1`: make one, the setting is on) and gets
-/// `<id>\t<newest round in the save's news>` (no id: the save has no book).
+/// `<id>\t<newest round in the save's news>\t<the save's own id>` (no id: the save has no book). The save's own id
+/// (2.8.3, [`save_id`]) names its files in the mod folder.
 pub const BALANCE_BOOK: &str = "balance_book";
 pub const BOOK_RESULT: &str = "balance_book_result";
 /// The save's own auto-patcher values while the balance has them off, the newest round put in the news, the author
@@ -48,6 +49,7 @@ const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
 const NEWS_DONE: &str = "pma_balance_news";
 const AUTHOR_DONE: &str = "pma_balance_author";
 const BOOK_ID: &str = "pma_balance_book";
+const SAVE_ID: &str = "pma_save";
 const FIXUPS_DONE: &str = "pma_balance_fixups";
 /// The news fix-ups this version knows (2: the mod's own patch notes without a champion say so).
 const FIXUPS: &str = "2";
@@ -79,7 +81,8 @@ impl StableServerExtension for ServerExt {
     fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
         if cmd.command == BALANCE_BOOK {
             let (id, done) = book(ctx, cmd.payload == b"1");
-            let message = format!("{}\t{done}", id.unwrap_or_default());
+            let save = save_id(ctx);
+            let message = format!("{}\t{done}\t{}", id.unwrap_or_default(), save.unwrap_or_default());
             ctx.emit_event(cmd.reply_target(), BOOK_RESULT, message.as_bytes());
             return CommandResultV1::Handled;
         }
@@ -713,16 +716,31 @@ fn unchanged(item: &Value) -> Value {
 /// or when the save already has rounds written (a save from before the ids, 2.8.0-2.8.1); None: the save has no book.
 pub fn book(host: &mut impl BalanceHost, create: bool) -> (Option<String>, u32) {
     let done = host.saved(NEWS_DONE).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
-    let valid = |id: &String| (8..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric());
-    let id = match host.saved(BOOK_ID).filter(valid) {
+    let id = match host.saved(BOOK_ID).filter(|id| valid_id(id)) {
         Some(id) => Some(id),
         None if create || done > 0 => {
-            let id = new_book_id();
+            // the save's own id when it has one already: one id a save
+            let id = host.saved(SAVE_ID).filter(|id| valid_id(id)).unwrap_or_else(new_book_id);
             host.set_saved(BOOK_ID, Some(&id)).then_some(id)
         }
         None => None,
     };
     (id, done)
+}
+
+fn valid_id(id: &str) -> bool {
+    (8..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// The save's own id (2.8.3), kept in the save and made the first time it is asked for: its book's id when it has
+/// a book. The save's files in the mod folder are named by it - they are that save's for sure, whatever team and
+/// name another save shares with it. None: the save keeps no id.
+pub fn save_id(host: &mut impl BalanceHost) -> Option<String> {
+    if let Some(id) = host.saved(BOOK_ID).filter(|id| valid_id(id)).or_else(|| host.saved(SAVE_ID).filter(|id| valid_id(id))) {
+        return Some(id);
+    }
+    let id = new_book_id();
+    host.set_saved(SAVE_ID, Some(&id)).then_some(id)
 }
 
 /// A book id no other save has: the time and the process's random hasher.
@@ -1440,7 +1458,17 @@ mod tests {
         let mut old = Host::default();
         old.saved.insert(NEWS_DONE.into(), "2".into());
         let (other, done) = book(&mut old, false);
-        assert!(other.is_some() && other != Some(id) && done == 2, "{other:?} {done}");
+        assert!(other.is_some() && other != Some(id.clone()) && done == 2, "{other:?} {done}");
+        // the save's own id: its book's when it has a book
+        assert_eq!(save_id(&mut host), Some(id));
+        assert_eq!(save_id(&mut old), other);
+        // a save without a book gets an id of its own, once - and its book, when it gets one, has the same
+        let mut plain = Host::default();
+        let own = save_id(&mut plain).expect("an id");
+        assert_eq!(save_id(&mut plain), Some(own.clone()));
+        assert_eq!(book(&mut plain, false), (None, 0));
+        assert_eq!(book(&mut plain, true), (Some(own.clone()), 0));
+        assert_eq!(save_id(&mut plain), Some(own));
     }
 
     /// The game's notes of a patch that list nothing (its champion changes off, no rule change).
