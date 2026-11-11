@@ -38,11 +38,21 @@ pub const PREPARE_BALANCE: &str = "prepare_balance";
 pub const PREPARED_WRITTEN: &str = "prepared_balance_written";
 /// The patch a prepared round carries until the game names it.
 pub const NEXT_PATCH: &str = "{NEXT_PATCH}";
-/// The save's own auto-patcher values while the balance has them off, the newest round put in the news, and the
-/// author the mod's news items were last renamed to.
+/// The save's book (2.8.2): the client asks for its id (payload `1`: make one, the setting is on) and gets
+/// `<id>\t<newest round in the save's news>` (no id: the save has no book).
+pub const BALANCE_BOOK: &str = "balance_book";
+pub const BOOK_RESULT: &str = "balance_book_result";
+/// The save's own auto-patcher values while the balance has them off, the newest round put in the news, the author
+/// the mod's news items were last renamed to, the id of the save's book, and the news fix-ups done.
 const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
 const NEWS_DONE: &str = "pma_balance_news";
 const AUTHOR_DONE: &str = "pma_balance_author";
+const BOOK_ID: &str = "pma_balance_book";
+const FIXUPS_DONE: &str = "pma_balance_fixups";
+/// The news fix-ups this version knows (2: the mod's own patch notes without a champion say so).
+const FIXUPS: &str = "2";
+/// The text of patch notes without a champion change (`text/news.i18n`).
+pub const UNCHANGED_TEXT: &str = "#asset/base/text/news?patch.pma_none";
 
 pub struct ServerExt;
 
@@ -67,6 +77,12 @@ impl StableServerExtension for ServerExt {
     }
 
     fn handle_command(&self, ctx: &mut StableServerCtx<'_>, cmd: &StableCommand<'_>) -> CommandResultV1 {
+        if cmd.command == BALANCE_BOOK {
+            let (id, done) = book(ctx, cmd.payload == b"1");
+            let message = format!("{}\t{done}", id.unwrap_or_default());
+            ctx.emit_event(cmd.reply_target(), BOOK_RESULT, message.as_bytes());
+            return CommandResultV1::Handled;
+        }
         if cmd.command == PREPARE_BALANCE {
             match (cmd.payload.is_empty(), Prepared::parse(cmd.payload)) {
                 (true, _) => arm(None, cmd.reply_target()),
@@ -612,13 +628,17 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
             }
         }
-        // the mod's news items under its old name: its name now (once a save)
-        if host.saved(AUTHOR_DONE).as_deref() != Some(crate::balance::AUTHOR) {
-            if let Some(n) = rename_authors(host, req.team) {
-                if n > 0 {
-                    said.push(format!("{n} news items now by {}", crate::balance::AUTHOR));
+        // the mod's news items put right, once a save and version
+        if host.saved(AUTHOR_DONE).as_deref() != Some(crate::balance::AUTHOR) || host.saved(FIXUPS_DONE).as_deref() != Some(FIXUPS) {
+            if let Some((renamed, said_so)) = fix_news(host, req.team) {
+                if renamed > 0 {
+                    said.push(format!("{renamed} news items now by {}", crate::balance::AUTHOR));
+                }
+                if said_so > 0 {
+                    said.push(format!("{said_so} of the mod's patch notes without a champion now say so"));
                 }
                 host.set_saved(AUTHOR_DONE, Some(crate::balance::AUTHOR));
+                host.set_saved(FIXUPS_DONE, Some(FIXUPS));
             }
         }
     } else if let Some(kept) = host.saved(AUTOPATCH_KEPT) {
@@ -636,22 +656,81 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
     (ok, said.join("; "))
 }
 
-/// The news items by one of the mod's old names (`balance::OLD_AUTHORS`) given its name now; how many (None: the
-/// news not readable).
-fn rename_authors(host: &mut impl BalanceHost, team: usize) -> Option<usize> {
+/// The mod's news items put right: those by one of its old names (`balance::OLD_AUTHORS`) get its name now, and its
+/// own patch notes without a champion (2.8.1 wrote a first round that changed nobody as an empty hotfix: 「看不到任何
+/// 内容」) say that nothing changed. How many of each (None: the news not readable).
+fn fix_news(host: &mut impl BalanceHost, team: usize) -> Option<(usize, usize)> {
     let items = news_items(host, team).ok()?;
-    let mut renamed = 0;
+    let (mut renamed, mut said_so) = (0, 0);
     for (i, item) in items.into_iter().enumerate() {
-        let Value::Object(mut map) = item else { continue };
-        if !map.get("author").and_then(Value::as_str).is_some_and(|a| crate::balance::OLD_AUTHORS.contains(&a)) {
+        let author = item.get("author").and_then(Value::as_str).unwrap_or_default();
+        if !crate::balance::is_ours(author) {
             continue;
         }
-        map.insert("author".to_string(), json!(crate::balance::AUTHOR));
-        if host.set_news_item(team, i, &Value::Object(map).to_string()) {
-            renamed += 1;
+        let old_name = author != crate::balance::AUTHOR;
+        let empty = says_nothing(&item);
+        if !old_name && !empty {
+            continue;
+        }
+        let mut fixed = if empty { unchanged(&item) } else { item };
+        if let Value::Object(map) = &mut fixed {
+            map.insert("author".to_string(), json!(crate::balance::AUTHOR));
+        }
+        if host.set_news_item(team, i, &fixed.to_string()) {
+            renamed += usize::from(old_name);
+            said_so += usize::from(empty);
         }
     }
-    Some(renamed)
+    Some((renamed, said_so))
+}
+
+/// Whether a news item is patch notes that list nothing: no champion, no new champion, no rule.
+fn says_nothing(item: &Value) -> bool {
+    let Some(body) = patch_body(item) else { return false };
+    ["champion_patch_data", "added_champion", "game_rule_patch_data"].iter().all(|key| match body.get(*key) {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(list)) => list.is_empty(),
+        Some(Value::Object(map)) => map.is_empty(),
+        Some(_) => false,
+    })
+}
+
+/// Patch notes that list nothing as plain news that says so: the same title, the text [`UNCHANGED_TEXT`], the
+/// game's patch kept in the binds (`patchnotes` reads it there).
+fn unchanged(item: &Value) -> Value {
+    let mut out = item.clone();
+    let version = patch_version(item).unwrap_or_default().to_string();
+    if let Value::Object(map) = &mut out {
+        map.insert(
+            "ty".to_string(),
+            json!({"Simple": {"content": UNCHANGED_TEXT, "content_bind": [["Patch", version], ["Scope", "patch"]]}}),
+        );
+    }
+    out
+}
+
+/// The save's book id and the newest round its news has. The id is made the first time the setting is on (`create`),
+/// or when the save already has rounds written (a save from before the ids, 2.8.0-2.8.1); None: the save has no book.
+pub fn book(host: &mut impl BalanceHost, create: bool) -> (Option<String>, u32) {
+    let done = host.saved(NEWS_DONE).and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0);
+    let valid = |id: &String| (8..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    let id = match host.saved(BOOK_ID).filter(valid) {
+        Some(id) => Some(id),
+        None if create || done > 0 => {
+            let id = new_book_id();
+            host.set_saved(BOOK_ID, Some(&id)).then_some(id)
+        }
+        None => None,
+    };
+    (id, done)
+}
+
+/// A book id no other save has: the time and the process's random hasher.
+fn new_book_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    format!("{:016x}", h.finish())
 }
 
 /// The team's news items.
@@ -813,8 +892,24 @@ fn own_note_items(pushed: &Value, note: &NoteRequest, template: Option<&Value>) 
 
 /// A round's notes into the team's news: into the game's own notes of the patch (`merge`), else as patch notes of
 /// their own - first a plain news item (it stays, readable, should the game refuse the patch-notes form), then made
-/// patch notes. Ok says how; Err when nothing could be written.
+/// patch notes. A round that changed nobody writes none (2.8.2: a first round on a new save was an empty hotfix,
+/// 「看不到任何内容」); the game's notes of its patch, when they list nothing at all (its champion changes are off),
+/// are made plain news that says so. Ok says how; Err when nothing could be written.
 pub fn write_note(host: &mut impl BalanceHost, team: usize, note: &NoteRequest) -> Result<String, String> {
+    if note.champions.is_empty() {
+        if !note.merge {
+            return Ok(format!("no champion changed: no patch notes {}", note.label));
+        }
+        let items = news_items(host, team)?;
+        let at = items.iter().rposition(|it| patch_version(it) == Some(note.version.as_str()));
+        return Ok(match at.filter(|i| says_nothing(&items[*i])) {
+            Some(i) if host.set_news_item(team, i, &unchanged(&items[i]).to_string()) => {
+                format!("no champion changed: the game's empty patch notes {} say so", note.version)
+            }
+            Some(_) => format!("no champion changed (the game refused its empty patch notes {} as plain news)", note.version),
+            None => format!("no champion changed: the game's patch notes {} left as they are", note.version),
+        });
+    }
     let items = news_items(host, team)?;
     if note.merge {
         if let Some(i) = items.iter().rposition(|it| patch_version(it) == Some(note.version.as_str())) {
@@ -1328,6 +1423,100 @@ mod tests {
         host.news[1]["author"] = json!(crate::balance::OLD_AUTHORS[0]);
         let (_, said) = balance(&mut host, &BalanceRequest { team: 3, off: true, ..BalanceRequest::default() });
         assert!(!said.contains("news items now by"), "once a save: {said}");
+    }
+
+    #[test]
+    fn a_save_gets_a_book_id_once() {
+        // the setting off on a save that never had a round: no book
+        let mut host = Host::default();
+        assert_eq!(book(&mut host, false), (None, 0));
+        // on: an id, kept in the save from then on
+        let (id, done) = book(&mut host, true);
+        let id = id.expect("an id");
+        assert!(id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+        assert_eq!(done, 0);
+        assert_eq!(book(&mut host, false), (Some(id.clone()), 0));
+        // a save from before the ids with rounds in its news: an id of its own, the setting on or off
+        let mut old = Host::default();
+        old.saved.insert(NEWS_DONE.into(), "2".into());
+        let (other, done) = book(&mut old, false);
+        assert!(other.is_some() && other != Some(id) && done == 2, "{other:?} {done}");
+    }
+
+    /// The game's notes of a patch that list nothing (its champion changes off, no rule change).
+    fn bare(version: &str) -> Value {
+        let mut item = official(version);
+        for key in ["champion_patch_data", "champion_patch_reasons", "game_rule_patch_data", "game_rule_patch_reasons"] {
+            item["ty"]["PatchNote"][key] = json!([]);
+        }
+        item
+    }
+
+    #[test]
+    fn a_round_that_changed_nobody_writes_no_notes() {
+        let nobody = |version: &str, label: &str, merge: bool| NoteRequest { champions: Vec::new(), ..note(version, label, merge) };
+        // a hotfix: nothing
+        let mut host = Host { strict: true, news: vec![official("2027.4.1")], ..Host::default() };
+        let how = write_note(&mut host, 3, &nobody("2027.4.1", "2027.4.1b", false)).unwrap();
+        assert_eq!(how, "no champion changed: no patch notes 2027.4.1b");
+        assert_eq!(host.news, vec![official("2027.4.1")]);
+        // the game's notes of its patch with something in them (a rule): left as they are
+        let mut host = Host { strict: true, news: vec![official("2027.5.0")], ..Host::default() };
+        write_note(&mut host, 3, &nobody("2027.5.0", "2027.5.0", true)).unwrap();
+        assert_eq!(host.news, vec![official("2027.5.0")]);
+        // the game's notes that list nothing at all: plain news that says so, its title and the patch kept
+        let mut host = Host { strict: true, news: vec![official("2027.4.1"), bare("2027.5.0")], ..Host::default() };
+        let how = write_note(&mut host, 3, &nobody("2027.5.0", "2027.5.0", true)).unwrap();
+        assert_eq!(how, "no champion changed: the game's empty patch notes 2027.5.0 say so");
+        let item = &host.news[1];
+        assert!(game_reads(item), "{item}");
+        assert_eq!((item["title"].as_str(), &item["title_bind"]), (Some("#asset/base/text/news?patch.title"), &json!([["Version", "2027.5.0"]])));
+        assert_eq!(item["author"], "Team Samoyed");
+        assert_eq!(item["ty"], json!({"Simple": {"content": UNCHANGED_TEXT, "content_bind": [["Patch", "2027.5.0"], ["Scope", "patch"]]}}));
+        // the client still takes it for the patch's notes (the game's newest patch)
+        let read = crate::patchnotes::parse_all(&Value::Array(host.news.clone()).to_string()).unwrap();
+        assert_eq!(read.newest_version().as_deref(), Some("2027.5.0"));
+        assert!(read.notes[1].changes.is_empty() && read.notes[1].is_for("2027.5.0"));
+        // a whole request of such a round: marked done, no card
+        let mut host = Host {
+            strict: true,
+            autopatch: Some(r#"{"major_strong_nerf_count":0,"meta_stale_high_threshold":4}"#.into()),
+            news: vec![official("2027.4.1")],
+            ..Host::default()
+        };
+        let req = BalanceRequest { team: 3, off: true, round: 1, note: Some(nobody("2027.4.1", "2027.4.1b", false)), articles: Vec::new() };
+        let (ok, said) = balance(&mut host, &req);
+        assert!(ok && said.contains("round 1 no champion changed"), "{said}");
+        assert_eq!((host.news.len(), host.saved.get(NEWS_DONE).map(String::as_str)), (1, Some("1")));
+    }
+
+    #[test]
+    fn the_mods_own_empty_patch_notes_say_that_nothing_changed() {
+        // 2.8.1 wrote a first round that changed nobody as an empty hotfix
+        let mut own = bare("2026.0.0");
+        own["author"] = json!(crate::balance::AUTHOR);
+        own["title_bind"] = json!([["Version", "2026.0.0b"]]);
+        let mut host = Host {
+            strict: true,
+            autopatch: Some(r#"{"major_strong_nerf_count":0,"meta_stale_high_threshold":4}"#.into()),
+            news: vec![bare("2026.0.0"), own],
+            ..Host::default()
+        };
+        host.saved.insert(AUTHOR_DONE.into(), crate::balance::AUTHOR.into());
+        let request = BalanceRequest { team: 3, off: true, ..BalanceRequest::default() };
+        let (ok, said) = balance(&mut host, &request);
+        assert!(ok && said.contains("1 of the mod's patch notes without a champion now say so"), "{said}");
+        let item = &host.news[1];
+        assert!(game_reads(item), "{item}");
+        assert_eq!(item["ty"]["Simple"]["content"], UNCHANGED_TEXT);
+        assert_eq!(item["ty"]["Simple"]["content_bind"][0], json!(["Patch", "2026.0.0"]));
+        assert_eq!((item["title_bind"].clone(), item["author"].as_str()), (json!([["Version", "2026.0.0b"]]), Some(crate::balance::AUTHOR)));
+        assert_eq!(host.news[0], bare("2026.0.0"), "the game's own notes are not looked at here");
+        // once a save
+        host.news[1] = bare("2026.0.0");
+        host.news[1]["author"] = json!(crate::balance::AUTHOR);
+        let (_, said) = balance(&mut host, &request);
+        assert!(!said.contains("now say so"), "{said}");
     }
 
     #[test]

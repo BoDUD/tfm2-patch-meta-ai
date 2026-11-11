@@ -47,6 +47,10 @@ pub trait Game: Source {
     fn champion_stats(&mut self, _name: &str) -> Option<crate::stats::Stats> {
         None
     }
+    /// Both of the above from one question to the game (its answer about a champion takes tens of milliseconds).
+    fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+        (self.champion_damage(name), self.champion_stats(name))
+    }
     /// The champion's display name.
     fn champion_label(&mut self, _name: &str) -> Option<String> {
         None
@@ -120,6 +124,18 @@ impl Game for ClientGame<'_, '_> {
         let brief = self.ctx.champion_brief(name)?;
         let category = brief.category.map(|c| c.code() as u8);
         Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth))
+    }
+    fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+        use mod_api_stable::ChampionTagV1;
+        let Some(brief) = self.ctx.champion_brief(name) else { return (None, None) };
+        let (ad, ap) = (brief.tags.contains(&ChampionTagV1::Ad), brief.tags.contains(&ChampionTagV1::Ap));
+        let damage = match (ad, ap) {
+            (true, false) => Damage::Physical,
+            (false, true) => Damage::Magic,
+            _ => Damage::Mixed,
+        };
+        let category = brief.category.map(|c| c.code() as u8);
+        (Some(damage), Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth)))
     }
     fn champion_label(&mut self, name: &str) -> Option<String> {
         let key = format!("#asset/base/text/champion?description.{name}.name");
@@ -221,6 +237,8 @@ struct State {
     /// Every champion's stats (read with the champion list).
     stats: Arc<HashMap<String, crate::stats::Stats>>,
     champions: Vec<String>,
+    /// The game's champions while they are being read, a few a frame (`read_champions`).
+    champion_read: Option<ChampionRead>,
     /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
     /// the file is this save's; whether that was settled; when the file was last written and
     /// with how many matches.
@@ -273,6 +291,7 @@ impl State {
             damage: HashMap::new(),
             stats: Arc::new(HashMap::new()),
             champions: Vec::new(),
+            champion_read: None,
             cache_pending: None,
             cache_checked: false,
             cache_written: None,
@@ -290,6 +309,64 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 fn lock() -> MutexGuard<'static, Option<State>> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The game's champions being read: their names, how far the reading is, and the stats read.
+struct ChampionRead {
+    names: Vec<String>,
+    next: usize,
+    stats: HashMap<String, crate::stats::Stats>,
+}
+
+/// A frame's time for reading champions (one champion at least).
+const CHAMPION_BUDGET: Duration = Duration::from_millis(4);
+
+/// The champions' damage types, stats and names, a few a frame (2.8.2): the game's answer about one champion takes
+/// tens of milliseconds, and all 284 asked in one frame froze it for 12-17 s when a save was opened (the server's
+/// answers in that time came too late, too). True while the reading goes on: the model waits for it.
+fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
+    if !st.champions.is_empty() {
+        return false;
+    }
+    let mut read = match st.champion_read.take() {
+        Some(read) => read,
+        None => {
+            let names = game.champion_names();
+            if names.is_empty() {
+                // the host lists none: `rebuild` rates the champions seen in matches
+                return false;
+            }
+            ChampionRead { names, next: 0, stats: HashMap::new() }
+        }
+    };
+    let started = Instant::now();
+    while read.next < read.names.len() {
+        let name = &read.names[read.next];
+        read.next += 1;
+        let (damage, stats) = game.champion_data(name);
+        if let Some(d) = damage {
+            st.damage.insert(st.names.id(name), d);
+        }
+        if let Some(s) = stats {
+            read.stats.insert(name.clone(), s);
+        }
+        if let Some(label) = game.champion_label(name) {
+            st.labels.champions.insert(name.clone(), label);
+        }
+        if started.elapsed() >= CHAMPION_BUDGET {
+            break;
+        }
+    }
+    if read.next < read.names.len() {
+        st.champion_read = Some(read);
+        return true;
+    }
+    st.labels.team_name = game.team_name(team).unwrap_or_default();
+    diag::log(&format!("[probe] stats read for {} of {} champions", read.stats.len(), read.names.len()));
+    st.stats = Arc::new(read.stats);
+    st.champions = read.names;
+    st.dirty = true;
+    false
 }
 
 pub fn reset_for_tests() {
@@ -368,8 +445,8 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
                     st.cache_pending = Some(games);
                 }
             }
-            // this save's balance patches (2.8.0)
-            crate::balance::open(identity.0, &identity.1);
+            // this save's balance patches: its book is opened once the server said which it is (`sync_balance`)
+            crate::balance::close();
             st.save = Some(identity);
         }
     }
@@ -405,7 +482,9 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     let caught_up = st.comp.pending() == 0 && st.solo.pending() == 0;
     let config_changed = st.rebuilt_with.as_ref().is_none_or(|c| !Arc::ptr_eq(c, cfg));
-    if (st.dirty || config_changed) && due(st.next_rebuild, now) {
+    // the champions' data first, a few a frame: the model is fitted with their stats
+    let reading = read_champions(st, game, team);
+    if (st.dirty || config_changed) && due(st.next_rebuild, now) && !reading {
         st.next_rebuild = Some(now + REBUILD_EVERY);
         st.dirty = false;
         st.rebuilt_with = Some(Arc::clone(cfg));
@@ -1255,9 +1334,20 @@ struct BalanceSync {
     prepared: Option<String>,
     prepared_from: Option<(usize, Date)>,
     next_patch: Option<(Date, Option<Date>)>,
+    /// The last request (`off`, round): its answer counts after the wait for it was given up, too (2.8.2 - a save
+    /// being opened stalls the game for tens of seconds, and the answer that came after them was thrown away).
+    sent: Option<(bool, u32)>,
+    /// The save's book (2.8.2): when the server was last asked which it is, and its id once it said ("": the save has
+    /// none; `book_wanted`: it was asked to make one). Nothing of the balance happens before.
+    book_asked: Option<Instant>,
+    book_wanted: bool,
+    book: Option<String>,
 }
 
 type Date = (i32, u32, u32);
+
+/// How long the server is given to say which book the save has before it is asked again.
+const BOOK_RETRY: Duration = Duration::from_secs(5);
 
 /// Game days before the game's scheduled patch that its round is made ahead and handed to the server.
 const PREPARE_DAYS: i64 = 2;
@@ -1362,17 +1452,32 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
             st.dirty = true;
             continue;
         }
+        if event == crate::server::BOOK_RESULT {
+            // which book the save has (`<id>\t<newest round in its news>`; no id: none)
+            let text = String::from_utf8_lossy(payload);
+            let (id, done) = text.split_once('\t').unwrap_or((text.as_ref(), "0"));
+            if st.balance.book.is_none() {
+                if !id.is_empty() {
+                    let name = st.save.as_ref().map(|s| s.1.clone()).unwrap_or_default();
+                    crate::balance::open_book(id, team, &name, done.trim().parse().unwrap_or(0));
+                }
+                st.balance.book = Some(id.to_string());
+            }
+            continue;
+        }
         if event != crate::server::BALANCE_RESULT {
             continue;
         }
         let text = String::from_utf8_lossy(payload);
         let mut parts = text.splitn(3, '\t');
         let (state, ok, detail) = (parts.next().unwrap_or(""), parts.next() == Some("ok"), parts.next().unwrap_or(""));
-        let Some((off, round, _)) = st.balance.waiting else { continue };
+        // the request waited for, or the last one sent: its answer may come after the wait was given up
+        let Some((off, round)) = st.balance.waiting.map(|(off, round, _)| (off, round)).or(st.balance.sent) else { continue };
         if state != format!("{}/{round}", u8::from(off)) {
             continue;
         }
         st.balance.waiting = None;
+        st.balance.sent = None;
         if ok {
             st.balance.acked = Some((off, round));
             st.balance.failures = 0;
@@ -1393,6 +1498,30 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
             st.balance.retry_at = Some(now + backoff(st.balance.failures));
             diag::log("[balance] no answer from the server; trying again later");
         }
+    }
+    // the save's book first: the server says which it is (the id is kept in the save)
+    match st.balance.book.as_deref() {
+        None => {
+            let create: &[u8] = if cfg.balance { b"1" } else { b"0" };
+            if due(st.balance.book_asked.map(|t| t + BOOK_RETRY), now) && game.send_command(crate::server::BALANCE_BOOK, create) {
+                st.balance.book_asked = Some(now);
+                st.balance.book_wanted = cfg.balance;
+            }
+            return;
+        }
+        // the save has none, and the setting is on (turned on since): asked again, for one to be made
+        Some("") if cfg.balance && !st.balance.book_wanted => {
+            st.balance.book = None;
+            st.balance.book_asked = None;
+            return;
+        }
+        Some("") => {
+            if cfg.balance {
+                diag::log_once("balance-no-book", "[balance] the save keeps no id for its book: no balance patches on it");
+            }
+            return;
+        }
+        Some(_) => {}
     }
     let rules = crate::balance::Rules { count: cfg.balance_count, max_step: cfg.balance_max };
     if cfg.balance {
@@ -1436,10 +1565,11 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
     } else {
         withdraw_prepared(st, game);
     }
-    // the server: nothing to say on a save that never had a round with this off
+    // the server (a save with a book: the setting was on once). Off with no round yet: the game's champion patches,
+    // turned off when it was on, are put back all the same
     let newest = crate::balance::latest();
     let want = match (&newest, cfg.balance) {
-        (None, false) => return,
+        (None, false) => (false, 0),
         // on, no round yet: the game's champion patches off already
         (None, true) => (true, 0),
         (Some(r), true) => (true, r.id),
@@ -1448,12 +1578,17 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
     if st.balance.acked == Some(want) || st.balance.waiting.is_some() || !due(st.balance.retry_at, now) {
         return;
     }
+    // a round's lines are the champions' numbers: not before they are read (a few a frame after a save opens)
+    if newest.is_some() && st.champions.is_empty() {
+        return;
+    }
     let req = match (&newest, want.0) {
         (Some(round), true) => balance_request(st, team, round, rules),
         _ => BalanceRequest { team, off: want.0, round: want.1, ..BalanceRequest::default() },
     };
     if game.send_command(crate::server::APPLY_BALANCE, req.encode().as_bytes()) {
         st.balance.waiting = Some((want.0, want.1, now));
+        st.balance.sent = Some((want.0, want.1));
     } else {
         st.balance.failures += 1;
         st.balance.retry_at = Some(now + backoff(st.balance.failures));
@@ -1550,6 +1685,12 @@ mod tests {
         reads: u32,
         /// Fit on a worker thread, as in the game (the frame-timing test).
         threaded: bool,
+        /// The save's book as the server says it (id, newest round in its news), the balance commands sent, and how
+        /// long the game takes to answer about a champion.
+        book: (String, u32),
+        balance_sent: Vec<String>,
+        champion_delay: Duration,
+        champions_asked: u32,
     }
 
     impl Source for FakeGame {
@@ -1612,6 +1753,16 @@ mod tests {
             Some(self.date)
         }
         fn send_command(&mut self, command: &str, payload: &[u8]) -> bool {
+            if command == server::BALANCE_BOOK {
+                // which book the save has (none unless a test gives it one)
+                let answer = format!("{}\t{}", self.book.0, self.book.1);
+                self.events.push((server::BOOK_RESULT.to_string(), answer.into_bytes()));
+                return true;
+            }
+            if command == server::APPLY_BALANCE || command == server::PREPARE_BALANCE {
+                self.balance_sent.push(command.to_string());
+                return true;
+            }
             assert_eq!(command, APPLY_TIERS);
             let req = Request::parse(payload, None).unwrap();
             // what the server does with it
@@ -1629,6 +1780,13 @@ mod tests {
         }
         fn threaded(&self) -> bool {
             self.threaded
+        }
+        fn champion_data(&mut self, _name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+            self.champions_asked += 1;
+            if !self.champion_delay.is_zero() {
+                std::thread::sleep(self.champion_delay);
+            }
+            (None, None)
         }
     }
 
@@ -1944,6 +2102,106 @@ mod tests {
         g.news = Value::Array(items.clone()).to_string();
         probe_news(&mut st, &mut g, 4);
         assert_eq!(st.balance.news_len, Some(3));
+    }
+
+    #[test]
+    fn the_champions_are_read_a_few_a_frame() {
+        let mut g = save();
+        // an answer takes longer than a frame's time for them: one a frame, and the model waits
+        g.champion_delay = CHAMPION_BUDGET * 2;
+        let mut st = State::new();
+        assert!(read_champions(&mut st, &mut g, 4));
+        assert_eq!(g.champions_asked, 1);
+        assert!(st.champions.is_empty() && !st.dirty);
+        let mut frames = 2;
+        while read_champions(&mut st, &mut g, 4) {
+            frames += 1;
+            assert!(frames < 20);
+        }
+        assert_eq!((frames, g.champions_asked, st.champions.len()), (10, 10, 10), "ten champions, ten frames");
+        assert!(st.dirty, "the model is built with them");
+        // quick answers: all in one frame
+        let mut quick = save();
+        let mut st2 = State::new();
+        assert!(!read_champions(&mut st2, &mut quick, 4));
+        assert_eq!((quick.champions_asked, st2.champions.len()), (10, 10));
+        // read once a save
+        assert!(!read_champions(&mut st, &mut g, 4));
+        assert_eq!(g.champions_asked, 10);
+    }
+
+    #[test]
+    fn the_book_is_opened_once_the_server_said_which_it_is() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        crate::balance::reset_for_tests();
+        let mut g = save();
+        g.book = ("abc12345".into(), 0);
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        let cfg = Config::default();
+        let t0 = Instant::now();
+        // asked first: nothing of the balance before the answer
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert!(st.balance.book.is_none() && crate::balance::book().is_none());
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert_eq!(g.events.len(), 1, "asked once while the answer is on its way");
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &events);
+        assert_eq!(st.balance.book.as_deref(), Some("abc12345"));
+        assert!(crate::balance::book().is_some_and(|b| b.ends_with("balance-abc12345.json")));
+        // a book, the setting off and no round yet: the game's own champion patches are asked back all the same
+        assert_eq!(g.balance_sent, [server::APPLY_BALANCE]);
+        assert_eq!(st.balance.waiting.map(|w| (w.0, w.1)), Some((false, 0)));
+        // a save with none (the setting off): nothing opened, nothing asked again
+        crate::balance::reset_for_tests();
+        let mut g = save();
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &events);
+        sync_balance(&mut st, &mut g, &cfg, 4, t0 + BOOK_RETRY * 3, &[]);
+        assert_eq!(st.balance.book.as_deref(), Some(""));
+        assert!(crate::balance::book().is_none() && g.events.is_empty());
+        crate::balance::reset_for_tests();
+    }
+
+    #[test]
+    fn the_servers_answer_counts_after_the_wait_for_it_was_given_up() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        crate::balance::reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_late_answer_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::balance::open_for_tests(file.clone());
+        crate::balance::publish(crate::balance::Round { id: 1, version: "1.1".into(), ..Default::default() });
+        let mut g = save();
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        st.balance.book = Some("book".into());
+        // the setting off on a save with a round: the game's own champion patches are to be put back
+        let cfg = Config::default();
+        let t0 = Instant::now();
+        // not before the champions are read (a round's lines are their numbers)
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert!(g.balance_sent.is_empty());
+        st.champions = vec!["a".into()];
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert_eq!(g.balance_sent, [server::APPLY_BALANCE]);
+        assert_eq!(st.balance.waiting.map(|w| (w.0, w.1)), Some((false, 1)));
+        // a save being opened stalls the game: no answer in time
+        let late = t0 + REPLY_TIMEOUT + Duration::from_secs(1);
+        sync_balance(&mut st, &mut g, &cfg, 4, late, &[]);
+        assert!(st.balance.waiting.is_none() && st.balance.acked.is_none());
+        // it comes a frame later: taken all the same, nothing sent again
+        let answer = (server::BALANCE_RESULT.to_string(), b"0/1\tok\tthe game's champion patches put back".to_vec());
+        sync_balance(&mut st, &mut g, &cfg, 4, late, &[answer]);
+        assert_eq!(st.balance.acked, Some((false, 1)));
+        sync_balance(&mut st, &mut g, &cfg, 4, late + Duration::from_secs(900), &[]);
+        assert_eq!(g.balance_sent.len(), 1);
+        crate::balance::reset_for_tests();
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

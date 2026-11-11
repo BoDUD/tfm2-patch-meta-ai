@@ -122,14 +122,21 @@ pub fn combine(notes: Vec<PatchNote>) -> Vec<PatchNote> {
 
 fn patch_note(item: &Value) -> Option<PatchNote> {
     let data = find_key(item, "champion_patch_data");
-    if data.is_none() && !mentions(item, "PatchNote", 0) {
+    // patch notes that listed nothing, made plain news by the balance patches (`server::unchanged`): the patch's
+    // notes all the same, the game's patch in the `Patch` bind
+    let unchanged = data.is_none() && mentions(item, "patch.pma_none", 0);
+    if data.is_none() && !unchanged && !mentions(item, "PatchNote", 0) {
         return None;
     }
     let mut versions = Vec::new();
     if let Some(bind) = find_key(item, "title_bind") {
         strings(bind, &mut versions, 0);
     }
-    let version = find_key(item, "version").and_then(version_string);
+    let bound = || {
+        let binds = item.get("ty")?.get("Simple")?.get("content_bind")?.as_array()?;
+        binds.iter().find(|b| b.get(0).and_then(Value::as_str) == Some("Patch"))?.get(1)?.as_str().map(str::to_string)
+    };
+    let version = find_key(item, "version").and_then(version_string).or_else(|| if unchanged { bound() } else { None });
     if let Some(v) = &version {
         versions.push(v.clone());
     }

@@ -1,6 +1,7 @@
 {
   "ko": {
     "patch": {
+      "pma_none": "이번 패치에는 챔피언 변경이 없습니다. 경기 수가 충분한 챔피언은 모두 목표 승률 구간(48~52%) 안에 있거나, 최근에 조정되어 새 수치로 치른 경기를 더 기다리고 있습니다.",
       "reason": {
         "pma_wr_0": "최근 승률이 약 0%로 목표 구간(48~52%)보다 낮습니다.",
         "pma_wr_1": "최근 승률이 약 1%로 목표 구간(48~52%)보다 낮습니다.",
@@ -110,6 +111,7 @@
   },
   "en": {
     "patch": {
+      "pma_none": "No champion changes this patch: every champion with enough games is inside the 48–52% win-rate target, or was changed recently and is still gathering games with its new numbers.",
       "reason": {
         "pma_wr_0": "Its recent win rate is about 0%, below the 48–52% target.",
         "pma_wr_1": "Its recent win rate is about 1%, below the 48–52% target.",
@@ -219,6 +221,7 @@
   },
   "ja": {
     "patch": {
+      "pma_none": "今回のパッチではチャンピオンの変更はありません。試合数が十分なチャンピオンはすべて目標勝率（48〜52%）の範囲内にあるか、最近調整されたばかりで新しい数値での試合を待っています。",
       "reason": {
         "pma_wr_0": "最近の勝率は約0%で、目標の48〜52%を下回っています。",
         "pma_wr_1": "最近の勝率は約1%で、目標の48〜52%を下回っています。",
@@ -328,6 +331,7 @@
   },
   "de": {
     "patch": {
+      "pma_none": "In diesem Patch gibt es keine Champion-Änderungen: Alle Champions mit genügend Spielen liegen im Zielbereich von 48–52 % Siegquote oder wurden kürzlich angepasst und sammeln noch Spiele mit ihren neuen Werten.",
       "reason": {
         "pma_wr_0": "Die jüngste Siegquote liegt bei etwa 0 % und damit unter dem Zielbereich von 48–52 %.",
         "pma_wr_1": "Die jüngste Siegquote liegt bei etwa 1 % und damit unter dem Zielbereich von 48–52 %.",
@@ -437,6 +441,7 @@
   },
   "vi": {
     "patch": {
+      "pma_none": "Bản cập nhật này không thay đổi tướng nào: mọi tướng có đủ số trận đều nằm trong mục tiêu tỷ lệ thắng 48–52%, hoặc vừa được điều chỉnh và còn đang chờ thêm trận với chỉ số mới.",
       "reason": {
         "pma_wr_0": "Tỷ lệ thắng gần đây khoảng 0%, thấp hơn mục tiêu 48–52%.",
         "pma_wr_1": "Tỷ lệ thắng gần đây khoảng 1%, thấp hơn mục tiêu 48–52%.",
@@ -546,6 +551,7 @@
   },
   "pt-BR": {
     "patch": {
+      "pma_none": "Nenhum campeão mudou neste patch: todos os campeões com partidas suficientes estão dentro da meta de 48–52% de vitórias, ou foram ajustados há pouco e ainda acumulam partidas com os novos valores.",
       "reason": {
         "pma_wr_0": "Sua taxa de vitória recente está em cerca de 0%, abaixo da meta de 48–52%.",
         "pma_wr_1": "Sua taxa de vitória recente está em cerca de 1%, abaixo da meta de 48–52%.",
@@ -655,6 +661,7 @@
   },
   "tr": {
     "patch": {
+      "pma_none": "Bu yamada şampiyon değişikliği yok: yeterli maçı olan tüm şampiyonlar %48–52 kazanma oranı hedefinin içinde ya da yakın zamanda ayarlandı ve yeni değerleriyle maç biriktiriyor.",
       "reason": {
         "pma_wr_0": "Son kazanma oranı yaklaşık %0, %48–52 hedefinin altında.",
         "pma_wr_1": "Son kazanma oranı yaklaşık %1, %48–52 hedefinin altında.",
@@ -764,6 +771,7 @@
   },
   "nl": {
     "patch": {
+      "pma_none": "Geen championwijzigingen in deze patch: alle champions met genoeg wedstrijden zitten binnen het doel van 48–52% winst, of zijn pas aangepast en verzamelen nog wedstrijden met hun nieuwe waarden.",
       "reason": {
         "pma_wr_0": "Het recente winpercentage is ongeveer 0%, onder het doel van 48–52%.",
         "pma_wr_1": "Het recente winpercentage is ongeveer 1%, onder het doel van 48–52%.",
@@ -873,6 +881,7 @@
   },
   "ru": {
     "patch": {
+      "pma_none": "В этом патче нет изменений чемпионов: у всех чемпионов с достаточным числом игр процент побед в целевых 48–52%, либо их недавно изменили, и они ещё набирают игры с новыми показателями.",
       "reason": {
         "pma_wr_0": "Недавний процент побед — около 0%, ниже целевых 48–52%.",
         "pma_wr_1": "Недавний процент побед — около 1%, ниже целевых 48–52%.",
@@ -982,6 +991,7 @@
   },
   "es-ES": {
     "patch": {
+      "pma_none": "Este parche no cambia ningún campeón: todos los campeones con suficientes partidas están dentro del objetivo del 48-52 % de victorias, o se ajustaron hace poco y aún acumulan partidas con sus nuevos valores.",
       "reason": {
         "pma_wr_0": "Su tasa de victorias reciente ronda el 0 %, por debajo del objetivo del 48-52 %.",
         "pma_wr_1": "Su tasa de victorias reciente ronda el 1 %, por debajo del objetivo del 48-52 %.",
@@ -1091,6 +1101,7 @@
   },
   "fr": {
     "patch": {
+      "pma_none": "Aucun changement de champion dans ce patch : tous les champions ayant assez de parties sont dans la cible de 48 à 52 % de victoires, ou ont été modifiés récemment et accumulent encore des parties avec leurs nouvelles valeurs.",
       "reason": {
         "pma_wr_0": "Son taux de victoire récent est d'environ 0 %, en dessous de la cible de 48 à 52 %.",
         "pma_wr_1": "Son taux de victoire récent est d'environ 1 %, en dessous de la cible de 48 à 52 %.",
@@ -1200,6 +1211,7 @@
   },
   "it": {
     "patch": {
+      "pma_none": "Nessun campione cambia in questa patch: tutti i campioni con abbastanza partite sono entro l'obiettivo del 48–52% di vittorie, oppure sono stati modificati di recente e stanno ancora accumulando partite con i nuovi valori.",
       "reason": {
         "pma_wr_0": "Il suo tasso di vittoria recente è di circa il 0%, sotto l'obiettivo del 48–52%.",
         "pma_wr_1": "Il suo tasso di vittoria recente è di circa il 1%, sotto l'obiettivo del 48–52%.",
@@ -1309,6 +1321,7 @@
   },
   "zh-hans": {
     "patch": {
+      "pma_none": "本次版本没有英雄改动：场次足够的英雄，胜率都在 48%–52% 的目标区间内，或者刚调整过、还在等新数值下的比赛。",
       "reason": {
         "pma_wr_0": "近期胜率约 0%，低于 48%–52% 的目标区间。",
         "pma_wr_1": "近期胜率约 1%，低于 48%–52% 的目标区间。",
@@ -1418,6 +1431,7 @@
   },
   "zh-hant": {
     "patch": {
+      "pma_none": "本次版本沒有英雄改動：場次足夠的英雄，勝率都在 48%–52% 的目標區間內，或者剛調整過、還在等新數值下的比賽。",
       "reason": {
         "pma_wr_0": "近期勝率約 0%，低於 48%–52% 的目標區間。",
         "pma_wr_1": "近期勝率約 1%，低於 48%–52% 的目標區間。",
@@ -1527,6 +1541,7 @@
   },
   "pl": {
     "patch": {
+      "pma_none": "W tej łatce nie zmieniono żadnego bohatera: wszyscy bohaterowie z wystarczającą liczbą gier mieszczą się w celu 48–52% zwycięstw albo zostali niedawno zmienieni i wciąż zbierają gry z nowymi wartościami.",
       "reason": {
         "pma_wr_0": "Ostatni współczynnik zwycięstw wynosi około 0%, poniżej celu 48–52%.",
         "pma_wr_1": "Ostatni współczynnik zwycięstw wynosi około 1%, poniżej celu 48–52%.",
@@ -1636,6 +1651,7 @@
   },
   "th": {
     "patch": {
+      "pma_none": "แพตช์นี้ไม่มีการปรับแชมเปี้ยน: แชมเปี้ยนที่มีจำนวนเกมเพียงพอทุกตัวอยู่ในเป้าหมายอัตราชนะ 48–52% หรือเพิ่งถูกปรับและยังรอเกมด้วยค่าใหม่",
       "reason": {
         "pma_wr_0": "อัตราชนะล่าสุดประมาณ 0% ต่ำกว่าเป้าหมาย 48–52%",
         "pma_wr_1": "อัตราชนะล่าสุดประมาณ 1% ต่ำกว่าเป้าหมาย 48–52%",
@@ -1745,6 +1761,7 @@
   },
   "haw": {
     "patch": {
+      "pma_none": "No champion changes this patch: every champion with enough games is inside the 48–52% win-rate target, or was changed recently and is still gathering games with its new numbers.",
       "reason": {
         "pma_wr_0": "Its recent win rate is about 0%, below the 48–52% target.",
         "pma_wr_1": "Its recent win rate is about 1%, below the 48–52% target.",

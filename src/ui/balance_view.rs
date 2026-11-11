@@ -177,6 +177,11 @@ impl BalanceView {
                 };
                 let Some(ours) = ours else { continue };
                 if ui.set_text(path, &ours) {
+                    // once a panel and save: that the numbers reach this screen (a game update may move its labels)
+                    crate::diag::log_once(
+                        &format!("balance-view-{}", panel.name),
+                        &format!("[ui] stat panel {}: {champion} at {power:+}% of power, {path} {text:?} -> {ours:?}", panel.name),
+                    );
                     self.labels.insert(path.clone(), (text, ours, champion.clone()));
                 }
             }

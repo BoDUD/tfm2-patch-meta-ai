@@ -30,8 +30,10 @@
 //! - **The game's own champion patches off**: the server half sets the save's auto-patcher counts to zero while this
 //!   is on, keeping the save's own values to put back when it is turned off (`server::balance`).
 //!
-//! The book is one file a save in the mod folder (`balance-team<id>-<hash>.json`): every round (its changes and
-//! every champion's power after it) and the kept matches.
+//! The book is one file a save in the mod folder (`balance-<id>.json`, the id kept in the save since 2.8.2 - named by
+//! the team before, a new career with the same team took the old one's book): every round (its changes and every
+//! champion's power after it) and the kept matches. Opened with the newest round the save's news has: the book's
+//! rounds after it are another save's ([`open_book`]).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -558,6 +560,12 @@ struct Store {
     /// This save's file (None: no save open).
     file: Option<PathBuf>,
     rounds: Vec<Round>,
+    /// The book's rounds after the open save (made after it was saved: a later save of the career has them in its
+    /// news). Not played here; kept in the file until this save makes a round of its own.
+    later: Vec<Round>,
+    /// The newest round the save's news had when it was opened: a new round's id comes after it (and after the
+    /// book's own - they are the same unless the book was lost).
+    done: u32,
     /// Each round's power, shared with the runs.
     powers: HashMap<u32, Arc<BTreeMap<String, i32>>>,
     kept: HashMap<String, u32>,
@@ -595,23 +603,61 @@ fn store() -> std::sync::MutexGuard<'static, Store> {
     STORE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The book's file for a save: the player's team id and a hash of its name (as the match history's).
-pub fn path(team: usize, team_name: &str) -> PathBuf {
+/// The book's file of 2.8.0 and 2.8.1: the player's team id and a hash of its name. Two careers with the same team
+/// shared it (a new one took the old one's rounds), so a save has an id of its own now ([`open_book`]).
+pub fn legacy_path(team: usize, team_name: &str) -> PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     team_name.hash(&mut h);
     paths::mod_dir().join(format!("balance-team{team}-{:08x}.json", h.finish() as u32))
 }
 
-/// A save is open: its book (empty when it has none yet).
-pub fn open(team: usize, team_name: &str) {
-    open_file(path(team, team_name));
+/// A save is open: its book, `balance-<id>.json` - the id is kept in the save (`server::book`), `done` is the newest
+/// round the save's news has. A save from before the ids with rounds written takes over its book of then
+/// ([`legacy_path`]) the first time. The book's rounds after `done` (made after the save was written - a later save of
+/// the career has them) are not played, and stay in the file until this save makes a round of its own.
+pub fn open_book(id: &str, team: usize, team_name: &str, done: u32) {
+    let file = paths::mod_dir().join(format!("balance-{id}.json"));
+    open_book_file(file, legacy_path(team, team_name), done);
+}
+
+fn open_book_file(file: PathBuf, legacy: PathBuf, done: u32) {
+    open_file(file);
+    let mut st = store();
+    st.done = done;
+    if st.rounds.is_empty() && done > 0 {
+        // the save has rounds in its news and the book none: a save of 2.8.0 / 2.8.1, its book named by the team
+        let old = std::fs::read_to_string(&legacy).ok().and_then(|t| serde_json::from_str::<Book>(&t).ok());
+        if let Some(book) = old.filter(|b| !b.rounds.is_empty()) {
+            diag::log(&format!("[balance] this save's book taken over from {}", legacy.display()));
+            load(&mut st, book);
+            write(&mut st);
+        }
+    }
+    let at = st.rounds.iter().position(|r| r.id > done).unwrap_or(st.rounds.len());
+    let later = st.rounds.split_off(at);
+    if !later.is_empty() {
+        for r in &later {
+            st.powers.remove(&r.id);
+        }
+        let view = st.rounds.last().and_then(|r| st.powers.get(&r.id).map(|power| view_of(r, power)));
+        st.view = view;
+        diag::log(&format!("[balance] {} rounds of the book are after this save (not in its news): not played", later.len()));
+        st.later = later;
+    }
+    if !st.rounds.is_empty() {
+        diag::log(&format!("[balance] {} rounds in this save's book, {} matches kept", st.rounds.len(), st.kept.len()));
+    }
 }
 
 fn open_file(file: PathBuf) {
     let book = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Book>(&t).ok()).unwrap_or_default();
     let mut st = store();
     *st = Store { file: Some(file), ..Store::default() };
+    load(&mut st, book);
+}
+
+fn load(st: &mut Store, book: Book) {
     for r in book.rounds {
         let power = Arc::new(r.power.clone());
         st.view = Some(view_of(&r, &power));
@@ -619,11 +665,9 @@ fn open_file(file: PathBuf) {
         st.rounds.push(r);
     }
     for (key, id) in book.kept {
-        st.order.push_back(key.clone());
-        st.kept.insert(key, id);
-    }
-    if !st.rounds.is_empty() {
-        diag::log(&format!("[balance] {} rounds in this save's book, {} matches kept", st.rounds.len(), st.kept.len()));
+        if st.kept.insert(key.clone(), id).is_none() {
+            st.order.push_back(key);
+        }
     }
 }
 
@@ -639,7 +683,7 @@ pub fn close() {
 fn write(st: &mut Store) {
     let Some(file) = &st.file else { return };
     let kept = st.order.iter().filter_map(|k| Some((k.clone(), *st.kept.get(k)?))).collect();
-    let book = Book { v: 1, rounds: st.rounds.clone(), kept };
+    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept };
     if let Ok(text) = serde_json::to_string(&book) {
         let _ = std::fs::write(file, text);
     }
@@ -671,7 +715,10 @@ pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Du
 
 /// The round `due` asks for on this save ([`make_round`]); not in the book until [`publish`]ed.
 pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
-    make_round(meta, &store().rounds, rules, due, today)
+    let st = store();
+    let mut round = make_round(meta, &st.rounds, rules, due, today);
+    round.id = round.id.max(st.done + 1);
+    round
 }
 
 /// A new round: in the book from now on (new matches play it).
@@ -683,6 +730,8 @@ fn publish_in(st: &mut Store, round: Round) {
     if st.file.is_none() {
         return;
     }
+    // a round of this save's own: the book's rounds after the save are another save's no more
+    st.later.clear();
     let power = Arc::new(round.power.clone());
     st.view = Some(view_of(&round, &power));
     st.powers.insert(round.id, power);
@@ -708,7 +757,7 @@ pub fn publish_prepared(round: Round, book: &str) -> Result<(), String> {
     if st.rounds.iter().any(|r| r.version == round.version) {
         return Err(format!("the book has a round of {} already", round.version));
     }
-    let next = st.rounds.last().map_or(1, |r| r.id + 1);
+    let next = st.rounds.last().map_or(1, |r| r.id + 1).max(st.done + 1);
     if round.id != next {
         return Err(format!("made as round {} while the book's next is {next}", round.id));
     }
@@ -1144,6 +1193,69 @@ mod tests {
         assert_eq!(notes().len(), 2);
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
+    }
+
+    #[test]
+    fn a_save_has_a_book_of_its_own_with_the_rounds_it_knows() {
+        let _serial = crate::tests::serial();
+        reset_for_tests();
+        let file = |name: &str| std::env::temp_dir().join(format!("pma_book_{name}_{}.json", std::process::id()));
+        let (legacy, own, career) = (file("legacy"), file("own"), file("career"));
+        for f in [&legacy, &own, &career] {
+            let _ = std::fs::remove_file(f);
+        }
+        // a book of 2.8.1 (named by the team): three rounds, a match played with each
+        open_file(legacy.clone());
+        for id in 1..=3u32 {
+            let power = [("maddie".to_string(), -10 * id as i32)].into_iter().collect();
+            publish(Round { id, version: format!("1.{id}"), power, ..Round::default() });
+            round_for(format!("match{id}"), true, true);
+        }
+        close();
+        // its save opened by 2.8.2: the save's news has two rounds (the third was made after it was saved)
+        open_book_file(own.clone(), legacy.clone(), 2);
+        assert_eq!(rounds().iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(view().map(|v| (v.id, v.power.get("maddie").copied())), Some((2, Some(-20))));
+        assert_eq!(round_for("match2".into(), false, true).map(|p| p["maddie"]), Some(-20));
+        assert_eq!(round_for("match3".into(), false, true), None, "a round after this save is not played");
+        assert!(legacy.exists(), "the old book stays for that career's other saves");
+        close();
+        // the career's later save opened again (its own book now, whatever became of the old one): the third round
+        // is still there
+        let _ = std::fs::remove_file(&legacy);
+        open_book_file(own.clone(), legacy.clone(), 3);
+        assert_eq!(rounds().len(), 3);
+        assert_eq!(round_for("match3".into(), false, true).map(|p| p["maddie"]), Some(-30));
+        close();
+        // back on the earlier save, and it goes its own way: its round takes the later one's place
+        open_book_file(own.clone(), legacy.clone(), 2);
+        assert_eq!(due_now(Some("1.3"), None), Some(Due::Patch("1.3".into())), "the later round is not this save's");
+        publish(Round { id: 3, version: "1.3".into(), label: "its own".into(), ..Round::default() });
+        close();
+        open_book_file(own.clone(), legacy.clone(), 3);
+        assert_eq!(rounds().iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["", "", "its own"]);
+        close();
+        // a new career with the same team (its news has no round): an empty book of its own
+        open_file(legacy.clone());
+        publish(Round { id: 1, version: "1.1".into(), ..Round::default() });
+        close();
+        open_book_file(career.clone(), legacy.clone(), 0);
+        assert!(rounds().is_empty() && view().is_none() && !career.exists());
+        assert_eq!(due_now(Some("1.1"), None), Some(Due::First("1.1".into())));
+        assert_eq!(make(&meta(), RULES, &Due::First("1.1".into()), None).id, 1);
+        close();
+        // a save whose book was lost (its news has two rounds, no file anywhere): the ids go on after them
+        let _ = std::fs::remove_file(&legacy);
+        open_book_file(career.clone(), legacy.clone(), 2);
+        assert!(rounds().is_empty());
+        let next = make(&meta(), RULES, &Due::First("1.1".into()), None);
+        assert_eq!(next.id, 3);
+        assert_eq!(publish_prepared(next, &book().unwrap()), Ok(()));
+        assert_eq!(rounds().iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
+        reset_for_tests();
+        for f in [&legacy, &own, &career] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Writes package/text/news.i18n: the balance patches' reasons (2.8.0), merged into the game's news texts.
+"""Writes package/text/news.i18n: the balance patches' texts (2.8.0), merged into the game's news texts.
 
 The game's patch notes give each champion a reason as codes of `patch.reason.*` texts; the balance patches' codes
 (`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100) and the limits that held a change (`pma_cap`,
-`pma_total`). A text cannot carry a number of its own, so there is one per win rate.
+`pma_total`). A text cannot carry a number of its own, so there is one per win rate. `patch.pma_none` (2.8.2) is what
+patch notes without a champion change say (`server::UNCHANGED_TEXT`).
 
     python tools/news_i18n.py
 """
@@ -127,6 +128,25 @@ TEXTS = {
         "การปรับรวมถึงขีดจำกัด ±{cap}% แล้ว",
     ),
 }
+# what patch notes say when no champion changed
+NONE = {
+    "zh-hans": "本次版本没有英雄改动：场次足够的英雄，胜率都在 48%–52% 的目标区间内，或者刚调整过、还在等新数值下的比赛。",
+    "zh-hant": "本次版本沒有英雄改動：場次足夠的英雄，勝率都在 48%–52% 的目標區間內，或者剛調整過、還在等新數值下的比賽。",
+    "en": "No champion changes this patch: every champion with enough games is inside the 48–52% win-rate target, or was changed recently and is still gathering games with its new numbers.",
+    "ko": "이번 패치에는 챔피언 변경이 없습니다. 경기 수가 충분한 챔피언은 모두 목표 승률 구간(48~52%) 안에 있거나, 최근에 조정되어 새 수치로 치른 경기를 더 기다리고 있습니다.",
+    "ja": "今回のパッチではチャンピオンの変更はありません。試合数が十分なチャンピオンはすべて目標勝率（48〜52%）の範囲内にあるか、最近調整されたばかりで新しい数値での試合を待っています。",
+    "de": "In diesem Patch gibt es keine Champion-Änderungen: Alle Champions mit genügend Spielen liegen im Zielbereich von 48–52 % Siegquote oder wurden kürzlich angepasst und sammeln noch Spiele mit ihren neuen Werten.",
+    "fr": "Aucun changement de champion dans ce patch : tous les champions ayant assez de parties sont dans la cible de 48 à 52 % de victoires, ou ont été modifiés récemment et accumulent encore des parties avec leurs nouvelles valeurs.",
+    "es-ES": "Este parche no cambia ningún campeón: todos los campeones con suficientes partidas están dentro del objetivo del 48-52 % de victorias, o se ajustaron hace poco y aún acumulan partidas con sus nuevos valores.",
+    "pt-BR": "Nenhum campeão mudou neste patch: todos os campeões com partidas suficientes estão dentro da meta de 48–52% de vitórias, ou foram ajustados há pouco e ainda acumulam partidas com os novos valores.",
+    "it": "Nessun campione cambia in questa patch: tutti i campioni con abbastanza partite sono entro l'obiettivo del 48–52% di vittorie, oppure sono stati modificati di recente e stanno ancora accumulando partite con i nuovi valori.",
+    "ru": "В этом патче нет изменений чемпионов: у всех чемпионов с достаточным числом игр процент побед в целевых 48–52%, либо их недавно изменили, и они ещё набирают игры с новыми показателями.",
+    "pl": "W tej łatce nie zmieniono żadnego bohatera: wszyscy bohaterowie z wystarczającą liczbą gier mieszczą się w celu 48–52% zwycięstw albo zostali niedawno zmienieni i wciąż zbierają gry z nowymi wartościami.",
+    "tr": "Bu yamada şampiyon değişikliği yok: yeterli maçı olan tüm şampiyonlar %48–52 kazanma oranı hedefinin içinde ya da yakın zamanda ayarlandı ve yeni değerleriyle maç biriktiriyor.",
+    "nl": "Geen championwijzigingen in deze patch: alle champions met genoeg wedstrijden zitten binnen het doel van 48–52% winst, of zijn pas aangepast en verzamelen nog wedstrijden met hun nieuwe waarden.",
+    "vi": "Bản cập nhật này không thay đổi tướng nào: mọi tướng có đủ số trận đều nằm trong mục tiêu tỷ lệ thắng 48–52%, hoặc vừa được điều chỉnh và còn đang chờ thêm trận với chỉ số mới.",
+    "th": "แพตช์นี้ไม่มีการปรับแชมเปี้ยน: แชมเปี้ยนที่มีจำนวนเกมเพียงพอทุกตัวอยู่ในเป้าหมายอัตราชนะ 48–52% หรือเพิ่งถูกปรับและยังรอเกมด้วยค่าใหม่",
+}
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
 
@@ -144,7 +164,7 @@ def reasons(lang):
 
 def main():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    doc = {lang: {"patch": {"reason": reasons(lang)}} for lang in LANGUAGES}
+    doc = {lang: {"patch": {"pma_none": NONE.get(lang, NONE["en"]), "reason": reasons(lang)}} for lang in LANGUAGES}
     path = os.path.join(root, "package", "text", "news.i18n")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
