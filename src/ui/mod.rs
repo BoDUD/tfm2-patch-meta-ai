@@ -7,6 +7,7 @@
 //! its own, so every node this mod adds is checked for every few frames and put back when it
 //! is gone, and nothing assumes a node exists without asking.
 
+pub mod balance_view;
 pub mod draft_screen;
 pub mod lineup_screen;
 pub mod explore;
@@ -217,6 +218,7 @@ struct State {
     page: page::MetaPage,
     tactics: tactics_screen::TacticsScreen,
     lineup: lineup_screen::LineupScreen,
+    balance: balance_view::BalanceView,
     context: Context,
 }
 
@@ -303,6 +305,11 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     }
     if cfg.meta_page {
         time(Part::Page, || st.page.tick(ui, &f));
+    }
+    // the stat panels with the balance patches on (2.8.0)
+    if cfg.balance {
+        let view = crate::balance::view();
+        time(Part::Page, || st.balance.tick(ui, &st.names, view.as_deref()));
     }
 }
 

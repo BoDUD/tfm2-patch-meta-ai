@@ -23,7 +23,7 @@ use crate::patchnotes::{self, PatchNote};
 use crate::records::{compare_versions, same_version_shape};
 use crate::report::{self, Labels};
 use crate::scan::{Scanner, Source, Step, VersionStats};
-use crate::server::{Request, APPLY_TIERS, FIELD, RESULT_EVENT};
+use crate::server::{BalanceRequest, NoteRequest, Request, APPLY_TIERS, FIELD, RESULT_EVENT};
 use crate::worker::{Job, Worker};
 use crate::{diag, meta, shared};
 
@@ -46,6 +46,10 @@ pub trait Game: Source {
     /// The champion's category and stat block.
     fn champion_stats(&mut self, _name: &str) -> Option<crate::stats::Stats> {
         None
+    }
+    /// Both of the above from one question to the game (its answer about a champion takes tens of milliseconds).
+    fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+        (self.champion_damage(name), self.champion_stats(name))
     }
     /// The champion's display name.
     fn champion_label(&mut self, _name: &str) -> Option<String> {
@@ -121,6 +125,18 @@ impl Game for ClientGame<'_, '_> {
         let category = brief.category.map(|c| c.code() as u8);
         Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth))
     }
+    fn champion_data(&mut self, name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+        use mod_api_stable::ChampionTagV1;
+        let Some(brief) = self.ctx.champion_brief(name) else { return (None, None) };
+        let (ad, ap) = (brief.tags.contains(&ChampionTagV1::Ad), brief.tags.contains(&ChampionTagV1::Ap));
+        let damage = match (ad, ap) {
+            (true, false) => Damage::Physical,
+            (false, true) => Damage::Magic,
+            _ => Damage::Mixed,
+        };
+        let category = brief.category.map(|c| c.code() as u8);
+        (Some(damage), Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth)))
+    }
     fn champion_label(&mut self, name: &str) -> Option<String> {
         let key = format!("#asset/base/text/champion?description.{name}.name");
         self.ctx.i18n(&key).filter(|s| !s.is_empty() && !s.starts_with('#'))
@@ -160,6 +176,9 @@ const REBUILD_EVERY: Duration = Duration::from_secs(5);
 /// meta_table.txt and meta_report.html are rewritten at most this often.
 const FILES_EVERY: Duration = Duration::from_secs(30);
 const NEWS_EVERY: Duration = Duration::from_secs(300);
+/// With the balance patches on, the end of the news list is looked at this often: a new item (the game's patch notes
+/// on the day it patches, a round's own notes) has the list read again.
+const NEWS_PROBE_EVERY: Duration = Duration::from_secs(1);
 /// Records read per save at most (newest first); older ones add little to the current patch.
 const BACKLOG_COMPETITION: u32 = 3000;
 const BACKLOG_SOLO: u32 = 2000;
@@ -203,6 +222,8 @@ struct State {
     /// The tier plan was built after every listed record had been read.
     plan_complete: bool,
     tiers: TierSync,
+    /// The balance patches' state on the server (2.8.0).
+    balance: BalanceSync,
     names: Names,
     worker: Option<Worker>,
     /// Rebuilds submitted, and the one a result has to match to count.
@@ -216,6 +237,8 @@ struct State {
     /// Every champion's stats (read with the champion list).
     stats: Arc<HashMap<String, crate::stats::Stats>>,
     champions: Vec<String>,
+    /// The game's champions while they are being read, a few a frame (`read_champions`).
+    champion_read: Option<ChampionRead>,
     /// This save's matches from earlier sessions (`cache`), until the save's own records confirm
     /// the file is this save's; whether that was settled; when the file was last written and
     /// with how many matches.
@@ -229,6 +252,8 @@ struct State {
     team_names: HashMap<u32, String>,
     probes_written: bool,
     records_probed: bool,
+    /// The player's last starting five (their signature champions get the patch's news cards).
+    starting: Vec<u32>,
 }
 
 impl State {
@@ -254,6 +279,7 @@ impl State {
             files_written_at: None,
             last_summary: String::new(),
             plan_complete: false,
+            balance: BalanceSync::default(),
             tiers: TierSync::default(),
             names: Names::default(),
             worker: None,
@@ -265,6 +291,7 @@ impl State {
             damage: HashMap::new(),
             stats: Arc::new(HashMap::new()),
             champions: Vec::new(),
+            champion_read: None,
             cache_pending: None,
             cache_checked: false,
             cache_written: None,
@@ -273,6 +300,7 @@ impl State {
             team_names: HashMap::new(),
             probes_written: false,
             records_probed: false,
+            starting: Vec::new(),
         }
     }
 }
@@ -281,6 +309,64 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 fn lock() -> MutexGuard<'static, Option<State>> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The game's champions being read: their names, how far the reading is, and the stats read.
+struct ChampionRead {
+    names: Vec<String>,
+    next: usize,
+    stats: HashMap<String, crate::stats::Stats>,
+}
+
+/// A frame's time for reading champions (one champion at least).
+const CHAMPION_BUDGET: Duration = Duration::from_millis(4);
+
+/// The champions' damage types, stats and names, a few a frame (2.8.2): the game's answer about one champion takes
+/// tens of milliseconds, and all 284 asked in one frame froze it for 12-17 s when a save was opened (the server's
+/// answers in that time came too late, too). True while the reading goes on: the model waits for it.
+fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
+    if !st.champions.is_empty() {
+        return false;
+    }
+    let mut read = match st.champion_read.take() {
+        Some(read) => read,
+        None => {
+            let names = game.champion_names();
+            if names.is_empty() {
+                // the host lists none: `rebuild` rates the champions seen in matches
+                return false;
+            }
+            ChampionRead { names, next: 0, stats: HashMap::new() }
+        }
+    };
+    let started = Instant::now();
+    while read.next < read.names.len() {
+        let name = &read.names[read.next];
+        read.next += 1;
+        let (damage, stats) = game.champion_data(name);
+        if let Some(d) = damage {
+            st.damage.insert(st.names.id(name), d);
+        }
+        if let Some(s) = stats {
+            read.stats.insert(name.clone(), s);
+        }
+        if let Some(label) = game.champion_label(name) {
+            st.labels.champions.insert(name.clone(), label);
+        }
+        if started.elapsed() >= CHAMPION_BUDGET {
+            break;
+        }
+    }
+    if read.next < read.names.len() {
+        st.champion_read = Some(read);
+        return true;
+    }
+    st.labels.team_name = game.team_name(team).unwrap_or_default();
+    diag::log(&format!("[probe] stats read for {} of {} champions", read.stats.len(), read.names.len()));
+    st.stats = Arc::new(read.stats);
+    st.champions = read.names;
+    st.dirty = true;
+    false
 }
 
 pub fn reset_for_tests() {
@@ -302,6 +388,7 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
             }
             *st = State::new();
             shared::clear();
+            crate::balance::close();
         }
         return;
     }
@@ -309,7 +396,7 @@ pub fn tick(game: &mut impl Game, in_game: bool, now: Instant) {
     config::refresh(now);
     let cfg = config::get();
     // the model is needed by any of the features, not only the two that change the game
-    if !cfg.ban_pick_on() && !cfg.tier_list_on() && !cfg.draft_overlay && !cfg.report {
+    if !cfg.ban_pick_on() && !cfg.tier_list_on() && !cfg.draft_overlay && !cfg.report && !cfg.balance {
         if shared::get().is_some() {
             shared::clear();
         }
@@ -358,6 +445,8 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
                     st.cache_pending = Some(games);
                 }
             }
+            // this save's balance patches: its book is opened once the server said which it is (`sync_balance`)
+            crate::balance::close();
             st.save = Some(identity);
         }
     }
@@ -393,7 +482,9 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     let caught_up = st.comp.pending() == 0 && st.solo.pending() == 0;
     let config_changed = st.rebuilt_with.as_ref().is_none_or(|c| !Arc::ptr_eq(c, cfg));
-    if (st.dirty || config_changed) && due(st.next_rebuild, now) {
+    // the champions' data first, a few a frame: the model is fitted with their stats
+    let reading = read_champions(st, game, team);
+    if (st.dirty || config_changed) && due(st.next_rebuild, now) && !reading {
         st.next_rebuild = Some(now + REBUILD_EVERY);
         st.dirty = false;
         st.rebuilt_with = Some(Arc::clone(cfg));
@@ -416,10 +507,12 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
 
     // the tier list goes out once it was built from the whole backlog, not after every
     // partial rebuild while the save is still being read
+    let events = game.take_events();
     if cfg.tier_list_on() {
         let complete = st.plan_complete;
-        sync_tiers(st, game, team, now, complete);
+        sync_tiers(st, game, team, now, complete, &events);
     }
+    sync_balance(st, game, cfg, team, now, &events);
 }
 
 fn read_records(st: &mut State, game: &mut impl Game, cfg: &Config) {
@@ -760,29 +853,83 @@ fn pretty(raw: &str) -> String {
     }
 }
 
+/// Reads the team's news: the patch notes (the model's, the balance patches' game patch), how many items it has and
+/// its last one. True when the patch notes changed.
+fn read_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
+    match game.record_json(RecordKindV1::Team, team, "news") {
+        Some(json) => match patchnotes::parse_all(&json) {
+            Ok(news) => {
+                diag::log_once(
+                    "probe-news",
+                    &format!(
+                        "[probe] news: {} items, {} patch notes; latest {:?}",
+                        news.len,
+                        news.notes.len(),
+                        news.notes.last().map(|n| (&n.versions, n.changes.len()))
+                    ),
+                );
+                let patch = news.newest_version();
+                if patch.is_some() && patch != st.balance.patch && st.balance.patch.is_some() {
+                    diag::log(&format!("[balance] the game's newest patch notes: {}", patch.as_deref().unwrap_or("")));
+                }
+                st.balance.patch = patch;
+                st.balance.news_len = Some(news.len);
+                st.balance.news_tail = news.len.checked_sub(1).and_then(|i| game.record_json(RecordKindV1::Team, team, &format!("news.{i}")));
+                let changed = st.notes != news.notes;
+                st.notes = news.notes;
+                return changed;
+            }
+            Err(why) => diag::log_once("probe-news", &format!("[probe] news unusable: {why}")),
+        },
+        None => diag::log_once("probe-news", "[probe] the team record has no readable news"),
+    }
+    false
+}
+
+/// New news items at most read one by one; more than that and the whole list is read.
+const NEW_ITEMS_MAX: usize = 32;
+
+/// Looks at the news list's end: its last item as it was (else the whole list is read again) and the items after it,
+/// one by one (a whole list is megabytes of a two-year save; a day adds a few items). True when the patch notes
+/// changed.
+fn probe_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
+    let Some(len) = st.balance.news_len else { return read_news(st, game, team) };
+    if let Some(last) = len.checked_sub(1) {
+        if game.record_json(RecordKindV1::Team, team, &format!("news.{last}")) != st.balance.news_tail {
+            return read_news(st, game, team);
+        }
+    }
+    let mut at = len;
+    let mut changed = false;
+    while let Some(json) = game.record_json(RecordKindV1::Team, team, &format!("news.{at}")) {
+        if at >= len + NEW_ITEMS_MAX {
+            return read_news(st, game, team);
+        }
+        if let Some(note) = patchnotes::parse_item(&json) {
+            st.notes.push(note);
+            changed = true;
+        }
+        st.balance.news_tail = Some(json);
+        at += 1;
+    }
+    st.balance.news_len = Some(at);
+    if changed {
+        let patch = st.notes.iter().rev().find_map(|n| n.version.clone());
+        if patch.is_some() && patch != st.balance.patch {
+            diag::log(&format!("[balance] the game's newest patch notes: {}", patch.as_deref().unwrap_or("")));
+        }
+        st.balance.patch = patch;
+    }
+    changed
+}
+
 fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, caught_up: bool) {
     // the patch notes (re-read every 5 minutes; they change once per in-game patch)
     let played_newest = st.comp.current_version().or_else(|| st.solo.current_version());
     if due(st.news_read_at.map(|t| t + NEWS_EVERY), now) || played_newest != st.news_version {
         st.news_read_at = Some(now);
         st.news_version = played_newest;
-        match game.record_json(RecordKindV1::Team, team, "news") {
-            Some(json) => match patchnotes::parse_news(&json) {
-                Ok(notes) => {
-                    diag::log_once(
-                        "probe-news",
-                        &format!(
-                            "[probe] news: {} patch notes; latest {:?}",
-                            notes.len(),
-                            notes.last().map(|n| (&n.versions, n.changes.len()))
-                        ),
-                    );
-                    st.notes = notes;
-                }
-                Err(why) => diag::log_once("probe-news", &format!("[probe] news unusable: {why}")),
-            },
-            None => diag::log_once("probe-news", "[probe] the team record has no readable news"),
-        }
+        read_news(st, game, team);
     }
 
     let record_current = st.comp.current_version().or_else(|| st.solo.current_version());
@@ -869,7 +1016,8 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         }
     }
     if let Some(Value::Array(last)) = game.record_json(RecordKindV1::Team, team, "last_starting").and_then(|j| serde_json::from_str(&j).ok()) {
-        squad.extend(last.iter().filter_map(|v| v.as_u64()).map(|v| v as u32));
+        st.starting = last.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+        squad.extend(st.starting.iter().copied());
     }
     squad.sort_unstable();
     squad.dedup();
@@ -914,13 +1062,27 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         names: st.names.clone(),
         champions: st.champions.clone(),
         stats: st.stats.clone(),
-        notes: st.notes.clone(),
+        notes: model_notes(&st.notes),
         current,
         settings: cfg.model(),
         backtest,
     };
     let threaded = game.threaded();
     st.worker.get_or_insert_with(|| Worker::new(threaded)).submit(job);
+}
+
+/// The patch notes the model learns from, one note a patch: the game's own from the news, and this save's balance
+/// rounds from its book - their lines in the news (a hotfix's own notes, the lines merged into the game's) left out
+/// so a round counts once. A save with no book keeps the news as it is.
+fn model_notes(news: &[PatchNote]) -> Vec<PatchNote> {
+    let rounds = crate::balance::notes();
+    let mut notes: Vec<PatchNote> = if rounds.is_empty() {
+        news.to_vec()
+    } else {
+        news.iter().filter(|n| !n.ours).map(PatchNote::game_only).collect()
+    };
+    notes.extend(rounds);
+    patchnotes::combine(notes)
 }
 
 /// Picks up a finished fit: publishes it for the draft hook, plans the tier list, prepares the
@@ -957,7 +1119,8 @@ fn collect(st: &mut State, cfg: &Config, team: usize) {
     }
     st.plan_complete = complete;
 
-    let note = st.notes.iter().rev().find(|n| n.is_for(&meta.current));
+    let notes = model_notes(&st.notes);
+    let note = notes.iter().rev().find(|n| n.is_for(&meta.current));
     let summary = format!(
         "patch {} (kept {}): competition {} matches this patch, {} kept; solo rank {}; patch notes {}; \
          ranked {}/{} champions{}",
@@ -1077,13 +1240,13 @@ const MAX_RESENDS: u32 = 3;
 /// Shortest time between two tier lists sent to the server.
 const SEND_GAP: Duration = Duration::from_secs(10);
 
-fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, plan_complete: bool) {
+fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, plan_complete: bool, events: &[(String, Vec<u8>)]) {
     let sync = &mut st.tiers;
-    for (event, payload) in game.take_events() {
+    for (event, payload) in events {
         if event != RESULT_EVENT {
             continue;
         }
-        let text = String::from_utf8_lossy(&payload);
+        let text = String::from_utf8_lossy(payload);
         let mut parts = text.splitn(3, '\t');
         let (hash, ok, detail) = (parts.next().unwrap_or(""), parts.next() == Some("ok"), parts.next().unwrap_or(""));
         let Some((sent, _)) = sync.waiting else { continue };
@@ -1152,6 +1315,338 @@ fn sync_tiers(st: &mut State, game: &mut impl Game, team: usize, now: Instant, p
     }
 }
 
+/// The balance patches on the server (2.8.0): what it confirmed (the game's champion patches off, the newest round
+/// written), the request waiting for its answer, retries; and what the news says (its length, the game's patch).
+#[derive(Default)]
+struct BalanceSync {
+    acked: Option<(bool, u32)>,
+    waiting: Option<(bool, u32, Instant)>,
+    failures: u32,
+    retry_at: Option<Instant>,
+    /// The news list's length and last item when it was last read, when its end is looked at next, and the game's
+    /// newest patch (its newest patch notes' version).
+    news_len: Option<usize>,
+    news_tail: Option<String>,
+    probe_at: Option<Instant>,
+    patch: Option<String>,
+    /// The round made ahead for the game's next patch as last handed to the server (2.8.1), what it was made from (the
+    /// model's snapshot, the game day), and the next patch day in the schedule as of a day.
+    prepared: Option<String>,
+    prepared_from: Option<(usize, Date)>,
+    next_patch: Option<(Date, Option<Date>)>,
+    /// The last request (`off`, round): its answer counts after the wait for it was given up, too (2.8.2 - a save
+    /// being opened stalls the game for tens of seconds, and the answer that came after them was thrown away).
+    sent: Option<(bool, u32)>,
+    /// The save's book (2.8.2): when the server was last asked which it is, and its id once it said ("": the save has
+    /// none; `book_wanted`: it was asked to make one). Nothing of the balance happens before.
+    book_asked: Option<Instant>,
+    book_wanted: bool,
+    book: Option<String>,
+}
+
+type Date = (i32, u32, u32);
+
+/// How long the server is given to say which book the save has before it is asked again.
+const BOOK_RETRY: Duration = Duration::from_secs(5);
+
+/// Game days before the game's scheduled patch that its round is made ahead and handed to the server.
+const PREPARE_DAYS: i64 = 2;
+/// The year schedule's events that are game patches.
+const PATCH_EVENTS: [&str; 3] = ["MinorPatch", "MajorPatch", "SeasonPatch"];
+
+/// The first day on or after `today` with a game patch in the year schedules (`[{"schedules": [["2027-10-03",
+/// "MinorPatch"], ...]}, ...]`; an event may be a name or a one-key object).
+fn next_patch_day(schedule: &str, today: Date) -> Option<Date> {
+    let doc: Value = serde_json::from_str(schedule).ok()?;
+    let years: Vec<&Value> = match &doc {
+        Value::Array(years) => years.iter().collect(),
+        other => vec![other],
+    };
+    let from = crate::balance::day_number(today);
+    years
+        .iter()
+        .filter_map(|y| y.get("schedules").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|entry| {
+            let is_patch = match entry.get(1)? {
+                Value::String(name) => PATCH_EVENTS.contains(&name.as_str()),
+                Value::Object(map) => map.keys().any(|k| PATCH_EVENTS.contains(&k.as_str())),
+                _ => false,
+            };
+            let mut parts = entry.get(0)?.as_str()?.get(..10)?.split('-');
+            let day: Date = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+            (is_patch && crate::balance::day_number(day) >= from).then_some(day)
+        })
+        .min_by_key(|d| crate::balance::day_number(*d))
+}
+
+/// The round for the game's next scheduled patch, made ahead while that patch is [`PREPARE_DAYS`] days off or nearer
+/// and handed to the server, which writes it in the management tick the game's patch notes appear in (its changes
+/// made later reach the screens only with a later day: the inbox showed the game's own empty notes first). Withdrawn
+/// when no patch is near.
+fn prepare_next(st: &mut State, game: &mut impl Game, team: usize, snapshot: &Arc<shared::Snapshot>, rules: crate::balance::Rules, patch: Option<&str>) {
+    let today = game.game_date();
+    let next = match (today, st.balance.next_patch) {
+        (Some(t), Some((day, next))) if day == t => next,
+        (Some(t), _) => {
+            let next = game.schedule_json("").and_then(|s| next_patch_day(&s, t));
+            st.balance.next_patch = Some((t, next));
+            next
+        }
+        (None, _) => None,
+    };
+    let near = match (today, next) {
+        (Some(t), Some(d)) => crate::balance::day_number(d) - crate::balance::day_number(t) <= PREPARE_DAYS,
+        _ => false,
+    };
+    let (Some(today), Some(day), true) = (today, next, near) else {
+        withdraw_prepared(st, game);
+        return;
+    };
+    let from = (Arc::as_ptr(snapshot) as usize, today);
+    if st.balance.prepared_from == Some(from) {
+        return;
+    }
+    st.balance.prepared_from = Some(from);
+    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day));
+    // the patch it is for: the first newer than every patch known (the book's, the news', the matches')
+    let mut after = crate::balance::latest().map(|r| r.version).unwrap_or_default();
+    if let Some(p) = patch.filter(|p| compare_versions(p, &after) == std::cmp::Ordering::Greater) {
+        after = p.to_string();
+    }
+    let Some(book) = crate::balance::book() else { return };
+    let request = balance_request(st, team, &round, rules);
+    let payload = crate::server::Prepared { book, after, round, request }.encode();
+    if st.balance.prepared.as_deref() != Some(payload.as_str()) && game.send_command(crate::server::PREPARE_BALANCE, payload.as_bytes()) {
+        st.balance.prepared = Some(payload);
+    }
+}
+
+/// The prepared round taken back from the server (no patch near, the setting off).
+fn withdraw_prepared(st: &mut State, game: &mut impl Game) {
+    st.balance.prepared_from = None;
+    if st.balance.prepared.is_some() && game.send_command(crate::server::PREPARE_BALANCE, b"") {
+        st.balance.prepared = None;
+    }
+}
+
+/// The balance patches (`balance`): the news watched for the game's patches, a new round when one is due (from a
+/// model built on the whole backlog), and the server told - the game's own champion patches off while this is on
+/// (put back when it is off), and each new round's notes and news cards written into the player's news.
+fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, events: &[(String, Vec<u8>)]) {
+    for (event, payload) in events {
+        if event == crate::server::PREPARED_WRITTEN {
+            // the server wrote the round made ahead into the game's patch: in the book, the news and the screens
+            let text = String::from_utf8_lossy(payload);
+            let mut parts = text.splitn(3, '\t');
+            let (round, ok, detail) = (parts.next().and_then(|r| r.parse::<u32>().ok()), parts.next() == Some("ok"), parts.next().unwrap_or(""));
+            diag::log(&format!("[balance] the server: {detail}"));
+            st.balance.prepared = None;
+            st.balance.prepared_from = None;
+            if let (true, Some(round)) = (ok, round) {
+                st.balance.acked = Some((true, round));
+                st.balance.failures = 0;
+            }
+            st.balance.probe_at = None;
+            st.balance.news_len = None;
+            st.dirty = true;
+            continue;
+        }
+        if event == crate::server::BOOK_RESULT {
+            // which book the save has (`<id>\t<newest round in its news>`; no id: none)
+            let text = String::from_utf8_lossy(payload);
+            let (id, done) = text.split_once('\t').unwrap_or((text.as_ref(), "0"));
+            if st.balance.book.is_none() {
+                if !id.is_empty() {
+                    let name = st.save.as_ref().map(|s| s.1.clone()).unwrap_or_default();
+                    crate::balance::open_book(id, team, &name, done.trim().parse().unwrap_or(0));
+                }
+                st.balance.book = Some(id.to_string());
+            }
+            continue;
+        }
+        if event != crate::server::BALANCE_RESULT {
+            continue;
+        }
+        let text = String::from_utf8_lossy(payload);
+        let mut parts = text.splitn(3, '\t');
+        let (state, ok, detail) = (parts.next().unwrap_or(""), parts.next() == Some("ok"), parts.next().unwrap_or(""));
+        // the request waited for, or the last one sent: its answer may come after the wait was given up
+        let Some((off, round)) = st.balance.waiting.map(|(off, round, _)| (off, round)).or(st.balance.sent) else { continue };
+        if state != format!("{}/{round}", u8::from(off)) {
+            continue;
+        }
+        st.balance.waiting = None;
+        st.balance.sent = None;
+        if ok {
+            st.balance.acked = Some((off, round));
+            st.balance.failures = 0;
+            diag::log(&format!("[balance] the server: {detail}"));
+            // the round's notes are in the news now (maybe in the game's own notes): read it again
+            st.balance.probe_at = None;
+            st.balance.news_len = None;
+        } else {
+            st.balance.failures += 1;
+            st.balance.retry_at = Some(now + backoff(st.balance.failures));
+            diag::log(&format!("[balance] the server refused ({detail}); trying again later"));
+        }
+    }
+    if let Some((_, _, at)) = st.balance.waiting {
+        if now.duration_since(at) > REPLY_TIMEOUT {
+            st.balance.waiting = None;
+            st.balance.failures += 1;
+            st.balance.retry_at = Some(now + backoff(st.balance.failures));
+            diag::log("[balance] no answer from the server; trying again later");
+        }
+    }
+    // the save's book first: the server says which it is (the id is kept in the save)
+    match st.balance.book.as_deref() {
+        None => {
+            let create: &[u8] = if cfg.balance { b"1" } else { b"0" };
+            if due(st.balance.book_asked.map(|t| t + BOOK_RETRY), now) && game.send_command(crate::server::BALANCE_BOOK, create) {
+                st.balance.book_asked = Some(now);
+                st.balance.book_wanted = cfg.balance;
+            }
+            return;
+        }
+        // the save has none, and the setting is on (turned on since): asked again, for one to be made
+        Some("") if cfg.balance && !st.balance.book_wanted => {
+            st.balance.book = None;
+            st.balance.book_asked = None;
+            return;
+        }
+        Some("") => {
+            if cfg.balance {
+                diag::log_once("balance-no-book", "[balance] the save keeps no id for its book: no balance patches on it");
+            }
+            return;
+        }
+        Some(_) => {}
+    }
+    let rules = crate::balance::Rules { count: cfg.balance_count, max_step: cfg.balance_max };
+    if cfg.balance {
+        // the news' end: a new item (the game's patch notes, a round's own) has the list read again
+        if due(st.balance.probe_at, now) {
+            st.balance.probe_at = Some(now + NEWS_PROBE_EVERY);
+            if probe_news(st, game, team) {
+                st.dirty = true;
+            }
+        }
+        // a new round when one is due: the game's new patch, the first one, or a late hotfix
+        if st.plan_complete {
+            if let Some(snapshot) = shared::get() {
+                let today = game.game_date();
+                // the game's patch: its newest patch notes, or the newest patch matches were played in when that is newer
+                // (a patch the game made without notes)
+                let played = (!snapshot.meta.current.is_empty()).then(|| snapshot.meta.current.clone());
+                let patch = match (st.balance.patch.clone(), played) {
+                    (Some(notes), Some(played)) if compare_versions(&played, &notes) == std::cmp::Ordering::Greater => Some(played),
+                    (notes, played) => notes.or(played),
+                };
+                if let Some(due) = crate::balance::due_now(patch.as_deref(), today) {
+                    let round = crate::balance::make(&snapshot.meta, rules, &due, today);
+                    let list: Vec<String> = round.changes.iter().map(|c| format!("{} {:+} ({:.1}%)", c.champion, c.step, c.win)).collect();
+                    diag::log(&format!(
+                        "[balance] round {} {} ({:?}): {}",
+                        round.id,
+                        round.label,
+                        due,
+                        if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
+                    ));
+                    log_held(&round);
+                    crate::balance::publish(round);
+                    // the model takes the round as the patch's notes; a round made ahead is made again after it
+                    st.dirty = true;
+                    st.balance.prepared_from = None;
+                }
+                prepare_next(st, game, team, &snapshot, rules, patch.as_deref());
+            }
+        }
+    } else {
+        withdraw_prepared(st, game);
+    }
+    // the server (a save with a book: the setting was on once). Off with no round yet: the game's champion patches,
+    // turned off when it was on, are put back all the same
+    let newest = crate::balance::latest();
+    let want = match (&newest, cfg.balance) {
+        (None, false) => (false, 0),
+        // on, no round yet: the game's champion patches off already
+        (None, true) => (true, 0),
+        (Some(r), true) => (true, r.id),
+        (Some(r), false) => (false, st.balance.acked.map_or(r.id, |a| a.1)),
+    };
+    if st.balance.acked == Some(want) || st.balance.waiting.is_some() || !due(st.balance.retry_at, now) {
+        return;
+    }
+    // a round's lines are the champions' numbers: not before they are read (a few a frame after a save opens)
+    if newest.is_some() && st.champions.is_empty() {
+        return;
+    }
+    let req = match (&newest, want.0) {
+        (Some(round), true) => balance_request(st, team, round, rules),
+        _ => BalanceRequest { team, off: want.0, round: want.1, ..BalanceRequest::default() },
+    };
+    if game.send_command(crate::server::APPLY_BALANCE, req.encode().as_bytes()) {
+        st.balance.waiting = Some((want.0, want.1, now));
+        st.balance.sent = Some((want.0, want.1));
+    } else {
+        st.balance.failures += 1;
+        st.balance.retry_at = Some(now + backoff(st.balance.failures));
+        diag::log_once("balance-send-failed", "[balance] could not send to the server (will retry)");
+    }
+}
+
+/// The champions a round left for later (outside the band, too few games with their new numbers), in the log.
+fn log_held(round: &crate::balance::Round) {
+    if !round.held.is_empty() {
+        let held: Vec<String> = round.held.iter().map(|(c, g)| format!("{c} ({g:.0} games)")).collect();
+        diag::log(&format!("[balance] round {} leaves for later (too few games since their last change): {}", round.id, held.join(", ")));
+    }
+}
+
+/// The server's request for a round: its notes (each champion's lines - its numbers as it plays with them, from
+/// the game's stats - and reason) and the patch's news cards.
+fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules: crate::balance::Rules) -> BalanceRequest {
+    let label = |n: &str| st.labels.champion(n);
+    let mut lines = BTreeMap::new();
+    let mut champions = Vec::new();
+    for c in &round.changes {
+        let Some(stats) = st.stats.get(&c.champion) else {
+            diag::log_once(&format!("balance-no-stats-{}", c.champion), &format!("[balance] no stats for {}: no lines in the notes", c.champion));
+            continue;
+        };
+        let rows = crate::balance::rows(stats, c.total - c.step, c.total);
+        let why = crate::balance::reason(c, rules);
+        champions.push((c.champion.clone(), rows.clone(), why.clone()));
+        lines.insert(c.champion.clone(), (rows, why));
+    }
+    let (title, content) = crate::balance::news(round, &label);
+    let articles = crate::balance::articles(round, &lines, &st.labels.team_name, &signatures(st), &label);
+    let name = if round.label.is_empty() { round.version.clone() } else { round.label.clone() };
+    BalanceRequest {
+        team,
+        off: true,
+        round: round.id,
+        note: Some(NoteRequest { version: round.version.clone(), label: name, merge: round.merged, champions, title, content }),
+        articles,
+    }
+}
+
+/// The player's starting five (the squad when not known) and each one's signature champion: the one they are most
+/// proficient with, from their records.
+fn signatures(st: &State) -> Vec<crate::balance::Signature> {
+    let infos = crate::ui::athlete_infos();
+    st.starting
+        .iter()
+        .filter_map(|a| {
+            let info = infos.get(a)?;
+            let (champion, _) = info.proficiency.iter().max_by(|x, y| x.1.cmp(y.1).then_with(|| y.0.cmp(x.0)))?;
+            let name = if info.name.is_empty() { st.labels.athletes.get(a).cloned().unwrap_or_default() } else { info.name.clone() };
+            Some(crate::balance::Signature { athlete: *a, name, champion: champion.clone() })
+        })
+        .collect()
+}
+
 /// `Some(example)` when the team's tier list, as the client sees it, is not the plan.
 fn differs(game: &mut impl Game, team: usize, plan: &Request) -> Option<String> {
     let json = game.record_json(RecordKindV1::Team, team, FIELD)?;
@@ -1190,6 +1685,12 @@ mod tests {
         reads: u32,
         /// Fit on a worker thread, as in the game (the frame-timing test).
         threaded: bool,
+        /// The save's book as the server says it (id, newest round in its news), the balance commands sent, and how
+        /// long the game takes to answer about a champion.
+        book: (String, u32),
+        balance_sent: Vec<String>,
+        champion_delay: Duration,
+        champions_asked: u32,
     }
 
     impl Source for FakeGame {
@@ -1210,6 +1711,11 @@ mod tests {
                 (RecordKindV1::SoloRankMatch, "") => self.solo.get(&id).cloned(),
                 (RecordKindV1::Team, "news") if id == self.team => Some(self.news.clone()),
                 (RecordKindV1::Team, "champion_tiers") if id == self.team => Some(self.tiers.to_string()),
+                // one news item: `news.<index>`
+                (RecordKindV1::Team, p) if id == self.team && p.starts_with("news.") => {
+                    let at: usize = p["news.".len()..].parse().ok()?;
+                    serde_json::from_str::<Value>(&self.news).ok()?.get(at).map(Value::to_string)
+                }
                 _ => None,
             }
         }
@@ -1247,6 +1753,16 @@ mod tests {
             Some(self.date)
         }
         fn send_command(&mut self, command: &str, payload: &[u8]) -> bool {
+            if command == server::BALANCE_BOOK {
+                // which book the save has (none unless a test gives it one)
+                let answer = format!("{}\t{}", self.book.0, self.book.1);
+                self.events.push((server::BOOK_RESULT.to_string(), answer.into_bytes()));
+                return true;
+            }
+            if command == server::APPLY_BALANCE || command == server::PREPARE_BALANCE {
+                self.balance_sent.push(command.to_string());
+                return true;
+            }
             assert_eq!(command, APPLY_TIERS);
             let req = Request::parse(payload, None).unwrap();
             // what the server does with it
@@ -1264,6 +1780,13 @@ mod tests {
         }
         fn threaded(&self) -> bool {
             self.threaded
+        }
+        fn champion_data(&mut self, _name: &str) -> (Option<Damage>, Option<crate::stats::Stats>) {
+            self.champions_asked += 1;
+            if !self.champion_delay.is_zero() {
+                std::thread::sleep(self.champion_delay);
+            }
+            (None, None)
         }
     }
 
@@ -1537,5 +2060,161 @@ mod tests {
         frames(&mut g, 3000, now); // 300 s later
         assert!(g.sent.len() > tries);
         assert_eq!(g.tiers["a"], "S");
+    }
+
+    fn patch_item(version: &str, champion: &str) -> Value {
+        serde_json::json!({
+            "author": "Team Samoyed", "title": "#asset/base/text/news?patch.title", "title_bind": [["Version", version]],
+            "ty": {"PatchNote": {"version": version, "added_champion": [],
+                "champion_patch_data": [[champion, [{"key": "k", "target_action": null, "pre_value": "1", "after_value": "2", "is_buff": true}]]],
+                "champion_patch_reasons": [], "game_rule_patch_data": [], "game_rule_patch_reasons": []}}
+        })
+    }
+
+    #[test]
+    fn only_new_news_items_are_read_and_a_changed_list_is_read_again() {
+        let mut g = save();
+        let mut items = vec![patch_item("2027.4.0", "e"), serde_json::json!({"title": "x", "ty": "StartTeam"})];
+        g.news = Value::Array(items.clone()).to_string();
+        let mut st = State::new();
+        // the first look reads the whole list
+        assert!(probe_news(&mut st, &mut g, 4));
+        assert_eq!((st.balance.news_len, st.balance.patch.as_deref(), st.notes.len()), (Some(2), Some("2027.4.0"), 1));
+        // a day's news: read one by one, no patch notes among them
+        items.push(serde_json::json!({"title": "y", "ty": "StartTeam"}));
+        g.news = Value::Array(items.clone()).to_string();
+        assert!(!probe_news(&mut st, &mut g, 4));
+        assert_eq!(st.balance.news_len, Some(3));
+        // the game patches: its notes come in, the newest patch known
+        items.push(patch_item("2027.5.0", "f"));
+        g.news = Value::Array(items.clone()).to_string();
+        assert!(probe_news(&mut st, &mut g, 4));
+        assert_eq!((st.balance.news_len, st.balance.patch.as_deref(), st.notes.len()), (Some(4), Some("2027.5.0"), 2));
+        // nothing new: nothing read
+        assert!(!probe_news(&mut st, &mut g, 4));
+        // the last item changed (a round written into the game's notes): the whole list again
+        items[3] = patch_item("2027.5.0", "g");
+        g.news = Value::Array(items.clone()).to_string();
+        assert!(probe_news(&mut st, &mut g, 4));
+        assert!(st.notes.last().unwrap().changes.contains_key("g"));
+        // the list got shorter: read again too
+        items.remove(1);
+        g.news = Value::Array(items.clone()).to_string();
+        probe_news(&mut st, &mut g, 4);
+        assert_eq!(st.balance.news_len, Some(3));
+    }
+
+    #[test]
+    fn the_champions_are_read_a_few_a_frame() {
+        let mut g = save();
+        // an answer takes longer than a frame's time for them: one a frame, and the model waits
+        g.champion_delay = CHAMPION_BUDGET * 2;
+        let mut st = State::new();
+        assert!(read_champions(&mut st, &mut g, 4));
+        assert_eq!(g.champions_asked, 1);
+        assert!(st.champions.is_empty() && !st.dirty);
+        let mut frames = 2;
+        while read_champions(&mut st, &mut g, 4) {
+            frames += 1;
+            assert!(frames < 20);
+        }
+        assert_eq!((frames, g.champions_asked, st.champions.len()), (10, 10, 10), "ten champions, ten frames");
+        assert!(st.dirty, "the model is built with them");
+        // quick answers: all in one frame
+        let mut quick = save();
+        let mut st2 = State::new();
+        assert!(!read_champions(&mut st2, &mut quick, 4));
+        assert_eq!((quick.champions_asked, st2.champions.len()), (10, 10));
+        // read once a save
+        assert!(!read_champions(&mut st, &mut g, 4));
+        assert_eq!(g.champions_asked, 10);
+    }
+
+    #[test]
+    fn the_book_is_opened_once_the_server_said_which_it_is() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        crate::balance::reset_for_tests();
+        let mut g = save();
+        g.book = ("abc12345".into(), 0);
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        let cfg = Config::default();
+        let t0 = Instant::now();
+        // asked first: nothing of the balance before the answer
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert!(st.balance.book.is_none() && crate::balance::book().is_none());
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert_eq!(g.events.len(), 1, "asked once while the answer is on its way");
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &events);
+        assert_eq!(st.balance.book.as_deref(), Some("abc12345"));
+        assert!(crate::balance::book().is_some_and(|b| b.ends_with("balance-abc12345.json")));
+        // a book, the setting off and no round yet: the game's own champion patches are asked back all the same
+        assert_eq!(g.balance_sent, [server::APPLY_BALANCE]);
+        assert_eq!(st.balance.waiting.map(|w| (w.0, w.1)), Some((false, 0)));
+        // a save with none (the setting off): nothing opened, nothing asked again
+        crate::balance::reset_for_tests();
+        let mut g = save();
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &events);
+        sync_balance(&mut st, &mut g, &cfg, 4, t0 + BOOK_RETRY * 3, &[]);
+        assert_eq!(st.balance.book.as_deref(), Some(""));
+        assert!(crate::balance::book().is_none() && g.events.is_empty());
+        crate::balance::reset_for_tests();
+    }
+
+    #[test]
+    fn the_servers_answer_counts_after_the_wait_for_it_was_given_up() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        crate::balance::reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_late_answer_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::balance::open_for_tests(file.clone());
+        crate::balance::publish(crate::balance::Round { id: 1, version: "1.1".into(), ..Default::default() });
+        let mut g = save();
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        st.balance.book = Some("book".into());
+        // the setting off on a save with a round: the game's own champion patches are to be put back
+        let cfg = Config::default();
+        let t0 = Instant::now();
+        // not before the champions are read (a round's lines are their numbers)
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert!(g.balance_sent.is_empty());
+        st.champions = vec!["a".into()];
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert_eq!(g.balance_sent, [server::APPLY_BALANCE]);
+        assert_eq!(st.balance.waiting.map(|w| (w.0, w.1)), Some((false, 1)));
+        // a save being opened stalls the game: no answer in time
+        let late = t0 + REPLY_TIMEOUT + Duration::from_secs(1);
+        sync_balance(&mut st, &mut g, &cfg, 4, late, &[]);
+        assert!(st.balance.waiting.is_none() && st.balance.acked.is_none());
+        // it comes a frame later: taken all the same, nothing sent again
+        let answer = (server::BALANCE_RESULT.to_string(), b"0/1\tok\tthe game's champion patches put back".to_vec());
+        sync_balance(&mut st, &mut g, &cfg, 4, late, &[answer]);
+        assert_eq!(st.balance.acked, Some((false, 1)));
+        sync_balance(&mut st, &mut g, &cfg, 4, late + Duration::from_secs(900), &[]);
+        assert_eq!(g.balance_sent.len(), 1);
+        crate::balance::reset_for_tests();
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn the_next_patch_day_comes_from_the_year_schedules() {
+        let schedule = r#"[
+            {"id": 1, "schedules": [["2027-09-15", "MinorPatch"], ["2027-10-01", {"LeagueMatch": {"index": 0, "round": 0}}],
+                                    ["2027-10-03", "MinorPatch"], ["2027-12-30", {"SeasonPatch": {}}]]},
+            {"id": 2, "schedules": [["2028-01-01", "StartRecruit"], ["2028-02-01", "MajorPatch"]]}]"#;
+        assert_eq!(next_patch_day(schedule, (2027, 10, 1)), Some((2027, 10, 3)));
+        assert_eq!(next_patch_day(schedule, (2027, 10, 3)), Some((2027, 10, 3)), "the day itself");
+        assert_eq!(next_patch_day(schedule, (2027, 10, 4)), Some((2027, 12, 30)));
+        assert_eq!(next_patch_day(schedule, (2028, 1, 1)), Some((2028, 2, 1)));
+        assert_eq!(next_patch_day(schedule, (2028, 2, 2)), None);
+        assert_eq!(next_patch_day("{", (2027, 1, 1)), None);
     }
 }

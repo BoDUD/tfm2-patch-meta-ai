@@ -19,6 +19,7 @@
 
 pub mod advisor;
 pub mod ai_tactics;
+pub mod balance;
 pub mod cache;
 mod client;
 pub mod compat;
@@ -89,6 +90,7 @@ pub fn reset_for_tests() {
     shared::clear();
     lock::set(None);
     ai_tactics::reset_for_tests();
+    balance::reset_for_tests();
     draft::variety::reset();
     server::reset_for_tests();
     draft::reset_for_tests();

@@ -1049,6 +1049,7 @@ pub(crate) mod tests {
         let note = PatchNote {
             versions: vec!["1.2".into()],
             changes: [("c".to_string(), -2)].into_iter().collect(),
+            ..PatchNote::default()
         };
         let meta = build(
             &Inputs { games: &games, names: &names, champions: &champions, notes: &[note], current: "1.2", warm: None, stats: None },

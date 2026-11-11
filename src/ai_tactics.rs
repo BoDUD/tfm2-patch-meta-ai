@@ -306,6 +306,8 @@ fn attempt(sim: &mut StableSim<'_>, at_start: bool) -> bool {
 
 impl StableMatchHook for TacticsHook {
     fn on_match_start(&self, sim: &mut StableSim<'_>) {
+        // the balance patches (2.8.0) ride on this hook: one match hook a mod
+        crate::balance::on_tick(sim, config::get().balance);
         if !config::get().ai_tactics {
             return;
         }
@@ -316,6 +318,7 @@ impl StableMatchHook for TacticsHook {
     }
 
     fn on_match_tick(&self, sim: &mut StableSim<'_>, _rng_seed: u64) {
+        crate::balance::on_tick(sim, config::get().balance);
         if sim.tick() > TICK_WINDOW || !config::get().ai_tactics {
             return;
         }

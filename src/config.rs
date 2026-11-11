@@ -61,6 +61,12 @@ pub struct Config {
     /// Teams drafted by the model (AI teams with `ai_bp`, the player's after an auto BP) also
     /// play the strategy the model rates best for their five champions.
     pub ai_tactics: bool,
+    /// This mod makes the balance patches (`balance`, 2.8.0): a round per game patch (written into the game's own
+    /// patch notes), the game's own champion patches off while it is on.
+    pub balance: bool,
+    /// Champions a round changes at most, and its step at most (percent of power).
+    pub balance_count: usize,
+    pub balance_max: i32,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -140,6 +146,9 @@ impl Default for Config {
             ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
+            balance: false,
+            balance_count: 10,
+            balance_max: 10,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -271,6 +280,9 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_bp" | "ai_draft" => cfg.ai_bp = flag(value)?,
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
+        "balance" => cfg.balance = flag(value)?,
+        "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 40.0) as usize,
+        "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, 30.0) as i32,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
             cfg.recency = None;
@@ -508,7 +520,8 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={}",
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
+         balance={} balance_count={} balance_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -552,7 +565,10 @@ pub fn summary(c: &Config) -> String {
         if c.lane_tags { "on" } else { "off" },
         c.panel_opacity,
         if c.meta_page { "on" } else { "off" },
-        if c.explore { "on" } else { "off" }
+        if c.explore { "on" } else { "off" },
+        if c.balance { "on" } else { "off" },
+        c.balance_count,
+        c.balance_max
     )
 }
 
@@ -590,7 +606,7 @@ ai_bp=off
 ;              (more for champions the model is unsure of), so every champion gets its chances
 ;              and the AI is hard to predict - but a ban or pick may fall at most this many
 ;              win-rate points below the model's best. 0 = always the best, 1 = default, up to 5.
-; ai_variety : AI 智能BP 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
+; ai_variety : AI 战队的 BP 每局对英雄强度的判断会浮动（模型越拿不准的英雄浮动越大），让所有英雄都有机会
 ;              上场，AI 也不好猜；但每一手最多比模型认为的最佳选择差这么多胜率点。
 ;              0 = 永远选最佳，1 = 默认，最大 5。
 ai_variety=1
@@ -601,6 +617,26 @@ ai_variety=1
 ; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
 ;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。「收官」由各队教练自己选。
 ai_tactics=off
+; balance : this mod makes the balance patches instead of the game. On every patch the game
+;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
+;           furthest outside a 48-52% win rate (with enough games, at most balance_count) get
+;           1.5% of power stronger or weaker for every point outside (at most balance_max a
+;           patch, 30% in all; half on attack / magic power, half on health), in every match.
+;           A champion changed waits for 30 games with its new numbers before the next change.
+;           The changes are the game's own patch notes (inbox, patch history), with the patch's
+;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
+;           While this is on the game's own champion patches are off (its settings are put back
+;           when this is turned off).
+; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
+;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个）
+;           每偏 1 个点调 1.5% 的强度（单版最多 balance_max，累计最多 30%；一半在攻击/法强，
+;           一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场才会再改。
+;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
+;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
+;           （关掉本项时恢复游戏原来的设置）。
+balance=off
+balance_count=10
+balance_max=10
 tier_list=auto
 
 [model]

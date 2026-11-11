@@ -31,9 +31,9 @@ out=dist/patch_meta_ai
 rm -rf "$out"
 mkdir -p "$out"
 cp "$dll" package/mod.mod_info package/mod.override_info package/thumbnail.png package/README.txt "$out/"
-# the page's texts, merged into the game's ui text (mod.override_info)
+# the page's texts and the balance patches' reasons, merged into the game's ui and news texts (mod.override_info)
 mkdir -p "$out/text"
-cp package/text/ui.i18n "$out/text/"
+cp package/text/ui.i18n package/text/news.i18n "$out/text/"
 
 if [ "${1:-}" = "--smoke" ]; then
     (cd tools/dll-smoke && cargo build --release --target "$target")

@@ -359,7 +359,8 @@ ban_pick=on
         assert_eq!(tiers["alpha"], "S", "{tiers}");
         assert_eq!(tiers["zulu"], "A", "kept: not a champion of this save");
         assert!(tiers.as_object().unwrap().len() >= 10);
-        assert_eq!(w.log, ["event apply_tiers_result"]);
+        // (first the client asked which balance book the save has: none, the balance is off)
+        assert_eq!(w.log, ["event balance_book_result", "event apply_tiers_result"]);
 
         // the draft hook through the C ABI: alpha up, juliet (nerfed, losing) down
         let brief_names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
