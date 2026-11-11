@@ -2,10 +2,12 @@
 //! the model and the statistics would lose them. So every save's matches are also written to
 //! `history/<save>.json` in the mod folder (never into the save itself), and read back next time.
 //!
-//! The file is only used for the save it came from: it is named after the player's team, but
-//! two saves can share a team, so its matches are merged only once the save's own records
-//! confirm it - at least [`CONFIRM_SHARE`] of the first [`CONFIRM_MATCHES`] matches read from
-//! the save are in the file. Otherwise it is ignored (and replaced by this save's).
+//! The file is only used for the save it came from. Since 2.8.3 a save has an id of its own, kept in
+//! the save, and its file is named by it ([`path_of`]): its matches are taken as soon as the save is
+//! open. Before, the file was named after the player's team ([`path`]), and two saves can share a
+//! team - so such a file's matches are merged only once the save's own records confirm it: at least
+//! [`CONFIRM_SHARE`] of the first [`CONFIRM_MATCHES`] matches read from the save are in the file.
+//! Otherwise it is ignored (and this save's are written under its id).
 //!
 //! Matches are stored with champion and strategy names, never the session's small ids.
 
@@ -46,12 +48,23 @@ struct Stored {
     l: Option<f32>,
 }
 
-/// The file for a save: the player's team id and a hash of its name.
-pub fn path(team: usize, team_name: &str) -> PathBuf {
+/// A save's name in the mod's files: the player's team id and a hash of its name.
+pub fn stem(team: usize, team_name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     team_name.hash(&mut h);
-    paths::mod_dir().join(DIR).join(format!("team{team}-{:08x}.json", h.finish() as u32))
+    format!("team{team}-{:08x}", h.finish() as u32)
+}
+
+/// The file for a save ([`stem`]): where its matches were kept before a save had an id of its own.
+pub fn path(team: usize, team_name: &str) -> PathBuf {
+    paths::mod_dir().join(DIR).join(format!("{}.json", stem(team, team_name)))
+}
+
+/// The file for a save by its own id (2.8.3, `server::save_id`): that save's for sure, so its matches are taken
+/// without waiting for the save's own records to confirm them.
+pub fn path_of(id: &str) -> PathBuf {
+    paths::mod_dir().join(DIR).join(format!("save-{id}.json"))
 }
 
 pub fn encode<'a>(games: impl Iterator<Item = (&'a u64, &'a Game)>, names: &Names) -> String {
