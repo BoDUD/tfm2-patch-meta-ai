@@ -227,6 +227,22 @@ impl Catalog {
         Some((i, self.items.get(i)?))
     }
 
+    /// Whether a match can tell this item from the others (2.9.0): its key cut as the pack cuts it in a buff's name
+    /// (41 - the mod id's length characters: 20 for `alele_runes_and_items`) names it alone, or its numbers are its
+    /// own among the items that share that cut. An item no match can tell apart gets no change (its notes would say
+    /// what no match does).
+    pub fn identifiable(&self, key: &str) -> bool {
+        let Some((i, item)) = self.item(key) else { return false };
+        let cut = 41usize.saturating_sub(self.mod_id.chars().count()).max(1);
+        let stem: String = key.chars().take(cut).collect();
+        let group: Vec<usize> = self.items.iter().enumerate().filter(|(_, x)| x.key.starts_with(&stem)).map(|(j, _)| j).collect();
+        if group.len() <= 1 {
+            return true;
+        }
+        let mine = rounded(&item.stats);
+        group.iter().filter(|j| rounded(&self.items[**j].stats) == mine).count() == 1 && group.contains(&i)
+    }
+
     /// Which item an item buff of the pack is (its place in the catalog): the key cut short in its name, and its
     /// numbers when that names several (four items share `item_t5_213456_0_0_1`). None: not an item of this pack, or
     /// not told apart.
@@ -256,6 +272,13 @@ impl Catalog {
             }
         }
     }
+}
+
+/// An item's numbers rounded, in field order (to compare two items).
+fn rounded(stats: &[(usize, f64)]) -> Vec<(usize, i64)> {
+    let mut v: Vec<(usize, i64)> = stats.iter().map(|(i, x)| (*i, x.round() as i64)).filter(|(_, x)| *x != 0).collect();
+    v.sort_unstable();
+    v
 }
 
 impl Item {
@@ -433,7 +456,11 @@ pub struct Inputs {
 pub fn inputs() -> Option<Inputs> {
     let (builds, cat) = (builds()?, catalog()?);
     let used: HashSet<&String> = builds.values().flatten().collect();
-    let names = used.into_iter().filter_map(|k| Some((k.clone(), cat.item(k)?.1.name.clone()))).collect();
+    let names = used
+        .into_iter()
+        .filter(|k| cat.identifiable(k))
+        .filter_map(|k| Some((k.clone(), cat.item(k)?.1.name.clone())))
+        .collect();
     Some(Inputs { builds, names })
 }
 
@@ -581,6 +608,24 @@ mod tests {
     }
 
     #[test]
+    fn only_items_a_match_can_tell_apart_can_change() {
+        let cat = Catalog::parse(CATALOG_TEXT).unwrap();
+        assert!(cat.identifiable("item_t5_134_1_2_101_0_0_0"), "its cut key names it alone");
+        assert!(cat.identifiable("item_t5_213456_0_0_101_0_0_0") && cat.identifiable("item_t5_213456_0_0_104_0_0_5"), "told by numbers");
+        assert!(!cat.identifiable("no_such_item"));
+        let twins = r#"{"sourceModId": "alele_runes_and_items", "items": [
+            {"gameKey": "item4_0_0_0_classic_everfrost", "name": "永霜", "tier": 5, "itemKind": "equipment",
+             "packageValues": {"stats": {"hp": 250, "magic_power": 70}}},
+            {"gameKey": "item4_0_0_0_classic_everfrost_b", "name": "永霜（另一件）", "tier": 5, "itemKind": "equipment",
+             "packageValues": {"stats": {"magic_power": 70.0, "hp": 250}}},
+            {"gameKey": "item4_0_0_0_classic_crown", "name": "破碎王后之冕", "tier": 5, "itemKind": "equipment",
+             "packageValues": {"stats": {"hp": 250, "magic_power": 60}}}]}"#;
+        let cat = Catalog::parse(twins).unwrap();
+        assert!(!cat.identifiable("item4_0_0_0_classic_everfrost"), "same cut key, same numbers");
+        assert!(cat.identifiable("item4_0_0_0_classic_crown"));
+    }
+
+    #[test]
     fn the_builds_keep_each_heros_specified_finished_equipment() {
         let cat = Catalog::parse(CATALOG_TEXT).unwrap();
         let text = r#"{"schema_version": 3, "smart_candidates": [1, 2, 3], "heroes": {
@@ -611,5 +656,67 @@ mod tests {
         let l = lines(rf, -10, -20, false);
         assert!(l.iter().all(|(label, ..)| label != "Range"), "{l:?}");
         assert!(l.contains(&("Attack speed".to_string(), "31".to_string(), "28".to_string())), "{l:?}");
+    }
+
+    /// The installed pack read for real (2.9.0; skipped unless asked):
+    /// `PATCH_META_AI_ITEMS_DIR=<game>/mods cargo test -- --ignored the_installed_pack_reads --nocapture`.
+    #[test]
+    #[ignore]
+    fn the_installed_pack_reads() {
+        let Some(dir) = std::env::var_os(ITEMS_DIR_ENV).map(PathBuf::from) else { return };
+        let cat = Catalog::parse(&std::fs::read_to_string(dir.join(ITEMS_MOD).join("item-catalog.json")).unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        let builds = parse_builds(&std::fs::read(dir.join(BUILDS_MOD).join("ai-tail-builds.json")).unwrap(), &cat).unwrap();
+        let used: HashSet<&String> = builds.values().flatten().collect();
+        println!(
+            "{} items ({} finished with numbers); builds of {} heroes read in {} ms, {} different finished items",
+            cat.items.len(),
+            cat.items.iter().filter(|i| i.finished() && !i.stats.is_empty()).count(),
+            builds.len(),
+            started.elapsed().as_millis(),
+            used.len()
+        );
+        // every item buff name the pack's DLL holds: which item it is (numbers unknown here: a shared cut key stays
+        // unknown until a match shows the buff)
+        let dll = std::fs::read(dir.join(ITEMS_MOD).join(format!("{ITEMS_MOD}.dll"))).unwrap();
+        let text = String::from_utf8_lossy(&dll);
+        let prefix = format!("{OWNED}{ITEMS_MOD}_");
+        let mut names: Vec<String> = Vec::new();
+        let mut at = 0;
+        while let Some(i) = text[at..].find(&prefix) {
+            let start = at + i;
+            let end = text[start..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(text.len(), |e| start + e);
+            names.push(text[start..end].to_string());
+            at = end;
+        }
+        names.sort();
+        names.dedup();
+        let known = names.iter().filter(|n| cat.owned_item(n, &BuffV1::named(n)).is_some()).count();
+        let finished_used = names
+            .iter()
+            .filter_map(|n| cat.owned_item(n, &BuffV1::named(n)))
+            .filter(|i| used.contains(&cat.items[*i].key))
+            .count();
+        println!("{} item buff names in the DLL: {known} told apart by the name alone, {finished_used} of them items the builds use", names.len());
+        // the items the builds use, as a match will see them: a buff named by the key cut to 20 characters (the pack
+        // makes most names as it goes, not from the DLL's list), with the item's own numbers
+        let (mut by_name, mut by_numbers, mut lost) = (0, 0, Vec::new());
+        for key in &used {
+            let (i, item) = cat.item(key).unwrap();
+            let stem: String = key.chars().take(20).collect();
+            let name = format!("{OWNED}{ITEMS_MOD}_{stem}_0123abcd");
+            let mut buff = BuffV1::named(&name);
+            for (k, v) in &item.stats {
+                set(&mut buff, *k, v.round() as i64);
+            }
+            let fresh = Catalog::parse(&std::fs::read_to_string(dir.join(ITEMS_MOD).join("item-catalog.json")).unwrap()).unwrap();
+            match fresh.owned_item(&name, &buff) {
+                Some(j) if j == i && cat.items.iter().filter(|x| x.key.starts_with(&stem)).count() == 1 => by_name += 1,
+                Some(j) if j == i => by_numbers += 1,
+                _ => lost.push(item.name.clone()),
+            }
+        }
+        println!("the builds' {} items: {by_name} by the cut key, {by_numbers} by their numbers, not told apart: {lost:?}", used.len());
+        assert!(builds.len() > 100 && (by_name + by_numbers) * 100 >= used.len() * 95);
     }
 }
