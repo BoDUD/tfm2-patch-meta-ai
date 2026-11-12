@@ -54,6 +54,18 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.9.0：装备平衡补丁（`item_balance`）；英雄上限 60、调整上限 50；补丁公告写明强度
+
+- **装备平衡**（用户：「那可以加一个46的装备平衡补丁吧」「完整版补丁」）：装了 alele 的 4+6 装备包、开 `item_balance=on` 后，每一轮平衡补丁也改它的成品装备。
+  - 4+6 的装备数值写在它自己的 DLL 里；英雄拿到一件装备时身上挂 `item_owned_<mod id>_<装备 key>_<8 位十六进制>` 的常驻效果，带着这件装备的数值（key 截短到效果名放得下：`alele_runes_and_items` 是 20 个字符）。它的 `item-catalog.json` 列出每件装备的 key、名字、品级、种类和数值（`packageValues.stats`，字段名就是效果的字段名），`alele_equipment_selection/ai-tail-builds.json`（选择器发布给游戏的）列出每个英雄的出装：6 个装备位，`specified` 的写着装备 key（`src/items.rs`）。
+  - **挑装备**（`balance::decide_items`）：一件装备至少有 `ITEM_MIN_USERS`（4）个场次够的英雄在出才看它；这些英雄的胜率按场次加权平均（每人最多 `ITEM_WEIGHT` 200 场），先扣掉本轮英雄改动的效果（一步强度大约收回 1/1.5 个胜率点），再按人数 n 乘 n/(n+4) 往 50% 收；收完仍在 50±2 之外的，每超 1 个点调 2%（`ITEM_PER_POINT`）。这样装备只管英雄改动之后还剩下的偏差：砍到累计上限还很强的英雄、一起强的一类英雄。单版最多 `item_balance_max`，累计最多 50%；每版最多 `item_balance_count` 件；改过的装备要等出它的英雄再打 60 场（`ITEM_MIN_GAMES`）。
+  - **比赛里**（`balance::on_tick` → `item_pass`）：每 10 tick 看一次每个英雄身上的 4+6 装备效果，按本场比赛记下的那一轮给它挂 `patch_meta_ai_item_<装备序号>`：每项数值的 p%（四舍五入）。装备换掉了就摘掉，数值变了就换。只改数值：特效不变；无符号的数值（穿透、韧性、射程……）效果只能加，削弱时不动。同一场比赛的每次模拟（服务器预演、你看的那场、回放）用同一轮；服务器那次关着 `item_balance` 的比赛，之后每次都不改装备（账本的 `items_off`）。
+  - **说明**：装备改动单独发一条新闻「电竞大脑装备平衡 v<版本>」（`balance::item_news`）：每件装备出它的英雄数和平均胜率、本次和累计、每项数值前后。4+6 的装备说明仍显示原来的数值。符文不改。
+  - 出装文件几十 MB：后台线程读，文件变了（选择器重新发布）才重读，每 20 秒看一次修改时间。
+- **英雄上限 60、调整上限 50**（用户：「英雄上限调多点吧 最多60个 还有max也调高点」）：`balance_count` 最多可填 60（原来 40），`balance_max` 最多 50（原来 30），累计上限 `CAP` 50%（原来 30%：赛娜、麦迪砍满 30% 还在 65%～70%）。
+- **补丁公告写明强度**（一位玩家把「强度 -11%」看成了属性上的 -5% / -6%，以为没砍到位）：原因一栏在胜率之后加两句：`pma_power_<m|p><n>`「本次强度 -11%（攻击力、法术强度 -5%，生命值 -6%）。」和改过不止一次时的 `pma_sum_<m|p><n>`「累计强度 -20%。」（17 种语言，`tools/news_i18n.py`）。
+- **日志写明为什么只改这么多**（同一位玩家：「我设置50个就砍了20个」）：每一轮 `diag.log` 多一行 `[balance] round N: … rated, … with 30 games or more, … outside 48-52%: … waiting …, … at the 50% limit, … too close …; X could change, Y changed (balance_count Z)`。`balance_count` 只是上限。
+
 ## 2.8.3：读档卡 16 秒的真正原因；读档后马上比赛也有模型
 
 - **2.8.2 没修好**：2.8.2 说「读档不再卡 12–17 秒」，装上之后读档后的第一帧仍然卡了 16.0 秒（`[perf] … worst frame 15992.9 ms`）。2.8.2 把「读 284 个英雄的属性」分到了很多帧里，可慢的不是属性：那一帧之后，剩下 283 个英雄的属性一共只花了 1.4 秒。
@@ -189,8 +201,11 @@
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | | `balance` | off | 由本 Mod 出版本平衡补丁（每版把胜率离 48%–52% 最远的英雄调强/调弱，所有比赛生效；写进游戏自己的补丁公告和补丁历史，BP/百科的属性显示改动后的数值；开着时游戏自带的英雄补丁关掉） |
-| | `balance_count` | 10 | 每个版本最多改几个英雄 |
-| | `balance_max` | 10 | 每个英雄每个版本最多调多少（强度百分比，累计最多 30%） |
+| | `balance_count` | 10 | 每个版本最多改几个英雄（1～60；只是上限：英雄还要场次够 30、胜率在 48%–52% 之外、用新数值打满 30 场、没到累计上限） |
+| | `balance_max` | 10 | 每个英雄每个版本最多调多少（强度百分比，1～50，累计最多 50%） |
+| | `item_balance` | off | 连 alele 的 4+6 装备一起平衡（2.9.0；要先开 `balance`、装 4+6 装备包）：出这件装备的英雄算上本轮英雄改动后仍偏离 48%–52% 时调它的数值，单独发新闻 |
+| | `item_balance_count` | 5 | 每个版本最多改几件装备（1～30） |
+| | `item_balance_max` | 10 | 每件装备每个版本最多调多少（装备数值的百分比，1～50，累计最多 50%） |
 | `[report]` | `report` | on | 写 `meta_report.html` |
 | `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 F9 随时写一份） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
@@ -222,6 +237,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.9.0: **item balance** (`item_balance`, with alele's "4+6" item pack): each balance round also changes the pack's finished items whose builders (heroes whose published build names the item, 4 or more with games) stay outside 48-52% once that round's own champion changes are counted - 2% of the item's numbers a point beyond, at most `item_balance_max` a round and 50% in all; a second buff on each holder carries the change (numbers only, unsigned ones never go down), and the changes are news of their own. `balance_count` now goes up to 60, `balance_max` and the overall limit to 50. Patch-note reasons now also say a change's power this patch and in all, and `diag.log` says why a round changed fewer champions than `balance_count`.
 
 Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). Version 2 fits one regularised logistic regression over your save's matches - champion strength per patch (a random walk across patches, wider where the patch notes changed a champion), lane offsets, each player's own strength and champion mastery, ally synergy and opponent matchups - on a background thread, and uses it for:
 

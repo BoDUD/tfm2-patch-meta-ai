@@ -67,6 +67,11 @@ pub struct Config {
     /// Champions a round changes at most, and its step at most (percent of power).
     pub balance_count: usize,
     pub balance_max: i32,
+    /// The 4+6 item pack's items in the balance patches too (`item_balance`, 2.9.0), at most `item_balance_count` a
+    /// round, each a step of at most `item_balance_max` (percent of the item's numbers).
+    pub item_balance: bool,
+    pub item_balance_count: usize,
+    pub item_balance_max: i32,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -149,6 +154,9 @@ impl Default for Config {
             balance: false,
             balance_count: 10,
             balance_max: 10,
+            item_balance: false,
+            item_balance_count: 5,
+            item_balance_max: 10,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -281,8 +289,12 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
         "balance" => cfg.balance = flag(value)?,
-        "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 40.0) as usize,
-        "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, 30.0) as i32,
+        // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」)
+        "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 60.0) as usize,
+        "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
+        "item_balance" => cfg.item_balance = flag(value)?,
+        "item_balance_count" => cfg.item_balance_count = number(value)?.round().clamp(1.0, 30.0) as usize,
+        "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
             cfg.recency = None;
@@ -521,7 +533,7 @@ pub fn summary(c: &Config) -> String {
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
-         balance={} balance_count={} balance_max={}",
+         balance={} balance_count={} balance_max={} item_balance={} item_balance_count={} item_balance_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -568,7 +580,10 @@ pub fn summary(c: &Config) -> String {
         if c.explore { "on" } else { "off" },
         if c.balance { "on" } else { "off" },
         c.balance_count,
-        c.balance_max
+        c.balance_max,
+        if c.item_balance { "on" } else { "off" },
+        c.item_balance_count,
+        c.item_balance_max
     )
 }
 
@@ -619,24 +634,45 @@ ai_variety=1
 ai_tactics=off
 ; balance : this mod makes the balance patches instead of the game. On every patch the game
 ;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
-;           furthest outside a 48-52% win rate (with enough games, at most balance_count) get
-;           1.5% of power stronger or weaker for every point outside (at most balance_max a
-;           patch, 30% in all; half on attack / magic power, half on health), in every match.
+;           furthest outside a 48-52% win rate (with enough games, at most balance_count, up to
+;           60) get 1.5% of power stronger or weaker for every point outside (at most balance_max
+;           a patch, up to 50; 50% in all; half on attack / magic power, half on health), in every
+;           match. balance_count is a ceiling: a champion also needs 30 recent games, a win rate
+;           outside 48-52% and room under the limit, so a patch may change fewer.
 ;           A champion changed waits for 30 games with its new numbers before the next change.
 ;           The changes are the game's own patch notes (inbox, patch history), with the patch's
 ;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
 ;           While this is on the game's own champion patches are off (its settings are put back
 ;           when this is turned off).
 ; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
-;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个）
-;           每偏 1 个点调 1.5% 的强度（单版最多 balance_max，累计最多 30%；一半在攻击/法强，
-;           一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场才会再改。
+;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个，
+;           最多可填 60）每偏 1 个点调 1.5% 的强度（单版最多 balance_max，最多可填 50；累计最多
+;           50%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
+;           才会再改。balance_count 只是上限：英雄还要近期场次够 30、胜率在 48%–52% 之外、
+;           没到累计上限才会被改，所以一版改的可能比它少。
 ;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
 ;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
 ;           （关掉本项时恢复游戏原来的设置）。
 balance=off
 balance_count=10
 balance_max=10
+; item_balance : with alele's "4+6" item pack (alele_runes_and_items + alele_equipment_selection)
+;                the balance patches change its finished items too: an item whose builders (the
+;                heroes whose published build names it, 4 or more with games) still win too much or
+;                too little once that patch's champion changes are counted gets 2% of its numbers
+;                weaker or stronger for every point beyond 48-52% (at most item_balance_max a patch,
+;                50% in all; at most item_balance_count items a patch), in every match. Numbers only:
+;                an item's own effects stay, and penetration / tenacity can go up but never down. The
+;                changes come as news of their own; the item tooltips still show the old numbers.
+;                Needs balance=on.
+; item_balance : 装了 alele 的 4+6 装备包时，平衡补丁也改它的成品装备：出这件装备的英雄（发布的出装里
+;                写着它的，场次够的 4 个以上）在算上本版英雄改动之后仍然赢得太多或太少，胜率每超出
+;                48%–52% 一个点，装备数值调 2%（单版最多 item_balance_max，累计最多 50%；每版最多
+;                item_balance_count 件），所有比赛生效。只改数值：装备特效不变，穿透、韧性这类只能加
+;                不能减。改动单独发一条新闻；装备说明里显示的仍是原来的数值。要先开 balance。
+item_balance=off
+item_balance_count=5
+item_balance_max=10
 tier_list=auto
 
 [model]

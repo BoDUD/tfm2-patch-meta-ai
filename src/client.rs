@@ -1818,8 +1818,18 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         }
         Some(_) => {}
     }
-    let rules = crate::balance::Rules { count: cfg.balance_count, max_step: cfg.balance_max };
+    let rules = crate::balance::Rules {
+        count: cfg.balance_count,
+        max_step: cfg.balance_max,
+        items: cfg.item_balance,
+        item_count: cfg.item_balance_count,
+        item_max: cfg.item_balance_max,
+    };
     if cfg.balance {
+        // the 4+6 builds read again in the background when the selector published new ones (2.9.0)
+        if cfg.item_balance {
+            crate::items::refresh();
+        }
         // the news' end: a new item (the game's patch notes, a round's own) has the list read again
         if due(st.balance.probe_at, now) {
             st.balance.probe_at = Some(now + NEWS_PROBE_EVERY);
@@ -1851,6 +1861,16 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                         due,
                         if list.is_empty() { "no changes".to_string() } else { list.join(", ") }
                     ));
+                    diag::log(&format!("[balance] round {}: {}", round.id, round.summary));
+                    if cfg.item_balance {
+                        let items: Vec<String> =
+                            round.items.iter().map(|c| format!("{} {:+} ({} builders, {:.1}%)", c.name, c.step, c.users, c.win)).collect();
+                        diag::log(&format!(
+                            "[balance] round {} items: {}",
+                            round.id,
+                            if items.is_empty() { "no changes".to_string() } else { items.join(", ") }
+                        ));
+                    }
                     log_held(&round);
                     crate::balance::publish(round);
                     // the model takes the round as the patch's notes; a round made ahead is made again after it
@@ -1921,12 +1941,24 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
     let (title, content) = crate::balance::news(round, &label);
     let articles = crate::balance::articles(round, &lines, &st.labels.team_name, &signatures(st), &label);
     let name = if round.label.is_empty() { round.version.clone() } else { round.label.clone() };
+    // the items' changes (2.9.0): news of their own, in Chinese when the items' names are
+    let catalog = crate::items::catalog();
+    let chinese = round.items.iter().any(|c| c.name.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
+    let item_lines = |c: &crate::balance::ItemChange| -> Vec<crate::items::Line> {
+        catalog
+            .as_ref()
+            .and_then(|cat| cat.item(&c.item))
+            .map(|(_, item)| crate::items::lines(item, c.total - c.step, c.total, chinese))
+            .unwrap_or_default()
+    };
+    let items_news = crate::balance::item_news(round, chinese, &item_lines);
     BalanceRequest {
         team,
         off: true,
         round: round.id,
         note: Some(NoteRequest { version: round.version.clone(), label: name, merge: round.merged, champions, title, content }),
         articles,
+        items_news,
     }
 }
 

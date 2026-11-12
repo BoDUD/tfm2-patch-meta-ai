@@ -2,8 +2,9 @@
 """Writes package/text/news.i18n: the balance patches' texts (2.8.0), merged into the game's news texts.
 
 The game's patch notes give each champion a reason as codes of `patch.reason.*` texts; the balance patches' codes
-(`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100) and the limits that held a change (`pma_cap`,
-`pma_total`). A text cannot carry a number of its own, so there is one per win rate. `patch.pma_none` (2.8.2) is what
+(`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100), the change's power this patch and in all
+(`pma_power_<m|p><n>`, `pma_sum_<m|p><n>`, 2.9.0: -11 is `m11`, n up to CAP) and the limits that held a change
+(`pma_cap`, `pma_total`). A text cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what
 patch notes without a champion change say (`server::UNCHANGED_TEXT`).
 
     python tools/news_i18n.py
@@ -11,7 +12,7 @@ patch notes without a champion change say (`server::UNCHANGED_TEXT`).
 import json
 import os
 
-CAP = 30  # balance::CAP
+CAP = 50  # balance::CAP
 
 # (above the band, below it, near it, the round's limit, the overall limit); {n} is the win rate
 TEXTS = {
@@ -147,6 +148,74 @@ NONE = {
     "vi": "Bản cập nhật này không thay đổi tướng nào: mọi tướng có đủ số trận đều nằm trong mục tiêu tỷ lệ thắng 48–52%, hoặc vừa được điều chỉnh và còn đang chờ thêm trận với chỉ số mới.",
     "th": "แพตช์นี้ไม่มีการปรับแชมเปี้ยน: แชมเปี้ยนที่มีจำนวนเกมเพียงพอทุกตัวอยู่ในเป้าหมายอัตราชนะ 48–52% หรือเพิ่งถูกปรับและยังรอเกมด้วยค่าใหม่",
 }
+# the power of a change (2.9.0, `balance::reason`: pma_power_<m|p><n>, pma_sum_<m|p><n>): (this patch, this patch
+# when the damage half is 0, in all); {s} {d} {h} {t} are signed numbers (+9, -11), d = s / 2 toward zero, h = s - d
+POWER = {
+    "zh-hans": ("本次强度 {s}%（攻击力、法术强度 {d}%，生命值 {h}%）。", "本次强度 {s}%（生命值 {h}%）。", "累计强度 {t}%。"),
+    "zh-hant": ("本次強度 {s}%（攻擊力、法術強度 {d}%，生命值 {h}%）。", "本次強度 {s}%（生命值 {h}%）。", "累計強度 {t}%。"),
+    "en": (
+        "Power {s}% this patch ({d}% attack and magic power, {h}% health).",
+        "Power {s}% this patch ({h}% health).",
+        "{t}% power in all.",
+    ),
+    "ko": ("이번 패치 강도 {s}% (공격력·주문력 {d}%, 체력 {h}%).", "이번 패치 강도 {s}% (체력 {h}%).", "누적 강도 {t}%."),
+    "ja": ("今回の強さ {s}%（攻撃力・魔力 {d}%、体力 {h}%）。", "今回の強さ {s}%（体力 {h}%）。", "累計の強さ {t}%。"),
+    "de": (
+        "Stärke {s} % in diesem Patch ({d} % Angriff und Fähigkeitsstärke, {h} % Leben).",
+        "Stärke {s} % in diesem Patch ({h} % Leben).",
+        "Insgesamt {t} % Stärke.",
+    ),
+    "fr": (
+        "Puissance {s} % dans ce patch ({d} % d'attaque et de puissance magique, {h} % de vie).",
+        "Puissance {s} % dans ce patch ({h} % de vie).",
+        "{t} % de puissance au total.",
+    ),
+    "es-ES": (
+        "Poder {s} % en este parche ({d} % de ataque y poder mágico, {h} % de vida).",
+        "Poder {s} % en este parche ({h} % de vida).",
+        "{t} % de poder en total.",
+    ),
+    "pt-BR": (
+        "Poder {s}% neste patch ({d}% de ataque e poder mágico, {h}% de vida).",
+        "Poder {s}% neste patch ({h}% de vida).",
+        "{t}% de poder no total.",
+    ),
+    "it": (
+        "Potenza {s}% in questa patch ({d}% di attacco e potere magico, {h}% di salute).",
+        "Potenza {s}% in questa patch ({h}% di salute).",
+        "{t}% di potenza in totale.",
+    ),
+    "ru": (
+        "Сила {s}% в этом патче ({d}% атаки и силы умений, {h}% здоровья).",
+        "Сила {s}% в этом патче ({h}% здоровья).",
+        "Всего {t}% силы.",
+    ),
+    "pl": (
+        "Siła {s}% w tej łatce ({d}% ataku i mocy umiejętności, {h}% zdrowia).",
+        "Siła {s}% w tej łatce ({h}% zdrowia).",
+        "Łącznie {t}% siły.",
+    ),
+    "tr": (
+        "Bu yamada güç %{s} (saldırı ve büyü gücü %{d}, can %{h}).",
+        "Bu yamada güç %{s} (can %{h}).",
+        "Toplam güç %{t}.",
+    ),
+    "nl": (
+        "Kracht {s}% in deze patch ({d}% aanval en magische kracht, {h}% leven).",
+        "Kracht {s}% in deze patch ({h}% leven).",
+        "{t}% kracht in totaal.",
+    ),
+    "vi": (
+        "Sức mạnh {s}% trong bản cập nhật này ({d}% tấn công và sức mạnh phép, {h}% máu).",
+        "Sức mạnh {s}% trong bản cập nhật này ({h}% máu).",
+        "Tổng cộng {t}% sức mạnh.",
+    ),
+    "th": (
+        "ความแข็งแกร่ง {s}% ในแพตช์นี้ (พลังโจมตีและพลังเวท {d}% พลังชีวิต {h}%)",
+        "ความแข็งแกร่ง {s}% ในแพตช์นี้ (พลังชีวิต {h}%)",
+        "ความแข็งแกร่งรวม {t}%",
+    ),
+}
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
 
@@ -159,6 +228,17 @@ def reasons(lang):
         out[f"pma_wr_{n}"] = text.format(n=n)
     out["pma_cap"] = cap
     out["pma_total"] = total.format(cap=CAP)
+    power, power_hp, in_all = POWER.get(lang, POWER["en"])
+    signed = lambda v: f"{v:+d}"
+    for v in range(-CAP, CAP + 1):
+        if v == 0:
+            continue
+        code = ("m" if v < 0 else "p") + str(abs(v))
+        d = int(v / 2)  # toward zero, as balance::buff splits it
+        h = v - d
+        text = power if d != 0 else power_hp
+        out[f"pma_power_{code}"] = text.format(s=signed(v), d=signed(d), h=signed(h))
+        out[f"pma_sum_{code}"] = in_all.format(t=signed(v))
     return out
 
 

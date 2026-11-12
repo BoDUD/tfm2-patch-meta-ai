@@ -29,6 +29,7 @@ mod diag;
 pub mod draft;
 pub mod glm;
 pub mod hell;
+pub mod items;
 pub mod history;
 pub mod knowledge;
 pub mod lock;

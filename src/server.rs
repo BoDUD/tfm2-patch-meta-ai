@@ -327,6 +327,9 @@ pub struct BalanceRequest {
     pub note: Option<NoteRequest>,
     #[serde(default)]
     pub articles: Vec<Article>,
+    /// The round's item changes as news of their own (2.9.0, `balance::item_news`): title and content.
+    #[serde(default)]
+    pub items_news: Option<(String, String)>,
 }
 
 /// A round's notes: for the game's patch `version`, named `label`; `merge`d into the game's own notes of that patch
@@ -627,6 +630,13 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
             if written {
                 if !req.articles.is_empty() {
                     said.push(write_articles(host, req.team, &req.articles));
+                }
+                if let Some((title, content)) = &req.items_news {
+                    said.push(if host.push_news(req.team, title, content, crate::balance::AUTHOR) {
+                        "the item changes as news".to_string()
+                    } else {
+                        "the game refused the item news".to_string()
+                    });
                 }
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
             }
@@ -1234,7 +1244,7 @@ mod tests {
     }
 
     fn breq(off: bool, round: u32) -> BalanceRequest {
-        BalanceRequest { team: 3, off, round, note: Some(note("2027.4.1", "2027.4.1b", false)), articles: Vec::new() }
+        BalanceRequest { team: 3, off, round, note: Some(note("2027.4.1", "2027.4.1b", false)), articles: Vec::new(), items_news: None }
     }
 
     #[test]
@@ -1512,7 +1522,7 @@ mod tests {
             news: vec![official("2027.4.1")],
             ..Host::default()
         };
-        let req = BalanceRequest { team: 3, off: true, round: 1, note: Some(nobody("2027.4.1", "2027.4.1b", false)), articles: Vec::new() };
+        let req = BalanceRequest { team: 3, off: true, round: 1, note: Some(nobody("2027.4.1", "2027.4.1b", false)), articles: Vec::new(), items_news: None };
         let (ok, said) = balance(&mut host, &req);
         assert!(ok && said.contains("round 1 no champion changed"), "{said}");
         assert_eq!((host.news.len(), host.saved.get(NEWS_DONE).map(String::as_str)), (1, Some("1")));
