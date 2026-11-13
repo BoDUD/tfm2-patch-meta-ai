@@ -942,7 +942,7 @@ mod tests {
         }, 11);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         )
     }
@@ -1055,7 +1055,7 @@ mod tests {
                 Game { record: id, solo: false, version: "1.1".into(), blue_win: rng.next() < 0.5, teams: [None, None], sides, bans: [vec![], vec![]], length: None, tactics: Default::default() }
             })
             .collect();
-        let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None }, &Settings::default());
+        let m = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] }, &Settings::default());
         let (ally, enemy) = ([3u16, 40, 77], [10u16, 55]);
         let none = |_: u16| None;
         let started = std::time::Instant::now();
@@ -1205,7 +1205,7 @@ mod tests {
         let mut champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         champions.extend((0..200).map(|i| format!("x{i}")));
         let m = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let offer: Vec<u16> = (0..m.names.len() as u16).collect();

@@ -30,7 +30,7 @@
 //! stays close to that. A champion's displayed win rate is `sigmoid(strength)`: how often a team with it
 //! and four average champions (and average players) beats an average team.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::glm::{self, logit, sigmoid, Link, Problem, Row};
 use crate::history::{Game, Names, Role};
@@ -371,6 +371,9 @@ impl Meta {
 /// What the build needs besides the games.
 pub struct Inputs<'a> {
     pub games: &'a [Game],
+    /// This save's balance rounds (2.9.0, `balance::model_rounds`): the model expects the move their steps' size
+    /// gives ([`own_steps`]) instead of the notes' `patch_shift`. Empty: a save without balance patches.
+    pub balance: &'a [BalanceRound],
     pub names: &'a Names,
     /// Every selectable champion (rated even without games).
     pub champions: &'a [String],
@@ -381,6 +384,58 @@ pub struct Inputs<'a> {
     pub warm: Option<&'a Meta>,
     /// Every champion's stats (`None`: not known).
     pub stats: Option<&'a HashMap<String, Stats>>,
+}
+
+/// A balance round as the model reads it (2.9.0): its game patch, whether it was merged into that patch's notes
+/// (else a hotfix, made after `matches` of the patch's competition matches), and each champion's power step
+/// (percent).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BalanceRound {
+    pub version: String,
+    pub merged: bool,
+    pub matches: u32,
+    pub steps: Vec<(String, i32)>,
+}
+
+/// The balance's own steps where their games are (2.9.0; the user 2026-11-13: 「接着查」「修」): champion id and
+/// version index -> percent of power. A merged round plays in all of its patch; a hotfix only in the matches after
+/// it, and the rest of its step falls on the next patch (the save's first hotfix came after 586 of its patch's 596
+/// matches). Rounds of patches no longer kept, and champions unknown here, are left out.
+pub fn own_steps(rounds: &[BalanceRound], names: &Names, versions: &[String], matches: &[u32]) -> HashMap<(u16, u16), f32> {
+    let mut out: HashMap<(u16, u16), f32> = HashMap::new();
+    for r in rounds {
+        let Some(at) = versions.iter().position(|v| *v == r.version) else { continue };
+        let after = if r.merged {
+            1.0
+        } else {
+            let n = matches.get(at).copied().unwrap_or(0) as f32;
+            if n > 0.0 {
+                ((n - r.matches as f32) / n).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        let next = versions.iter().position(|v| compare_versions(v, &r.version).is_gt());
+        for (champion, step) in &r.steps {
+            let Some(c) = names.get(champion) else { continue };
+            *out.entry((c, at as u16)).or_insert(0.0) += *step as f32 * after;
+            if let (Some(n), true) = (next, after < 1.0) {
+                *out.entry((c, n as u16)).or_insert(0.0) += *step as f32 * (1.0 - after);
+            }
+        }
+    }
+    out
+}
+
+/// The log-odds a balance step should move a champion (2.9.0): [`crate::balance::PER_POINT`] percent of power a
+/// win-rate point. The notes' `patch_shift` (2 points) is what a game patch's lines suggest; on the user's save 25
+/// balance steps of -10% moved their champions -6.9 points in their games, and the model, expecting 2, read them
+/// about 5 points too strong a patch later (Maddie: 65.6% in the model, 45.7% in her games, cut again).
+pub fn step_shift(step: f32) -> f32 {
+    if step == 0.0 {
+        return 0.0;
+    }
+    logit((0.5 + step / crate::balance::PER_POINT / 100.0).clamp(0.05, 0.95))
 }
 
 struct Registry {
@@ -573,6 +628,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let mut tallies: HashMap<Key, Tally> = HashMap::new();
     let mut lane_gold: HashMap<(u16, u16), (f64, u32)> = HashMap::new();
     let mut per_version: Vec<HashMap<u16, Tally>> = vec![HashMap::new(); versions.len()];
+    // competition matches per kept patch (where a hotfix's step falls, `own_steps`)
+    let mut version_matches: Vec<u32> = vec![0; versions.len()];
     let mut picks: HashMap<u16, u32> = HashMap::new();
     let mut bans: HashMap<u16, u32> = HashMap::new();
     let mut athlete_lanes: HashMap<u32, [u32; 5]> = HashMap::new();
@@ -597,6 +654,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             solo_matches += 1;
         } else {
             matches += 1;
+            version_matches[vi as usize] += 1;
         }
         // plain counts, for display and eligibility
         for (side_i, slots) in game.sides.iter().enumerate() {
@@ -665,6 +723,17 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let mut problem = Problem::new(0);
     problem.prior(side, 0.0, set.side_sd);
     let shift = logit(0.5 + set.patch_shift);
+    // the balance's own steps (2.9.0): their size, where their games are; their lines in the notes give no direction
+    let own = own_steps(inp.balance, &names, &versions, &version_matches);
+    let mut own_lines: HashSet<(u16, u16)> = HashSet::new();
+    for r in inp.balance {
+        let Some(v) = versions.iter().position(|x| *x == r.version) else { continue };
+        for (champion, _) in &r.steps {
+            if let Some(c) = names.get(champion) {
+                own_lines.insert((c, v as u16));
+            }
+        }
+    }
     let mut last_change: HashMap<u16, (String, i32)> = HashMap::new();
     for c in 0..champ_count {
         let name = names.name(c).to_string();
@@ -685,10 +754,12 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         for v in 1..versions.len() as u16 {
             let note = inp.notes.iter().rev().find(|n| n.is_for(&versions[v as usize]));
             let dir = note.map_or(0, |n| n.direction(&name));
+            let step = own.get(&(c, v)).copied();
+            let mean = if own_lines.contains(&(c, v)) { 0.0 } else { dir as f32 * shift } + step.map_or(0.0, step_shift);
             let reworked = v == cur_index && set.reworked.contains(&name);
             let sd = if reworked {
                 set.first_sd
-            } else if dir != 0 {
+            } else if dir != 0 || step.is_some() {
                 set.change_sd
             } else {
                 set.drift_sd
@@ -697,7 +768,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
                 last_change.insert(c, (versions[v as usize].clone(), dir));
             }
             let (p, prev) = (reg.id(Key::Champ(c, v)), reg.id(Key::Champ(c, v - 1)));
-            problem.chain(p, prev, dir as f32 * shift, sd);
+            problem.chain(p, prev, mean, sd);
         }
     }
     for (i, key) in reg.keys.iter().enumerate() {
@@ -1015,7 +1086,7 @@ pub(crate) mod tests {
         let (names, games) = simulate(3000, "1.1", strength, 11);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let wr = |n: &str| meta.champion(n).unwrap().win_rate();
@@ -1052,7 +1123,7 @@ pub(crate) mod tests {
             ..PatchNote::default()
         };
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[note], current: "1.2", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[note], current: "1.2", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let c = meta.champion("c").unwrap();
@@ -1069,7 +1140,7 @@ pub(crate) mod tests {
         assert!(c.current.games + l.current.games > 0);
         // warm start reuses the fit
         let again = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.2", warm: Some(&meta), stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.2", warm: Some(&meta), stats: None, balance: &[] },
             &Settings::default(),
         );
         assert!(again.sweeps < meta.sweeps, "{} vs {}", again.sweeps, meta.sweeps);
@@ -1080,7 +1151,7 @@ pub(crate) mod tests {
         let (names, games) = simulate(2500, "1.1", strength, 21);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let bt = backtest(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
             500,
         )
@@ -1112,7 +1183,7 @@ pub(crate) mod tests {
         }
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let (g, b) = (meta.tactics[&good].value, meta.tactics[&bad].value);
@@ -1169,7 +1240,7 @@ pub(crate) mod tests {
             });
         }
         let started = std::time::Instant::now();
-        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.11", warm: None, stats: None };
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.11", warm: None, stats: None, balance: &[] };
         let meta = build(&inp, &Settings::default());
         let cold = started.elapsed();
         let mut more = games.clone();
@@ -1216,7 +1287,7 @@ pub(crate) mod tests {
             .map(|n| (n.clone(), Stats { category: Some(0), base: [attack(n), 0.0, 900.0, 20.0, 20.0, 900.0], growth: [0.0; 6] }))
             .collect();
         let set = Settings { stat_sd: 0.3, ..Settings::default() };
-        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: Some(&stats) };
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: Some(&stats), balance: &[] };
         let with = build(&inp, &set);
         assert!(with.stat_prior && with.stat_weights[0].value > 0.05, "{:?}", with.stat_weights[0]);
         let m = with.champion("m").unwrap();
@@ -1267,7 +1338,7 @@ pub(crate) mod tests {
             g
         }));
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
-        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None };
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] };
         let flat = build(&inp, &Settings::default()).champion("c").unwrap().strength;
         let recent = build(&inp, &Settings { recency: Some(400.0), ..Settings::default() }).champion("c").unwrap().strength;
         assert!(recent < flat - 0.3 && recent < -0.3, "{flat} -> {recent}");
@@ -1275,5 +1346,65 @@ pub(crate) mod tests {
         let ages = recency_ages(&games);
         assert_eq!(ages[games.len() - 1], 0);
         assert_eq!(ages[0] as usize, games.len() - 1);
+    }
+
+    #[test]
+    fn balance_steps_land_where_their_games_are() {
+        let mut names = Names::default();
+        let (m, k) = (names.id("m"), names.id("k"));
+        let versions: Vec<String> = ["1.1", "1.2", "1.3"].iter().map(|v| v.to_string()).collect();
+        let round = |version: &str, merged: bool, matches: u32, steps: &[(&str, i32)]| BalanceRound {
+            version: version.into(),
+            merged,
+            matches,
+            steps: steps.iter().map(|(c, s)| (c.to_string(), *s)).collect(),
+        };
+        let rounds = [
+            // a hotfix after 90 of 1.1's 100 matches: a tenth of its step in 1.1, the rest in 1.2
+            round("1.1", false, 90, &[("m", -10)]),
+            round("1.2", true, 0, &[("m", -5)]),
+            round("1.3", true, 0, &[("k", 8)]),
+            // a hotfix of the newest patch after 20 of its 80 matches: no next patch yet
+            round("1.3", false, 20, &[("k", 4), ("gone", 3)]),
+            round("1.0", true, 0, &[("m", 9)]),
+        ];
+        let own = own_steps(&rounds, &names, &versions, &[100, 50, 80]);
+        let at = |c: u16, v: u16| own.get(&(c, v)).copied();
+        assert!((at(m, 0).unwrap() + 1.0).abs() < 1e-4, "{own:?}");
+        assert!((at(m, 1).unwrap() + 14.0).abs() < 1e-4, "{own:?}");
+        assert!((at(k, 2).unwrap() - 11.0).abs() < 1e-4, "{own:?}");
+        assert_eq!(own.len(), 3, "a patch no longer kept and a champion unknown here are left out: {own:?}");
+        assert!((step_shift(-10.0) - logit(0.5 - 10.0 / 150.0)).abs() < 1e-6);
+        assert_eq!(step_shift(0.0), 0.0);
+        assert!(step_shift(-200.0).is_finite() && step_shift(200.0).is_finite());
+    }
+
+    #[test]
+    fn a_balance_step_moves_the_estimate_its_size() {
+        // c strong in 1.1; the balance cut it 10% for 1.2, where it plays about 7 points weaker
+        let (names, mut games) = simulate(2000, "1.1", strength, 5);
+        let (_, later) = simulate(300, "1.2", |n| match n {
+            "c" => 0.5 - 0.29,
+            "l" => -0.5,
+            _ => 0.0,
+        }, 9);
+        games.extend(later.into_iter().map(|mut g| {
+            g.record += 10_000;
+            g
+        }));
+        let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
+        // the book's note, as the client gives the model: the direction only
+        let note = PatchNote { versions: vec!["1.2".into()], changes: [("c".to_string(), -1)].into_iter().collect(), ..PatchNote::default() };
+        let rounds = [BalanceRound { version: "1.2".into(), merged: true, matches: 0, steps: vec![("c".into(), -10)] }];
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: std::slice::from_ref(&note), current: "1.2", warm: None, stats: None, balance: &[] };
+        let by_note = build(&inp, &Settings::default());
+        let by_step = build(&Inputs { balance: &rounds, ..inp }, &Settings::default());
+        let (a, b) = (by_note.champion("c").unwrap(), by_step.champion("c").unwrap());
+        assert!(b.strength < a.strength - 0.02, "the step's size moves it further: {} vs {}", b.strength, a.strength);
+        assert!(b.history[0].0 > b.strength, "{:?}", b.history);
+        assert_eq!(b.last_change, Some(("1.2".to_string(), -1)), "the notes still say when it changed");
+        // champions the round did not touch stay where the notes put them
+        let (e1, e2) = (by_note.champion("e").unwrap().strength, by_step.champion("e").unwrap().strength);
+        assert!((e1 - e2).abs() < 0.03, "{e1} vs {e2}");
     }
 }

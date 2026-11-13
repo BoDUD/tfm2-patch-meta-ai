@@ -307,7 +307,7 @@ mod tests {
         let (names, games) = simulate(600, "1.1", |n| if n == "c" { 0.5 } else { 0.0 }, 2);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let tiers: HashMap<String, Tier> = crate::meta::tiers(&meta, 10.0, [10.0, 20.0, 40.0, 20.0]).into_iter().collect();

@@ -276,7 +276,7 @@ mod tests {
             }
         }
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
-        build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None }, &Settings::default())
+        build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] }, &Settings::default())
     }
 
     #[test]

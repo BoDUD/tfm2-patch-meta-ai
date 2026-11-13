@@ -24,7 +24,7 @@ fn board_on_a_save() {
     champions.sort();
     let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
     let meta = build(
-        &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None },
+        &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] },
         &Settings::default(),
     );
     eprintln!("{} games, patch {current}", games.len());
@@ -76,7 +76,7 @@ fn board_on_a_save() {
     // which weight of League's knowledge predicts the newest matches best
     for w in [0.0, 0.5, 1.0, 2.0] {
         let set = Settings { lol_prior: w, ..Settings::default() };
-        let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None };
+        let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] };
         if let Some(bt) = patch_meta_ai::meta::backtest(&inputs, &set, (games.len() / 10).clamp(50, 300)) {
             eprintln!("lol_prior {w}: log-loss {:.4}, favourite won {:.1}% of {}", bt.log_loss / bt.games as f32, bt.accuracy * 100.0, bt.games);
         }
@@ -130,7 +130,7 @@ fn stats_on_a_save() {
         for lol in [0.0, 1.0] {
             for (on, sd) in [(false, 0.06), (true, 0.06), (true, 0.15), (true, 0.3)] {
                 let set = Settings { lol_prior: lol, stat_prior: on, stat_sd: sd, ..Settings::default() };
-                let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats) };
+                let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats), balance: &[] };
                 if let Some(bt) = patch_meta_ai::meta::backtest(&inputs, &set, holdout) {
                     eprintln!(
                         "holdout {holdout}: lol_prior {lol} stats {:<3} sd {sd}  log-loss {:.4} (x{:.2}: {:.4})  favourite won {:.1}%",
@@ -148,11 +148,11 @@ fn stats_on_a_save() {
         let set = Settings { stat_prior: on, ..Settings::default() };
         let few = &games[games.len() - n..];
         let started = std::time::Instant::now();
-        let m = build(&Inputs { games: few, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats) }, &set);
+        let m = build(&Inputs { games: few, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats), balance: &[] }, &set);
         eprintln!("{n} games, stats {on}: {} iterations, {:?}", m.sweeps, started.elapsed());
     }
     let set = Settings { lol_prior: 0.0, ..Settings::default() };
-    let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats) }, &set);
+    let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: Some(&stats), balance: &[] }, &set);
     for (k, e) in meta.stat_weights.iter().enumerate() {
         eprintln!("  {:<8} {:+.3} +- {:.3}", patch_meta_ai::stats::feature_name(k), e.value, e.sd);
     }
@@ -177,7 +177,7 @@ fn recency_on_a_save() {
     for holdout in [150, 300] {
         for half in [None, Some(400.0), Some(1200.0)] {
             let set = Settings { lol_prior: 0.0, recency: half, ..Settings::default() };
-            let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None };
+            let inputs = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] };
             if let Some(bt) = patch_meta_ai::meta::backtest(&inputs, &set, holdout) {
                 eprintln!(
                     "holdout {holdout}: recency {:<6} log-loss {:.4}  favourite won {:.1}%  scale {:.2}",
@@ -231,7 +231,7 @@ fn tactics_on_a_save() {
     let (train, test) = natural.split_at(natural.len() - hold);
     let current = train.iter().map(|g| g.version.clone()).max().unwrap_or_default();
     let meta = build(
-        &Inputs { games: train, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None },
+        &Inputs { games: train, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] },
         &Settings::default(),
     );
     eprintln!(

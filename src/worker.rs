@@ -30,6 +30,8 @@ pub struct Job {
     /// Every champion's stats (empty: not known).
     pub stats: Arc<HashMap<String, Stats>>,
     pub notes: Vec<PatchNote>,
+    /// This save's balance rounds (2.9.0, `balance::model_rounds`).
+    pub balance: Vec<crate::meta::BalanceRound>,
     pub current: String,
     pub settings: Settings,
     /// Also score the model on the newest games it was not fitted on.
@@ -132,6 +134,7 @@ fn run(job: Job, warm: Option<&Meta>, calibration: &mut Calibration) -> Done {
         current: &job.current,
         warm,
         stats: (!job.stats.is_empty()).then_some(job.stats.as_ref()),
+        balance: &job.balance,
     };
     let mut settings = job.settings.clone();
     let chosen = calibrate(&inputs, &settings, calibration);
@@ -230,6 +233,7 @@ mod tests {
             champions: NAMES.iter().map(|s| s.to_string()).collect(),
             stats: Arc::new(HashMap::new()),
             notes: Vec::new(),
+            balance: Vec::new(),
             current: "1.1".into(),
             settings: Settings::default(),
             backtest: true,

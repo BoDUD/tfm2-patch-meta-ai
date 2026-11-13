@@ -125,7 +125,7 @@ mod tests {
         let (names, games) = simulate(300, "1.1", |_| 0.0, 4);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         let mut hell = Hell { ally: false, enemy: true, record: HashMap::new() };

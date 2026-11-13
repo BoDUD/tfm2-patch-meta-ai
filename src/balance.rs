@@ -13,6 +13,12 @@
 //!   strong is cut again next patch). A champion a round changed waits until it has played [`MIN_EVIDENCE`] games
 //!   with its new numbers ([`games_since_change`]; 2.8.1 - the first rounds on a save, a hotfix and the game's patch
 //!   two days later, cut the same ten champions twice on the games from before the first cut).
+//! - **Against the field** (2.9.0, the user 2026-11-13: 「先修再打包」): the win rates a round reads are measured from
+//!   the middle of this patch's field ([`field_centre`], [`field_win`]), not from the model's strength 0 - its
+//!   prior's centre, a champion nobody may play. On one save (2027.5.0) the 38 champions with 30 games that patch
+//!   averaged 59.4% in the model and 51.8% in their games; the round due wanted 51 nerfs and 2 buffs, champions at
+//!   38-44% in their games among the nerfs, and Zeri, Jinx and Kindred, at about 50% when the first rounds cut them
+//!   20%, had fallen to 33-40%.
 //! - **In every match**: a champion's power is a permanent buff ([`BUFF`]), half on damage (attack and magic power),
 //!   half on health ([`buff`]), put on it at the start and again on every respawn (a new entity).
 //! - **Every run alike**: a match is simulated more than once (the server's run is the result, the client plays it
@@ -27,6 +33,12 @@
 //!   writes them ([`articles`]: the most buffed and most nerfed champion, the player's athletes' signature champions),
 //!   and the stat panels of the ban/pick screen and the encyclopedia show the numbers with the power on
 //!   (`ui::balance_view`).
+//! - **Items** (2.9.0, `item_balance`, [`crate::items`]): with alele's "4+6" item pack, a round also changes the
+//!   finished items whose builders - the champions whose published build names them - stay outside the band once
+//!   this round's own champion changes are counted ([`decide_items`]): so the items catch what the champions' own
+//!   changes leave (a champion at the limit, a whole family of builders) rather than cutting a champion twice. An
+//!   item's power is a share of its numbers, put on its holders by a second buff in every match ([`on_tick`]); the
+//!   items' notes are news of their own ([`item_news`]).
 //! - **The game's own champion patches off**: the server half sets the save's auto-patcher counts to zero while this
 //!   is on, keeping the save's own values to put back when it is turned off (`server::balance`).
 //!
@@ -54,10 +66,28 @@ pub const BUFF: &str = "patch_meta_ai_balance";
 pub const BAND: (f32, f32) = (48.0, 52.0);
 /// Power changed for every win-rate point outside the band (percent of power).
 pub const PER_POINT: f32 = 1.5;
-/// A champion's power stays within this much of its own (percent).
-pub const CAP: i32 = 30;
+/// A champion's (and an item's) power stays within this much of its own (percent). 50 since 2.9.0 (the user,
+/// 2026-11-13: 「还有max也调高点」 - 30 held the champions that did not move at -30%, and `balance_max` up to 50 needs
+/// room in all as well).
+pub const CAP: i32 = 50;
 /// Recent games (each patch back counting half, the model's `evidence`) before a champion's win rate is trusted.
 pub const MIN_EVIDENCE: f32 = 30.0;
+/// Picks this patch (ten a match) before they set the middle of the field ([`field_centre`]); fewer (a patch just
+/// begun): the champions' recent games ([`MIN_EVIDENCE`]'s evidence) do.
+pub const CENTRE_MIN_PICKS: f32 = 300.0;
+/// Items (2.9.0): builders with games enough ([`MIN_EVIDENCE`]) an item needs before it is judged; each builder
+/// weighs its games, at most [`ITEM_WEIGHT`]; their win rate is drawn toward 50 by n / (n + [`ITEM_SHRINK`]) (a few
+/// builders say little about the item); within [`ITEM_BAND`] points of 50 it is left alone, beyond it a step of
+/// [`ITEM_PER_POINT`] percent of its numbers a point; an item changed waits for [`ITEM_MIN_GAMES`] games of its
+/// builders since.
+pub const ITEM_MIN_USERS: usize = 4;
+pub const ITEM_WEIGHT: f32 = 200.0;
+pub const ITEM_SHRINK: f32 = 4.0;
+pub const ITEM_BAND: f32 = 2.0;
+pub const ITEM_PER_POINT: f32 = 2.0;
+pub const ITEM_MIN_GAMES: f32 = 60.0;
+/// A match looks at its champions' items every this many ticks (an item is bought now and then).
+pub const ITEM_EVERY: usize = 10;
 /// Game days after a round without a new game patch before the next round comes as a hotfix of the same patch (the
 /// game makes one every 4-6 weeks; with its champion changes off it might make none).
 pub const LATE_DAYS: i64 = 60;
@@ -73,16 +103,35 @@ const RUNS_KEPT: usize = 64;
 pub struct Rules {
     pub count: usize,
     pub max_step: i32,
+    /// The 4+6 pack's items too (2.9.0, `item_balance`), at most `item_count` a round, each a step of at most
+    /// `item_max` (percent of its numbers).
+    pub items: bool,
+    pub item_count: usize,
+    pub item_max: i32,
 }
 
 /// One champion's change in a round.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Change {
     pub champion: String,
-    /// The model's win rate for it when the round was made (percent) and its recent games.
+    /// Its win rate against the field when the round was made (percent, [`field_win`]; the model's own before 2.9.0)
+    /// and its recent games.
     pub win: f32,
     pub evidence: f32,
     /// This round's step and its power after it (percent).
+    pub step: i32,
+    pub total: i32,
+}
+
+/// One item's change in a round (2.9.0, `item_balance`): the 4+6 pack's key and the item's name, how many champions
+/// with games build it and their win rate (percent, weighted by games), its step and its power after it (percent of
+/// the item's numbers).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ItemChange {
+    pub item: String,
+    pub name: String,
+    pub users: u32,
+    pub win: f32,
     pub step: i32,
     pub total: i32,
 }
@@ -111,10 +160,50 @@ pub struct Round {
     /// Only for the log.
     #[serde(skip)]
     pub held: Vec<(String, f32)>,
+    /// The items it changed (2.9.0), and every item's power after it (percent of its numbers; absent = 0).
+    #[serde(default)]
+    pub items: Vec<ItemChange>,
+    #[serde(default)]
+    pub item_power: BTreeMap<String, i32>,
+    /// Why these champions and no more (the log: how many had games, were outside the band, waited, were at the limit).
+    #[serde(skip)]
+    pub summary: String,
 }
 
-/// A champion the model rates: name, win rate (percent), recent games, and its games since a round last changed it
-/// (None: no round did).
+/// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
+/// every game it was picked in this patch ([`CENTRE_MIN_PICKS`] picks or more; else by its recent games). The
+/// model's strength 0 is its prior's centre - a champion nobody may play - and measured from it nearly every
+/// champion played is too strong (on one save the 38 champions with 30 games of a patch: 59.4% in the model, 51.8%
+/// in their games). The median rather than the mean: a champion in every game does not make all the others look
+/// weak. 0 without any game.
+pub fn field_centre(meta: &Meta) -> f32 {
+    let picks: f32 = meta.champions.iter().map(|c| c.current.games as f32).sum();
+    let by_picks = picks >= CENTRE_MIN_PICKS;
+    let mut field: Vec<(f32, f32)> = meta
+        .champions
+        .iter()
+        .map(|c| (c.strength, if by_picks { c.current.games as f32 } else { c.evidence }))
+        .filter(|(strength, weight)| *weight > 0.0 && strength.is_finite())
+        .collect();
+    field.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let half = field.iter().map(|(_, weight)| weight).sum::<f32>() / 2.0;
+    let mut seen = 0.0;
+    for (strength, weight) in &field {
+        seen += weight;
+        if seen >= half {
+            return *strength;
+        }
+    }
+    0.0
+}
+
+/// A champion's win rate against the field (percent): its strength measured from [`field_centre`].
+pub fn field_win(champion: &crate::meta::Champion, centre: f32) -> f32 {
+    crate::glm::sigmoid(champion.strength - centre) * 100.0
+}
+
+/// A champion the model rates: name, win rate against the field (percent, [`field_win`]), recent games, and its
+/// games since a round last changed it (None: no round did).
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate<'a> {
     pub name: &'a str,
@@ -146,23 +235,36 @@ impl Candidate<'_> {
 /// later ones (its own patch mixes games from before and after it). None: no round changed it.
 pub fn games_since_change(rounds: &[Round], versions: &[String], champion: &crate::meta::Champion) -> Option<f32> {
     let last = rounds.iter().rev().find(|r| r.changes.iter().any(|c| c.champion == champion.name))?;
+    Some(games_since_round(last, versions, champion))
+}
+
+/// A champion's games since `round`: a round merged into a game patch counts that patch and the later ones, a hotfix
+/// only the later ones.
+fn games_since_round(round: &Round, versions: &[String], champion: &crate::meta::Champion) -> f32 {
     let games: u32 = versions
         .iter()
         .zip(&champion.history)
-        .filter(|(v, _)| match compare_versions(v, &last.version) {
+        .filter(|(v, _)| match compare_versions(v, &round.version) {
             std::cmp::Ordering::Greater => true,
-            std::cmp::Ordering::Equal => last.merged,
+            std::cmp::Ordering::Equal => round.merged,
             std::cmp::Ordering::Less => false,
         })
         .map(|(_, (_, tally))| tally.games)
         .sum();
-    Some(games as f32)
+    games as f32
 }
 
 /// The changes of a round: the champions furthest outside [`BAND`] with enough games (recent ones, and since their
 /// last change), at most `rules.count`, each a step of [`PER_POINT`] a point outside the band (at most
 /// `rules.max_step`), their power kept within [`CAP`].
 pub fn decide(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules: Rules) -> Vec<Change> {
+    let mut out = qualified(candidates, before, rules);
+    out.truncate(rules.count);
+    out
+}
+
+/// Every change [`decide`] could make, furthest outside the band first (before `rules.count` cuts the list).
+fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules: Rules) -> Vec<Change> {
     let mut out: Vec<(f32, Change)> = candidates
         .iter()
         .filter(|c| c.evidence >= MIN_EVIDENCE && c.settled())
@@ -179,7 +281,64 @@ pub fn decide(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rule
         })
         .collect();
     out.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.champion.cmp(&b.1.champion)));
-    out.truncate(rules.count);
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// A champion as the items see it (2.9.0): its win rate, the win rate once this round's own change to it works (a
+/// step closes step / [`PER_POINT`] points), its games, and the finished items its published build names.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Builder {
+    pub champion: String,
+    pub win: f32,
+    pub after: f32,
+    pub evidence: f32,
+    pub items: Vec<String>,
+}
+
+/// The item changes of a round (2.9.0): for each item named by [`ITEM_MIN_USERS`] builders or more with games, their
+/// win rate after this round's champion changes, weighted by games (at most [`ITEM_WEIGHT`] each) and drawn toward 50
+/// by n / (n + [`ITEM_SHRINK`]); beyond [`ITEM_BAND`] points of 50 a step of [`ITEM_PER_POINT`] a point (at most
+/// `rules.item_max`), the power kept within [`CAP`]; an item `settled` says not yet waits. Furthest first, at most
+/// `rules.item_count`. `names`: the items that can change (finished ones), with their names.
+pub fn decide_items(
+    builders: &[Builder],
+    names: &BTreeMap<String, String>,
+    before: &BTreeMap<String, i32>,
+    settled: &dyn Fn(&str) -> bool,
+    rules: Rules,
+) -> Vec<ItemChange> {
+    let mut out: Vec<(f32, ItemChange)> = Vec::new();
+    for (item, name) in names {
+        let users: Vec<&Builder> = builders.iter().filter(|b| b.evidence >= MIN_EVIDENCE && b.items.contains(item)).collect();
+        let n = users.len();
+        if n < ITEM_MIN_USERS {
+            continue;
+        }
+        let weight: f32 = users.iter().map(|b| b.evidence.min(ITEM_WEIGHT)).sum();
+        if weight <= 0.0 {
+            continue;
+        }
+        let mean = |f: &dyn Fn(&Builder) -> f32| users.iter().map(|b| b.evidence.min(ITEM_WEIGHT) * f(b)).sum::<f32>() / weight;
+        let (win, after) = (mean(&|b| b.win), mean(&|b| b.after));
+        let shrunk = (after - 50.0) * n as f32 / (n as f32 + ITEM_SHRINK);
+        let gap = if shrunk > ITEM_BAND {
+            shrunk - ITEM_BAND
+        } else if shrunk < -ITEM_BAND {
+            shrunk + ITEM_BAND
+        } else {
+            continue;
+        };
+        let want = ((-(gap * ITEM_PER_POINT)).round() as i32).clamp(-rules.item_max, rules.item_max);
+        let was = before.get(item).copied().unwrap_or(0);
+        let total = (was + want).clamp(-CAP, CAP);
+        let step = total - was;
+        if step == 0 || !settled(item) {
+            continue;
+        }
+        out.push((gap.abs(), ItemChange { item: item.clone(), name: name.clone(), users: n as u32, win, step, total }));
+    }
+    out.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.item.cmp(&b.1.item)));
+    out.truncate(rules.item_count);
     out.into_iter().map(|(_, c)| c).collect()
 }
 
@@ -237,22 +396,37 @@ pub fn hotfix_label(rounds: &[Round], version: &str) -> String {
 /// The round `due` asks for, after `rounds`, from the model's `meta`. A round that changes nobody is still a round
 /// (it marks the patch as looked at).
 pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
+    make_round_with(meta, rounds, rules, due, today, None)
+}
+
+/// [`make_round`] with the 4+6 pack's builds and item names (2.9.0): with `rules.items` the round changes items too;
+/// without, it carries the item power of the round before unchanged.
+pub fn make_round_with(
+    meta: &Meta,
+    rounds: &[Round],
+    rules: Rules,
+    due: &Due,
+    today: Option<(i32, u32, u32)>,
+    items: Option<&crate::items::Inputs>,
+) -> Round {
     let last = rounds.last();
     let version = due.version().to_string();
     let merged = matches!(due, Due::Patch(_));
     let label = if merged { version.clone() } else { hotfix_label(rounds, &version) };
     let before = last.map(|r| r.power.clone()).unwrap_or_default();
+    let centre = field_centre(meta);
     let candidates: Vec<Candidate<'_>> = meta
         .champions
         .iter()
         .map(|c| Candidate {
             name: &c.name,
-            win: c.win_rate() * 100.0,
+            win: field_win(c, centre),
             evidence: c.evidence,
             since_change: games_since_change(rounds, &meta.versions, c),
         })
         .collect();
-    let changes = decide(&candidates, &before, rules);
+    let could = qualified(&candidates, &before, rules);
+    let changes: Vec<Change> = could.iter().take(rules.count).cloned().collect();
     // out of the band with games enough, but not since their last change: next round, maybe
     let mut held: Vec<(f32, String, f32)> = candidates
         .iter()
@@ -260,12 +434,52 @@ pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today:
         .filter_map(|c| Some((c.gap()?.abs(), c.name.to_string(), c.since_change.unwrap_or(0.0))))
         .collect();
     held.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let summary = format!(
+        "{}; win rates against this patch's field: the model's {:.1}% counts as 50%",
+        summarize(&candidates, &before, rules, could.len(), changes.len()),
+        crate::glm::sigmoid(centre) * 100.0
+    );
     let mut power = before;
     for c in &changes {
         if c.total == 0 {
             power.remove(&c.champion);
         } else {
             power.insert(c.champion.clone(), c.total);
+        }
+    }
+    let mut item_power = last.map(|r| r.item_power.clone()).unwrap_or_default();
+    let item_changes = match items.filter(|_| rules.items) {
+        Some(inputs) => {
+            let builders: Vec<Builder> = meta
+                .champions
+                .iter()
+                .filter_map(|c| {
+                    let items = inputs.builds.get(&c.name)?.clone();
+                    let win = field_win(c, centre);
+                    let step = changes.iter().find(|x| x.champion == c.name).map_or(0, |x| x.step);
+                    Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / PER_POINT, evidence: c.evidence, items })
+                })
+                .collect();
+            // an item a round changed waits for its builders' games since
+            let settled = |item: &str| -> bool {
+                let Some(r) = rounds.iter().rev().find(|r| r.items.iter().any(|c| c.item == item)) else { return true };
+                let games: f32 = meta
+                    .champions
+                    .iter()
+                    .filter(|c| inputs.builds.get(&c.name).is_some_and(|b| b.iter().any(|k| k == item)))
+                    .map(|c| games_since_round(r, &meta.versions, c))
+                    .sum();
+                games >= ITEM_MIN_GAMES
+            };
+            decide_items(&builders, &inputs.names, &item_power, &settled, rules)
+        }
+        None => Vec::new(),
+    };
+    for c in &item_changes {
+        if c.total == 0 {
+            item_power.remove(&c.item);
+        } else {
+            item_power.insert(c.item.clone(), c.total);
         }
     }
     Round {
@@ -278,7 +492,39 @@ pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today:
         changes,
         power,
         held: held.into_iter().map(|(_, name, games)| (name, games)).collect(),
+        items: item_changes,
+        item_power,
+        summary,
     }
+}
+
+/// Why a round changed these champions and no more, for the log (the user, 2026-11-13, a player's 「我设置50个就砍了
+/// 20个」: `balance_count` is a ceiling - a champion also needs games, a win rate outside the band, games with its
+/// numbers since its last change and room under the limit).
+fn summarize(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules: Rules, could: usize, changed: usize) -> String {
+    let rated: Vec<&Candidate<'_>> = candidates.iter().filter(|c| c.evidence >= MIN_EVIDENCE).collect();
+    let outside: Vec<&&Candidate<'_>> = rated.iter().filter(|c| c.gap().is_some()).collect();
+    let waiting = outside.iter().filter(|c| !c.settled()).count();
+    let at_limit = outside
+        .iter()
+        .filter(|c| c.settled())
+        .filter(|c| {
+            let gap = c.gap().unwrap_or(0.0);
+            let want = ((-(gap * PER_POINT)).round() as i32).clamp(-rules.max_step, rules.max_step);
+            let was = before.get(c.name).copied().unwrap_or(0);
+            want != 0 && (was + want).clamp(-CAP, CAP) == was
+        })
+        .count();
+    let close = outside.len().saturating_sub(waiting + at_limit + could);
+    format!(
+        "{} champions rated, {} with {MIN_EVIDENCE} games or more, {} of those outside {}-{}%: {waiting} waiting for {MIN_EVIDENCE} games with their new numbers, {at_limit} at the {CAP}% limit, {close} too close to the band for a step; {could} could change, {changed} changed (balance_count {})",
+        candidates.len(),
+        rated.len(),
+        outside.len(),
+        BAND.0,
+        BAND.1,
+        rules.count
+    )
 }
 
 /// The buff for a champion at `power` percent: half on damage (attack and magic power), the rest on health.
@@ -293,8 +539,27 @@ pub fn factors(power: i32) -> (f64, f64) {
     (1.0 + f64::from(damage) / 100.0, 1.0 + f64::from(power - damage) / 100.0)
 }
 
+/// The rounds as the model reads them (2.9.0, [`crate::meta::own_steps`]): each step's size, where its games are.
+pub fn model_rounds_of(rounds: &[Round]) -> Vec<crate::meta::BalanceRound> {
+    rounds
+        .iter()
+        .map(|r| crate::meta::BalanceRound {
+            version: r.version.clone(),
+            merged: r.merged,
+            matches: r.matches,
+            steps: r.changes.iter().map(|c| (c.champion.clone(), c.step)).collect(),
+        })
+        .collect()
+}
+
+/// This save's rounds for the model ([`model_rounds_of`]).
+pub fn model_rounds() -> Vec<crate::meta::BalanceRound> {
+    model_rounds_of(&rounds())
+}
+
 /// The patch notes of the rounds for the model: each round gives each champion it changed its direction (+1
-/// buffed, -1 nerfed) in its patch, as the game's own notes do (the client adds up the notes of a patch).
+/// buffed, -1 nerfed) in its patch, as the game's own notes do (the client adds up the notes of a patch). Since
+/// 2.9.0 the model takes the steps' size from [`model_rounds`] and these lines give no direction of their own.
 pub fn notes_of(rounds: &[Round]) -> Vec<PatchNote> {
     rounds
         .iter()
@@ -376,6 +641,14 @@ pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
 pub fn reason(c: &Change, rules: Rules) -> String {
     let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
     let mut codes = vec![format!("pma_wr_{n}")];
+    // the power this round and in all (2.9.0; the user: 「一起加上」 - a player read -11% of power as the -5% / -6% of
+    // the lines and thought it barely cut)
+    if c.step != 0 {
+        codes.push(format!("pma_power_{}", signed_code(c.step)));
+    }
+    if c.total != 0 && c.total != c.step {
+        codes.push(format!("pma_sum_{}", signed_code(c.total)));
+    }
     if c.step.abs() >= rules.max_step {
         codes.push("pma_cap".to_string());
     }
@@ -383,6 +656,59 @@ pub fn reason(c: &Change, rules: Rules) -> String {
         codes.push("pma_total".to_string());
     }
     codes.join(",")
+}
+
+/// A signed percent in a text code: `m11` for -11, `p9` for +9 (`pma_power_*`, `pma_sum_*`).
+pub fn signed_code(v: i32) -> String {
+    format!("{}{}", if v < 0 { "m" } else { "p" }, v.unsigned_abs())
+}
+
+/// The round's item changes as news of their own (2.9.0; None: it changed no item): a title and a line an item - its
+/// builders' win rate, its step and power, and its numbers before and after (`lines`, [`crate::items::lines`]).
+pub fn item_news(round: &Round, chinese: bool, lines: &dyn Fn(&ItemChange) -> Vec<crate::items::Line>) -> Option<(String, String)> {
+    if round.items.is_empty() {
+        return None;
+    }
+    let name = if round.label.is_empty() { round.version.as_str() } else { round.label.as_str() };
+    let title = if chinese { format!("电竞大脑装备平衡 {name}") } else { format!("Patch Meta AI item balance {name}") };
+    let mut out = vec![if chinese {
+        "4+6 装备的改动：只改装备给的数值（特效不变，穿透、韧性这类只能加不能减），对所有比赛生效；装备说明里显示的仍是原来的数值。"
+            .to_string()
+    } else {
+        "4+6 item changes: only the numbers an item gives (its effects stay; penetration, tenacity and the like can go up,          never down), in every match; the item tooltips still show the numbers from before."
+            .to_string()
+    }];
+    let mut items: Vec<&ItemChange> = round.items.iter().collect();
+    items.sort_by_key(|c| (c.step > 0, c.step));
+    for c in items {
+        let numbers: Vec<String> = lines(c).into_iter().map(|(label, from, to)| format!("{label} {from} → {to}")).collect();
+        out.push(if chinese {
+            format!(
+                "【{}】{}：出它的 {} 个英雄平均胜率约 {:.1}% → 装备数值 {:+}%（累计 {:+}%）{}{}",
+                if c.step < 0 { "削弱" } else { "加强" },
+                c.name,
+                c.users,
+                c.win,
+                c.step,
+                c.total,
+                if numbers.is_empty() { "" } else { "：" },
+                numbers.join("，")
+            )
+        } else {
+            format!(
+                "[{}] {}: its {} builders win about {:.1}% -> item numbers {:+}% ({:+}% in all){}{}",
+                if c.step < 0 { "Nerf" } else { "Buff" },
+                c.name,
+                c.users,
+                c.win,
+                c.step,
+                c.total,
+                if numbers.is_empty() { "" } else { ": " },
+                numbers.join(", ")
+            )
+        });
+    }
+    Some((title, out.join("\n")))
 }
 
 /// A news card as the game writes them: a `Simple` item with text references and their binds.
@@ -553,6 +879,9 @@ struct Book {
     rounds: Vec<Round>,
     /// (match key, round id; 0 = none) - the newest last.
     kept: Vec<(String, u32)>,
+    /// Kept matches whose server run had the item balance off (2.9.0): every run of them plays no item change.
+    #[serde(default)]
+    items_off: Vec<String>,
 }
 
 #[derive(Default)]
@@ -566,8 +895,11 @@ struct Store {
     /// The newest round the save's news had when it was opened: a new round's id comes after it (and after the
     /// book's own - they are the same unless the book was lost).
     done: u32,
-    /// Each round's power, shared with the runs.
+    /// Each round's power, shared with the runs; and its items' (2.9.0).
     powers: HashMap<u32, Arc<BTreeMap<String, i32>>>,
+    item_powers: HashMap<u32, Arc<BTreeMap<String, i32>>>,
+    /// Kept matches played without the item balance ([`Book::items_off`]).
+    items_off: std::collections::HashSet<String>,
     kept: HashMap<String, u32>,
     order: VecDeque<String>,
     /// Kept matches not written yet, and when the book was last written (a day plays many matches: the book is
@@ -639,6 +971,7 @@ fn open_book_file(file: PathBuf, legacy: PathBuf, done: u32) {
     if !later.is_empty() {
         for r in &later {
             st.powers.remove(&r.id);
+            st.item_powers.remove(&r.id);
         }
         let view = st.rounds.last().and_then(|r| st.powers.get(&r.id).map(|power| view_of(r, power)));
         st.view = view;
@@ -662,6 +995,7 @@ fn load(st: &mut Store, book: Book) {
         let power = Arc::new(r.power.clone());
         st.view = Some(view_of(&r, &power));
         st.powers.insert(r.id, power);
+        st.item_powers.insert(r.id, Arc::new(r.item_power.clone()));
         st.rounds.push(r);
     }
     for (key, id) in book.kept {
@@ -669,6 +1003,7 @@ fn load(st: &mut Store, book: Book) {
             st.order.push_back(key);
         }
     }
+    st.items_off = book.items_off.into_iter().filter(|k| st.kept.contains_key(k)).collect();
 }
 
 /// The save is closed (its kept matches written first).
@@ -683,7 +1018,8 @@ pub fn close() {
 fn write(st: &mut Store) {
     let Some(file) = &st.file else { return };
     let kept = st.order.iter().filter_map(|k| Some((k.clone(), *st.kept.get(k)?))).collect();
-    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept };
+    let items_off = st.order.iter().filter(|k| st.items_off.contains(*k)).cloned().collect();
+    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept, items_off };
     if let Ok(text) = serde_json::to_string(&book) {
         let _ = std::fs::write(file, text);
     }
@@ -715,8 +1051,12 @@ pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Du
 
 /// The round `due` asks for on this save ([`make_round`]); not in the book until [`publish`]ed.
 pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
+    let items = if rules.items { crate::items::inputs() } else { None };
+    if rules.items && items.is_none() {
+        diag::log_once("items-no-inputs", "[items] item_balance is on but the 4+6 builds or catalog are not read (yet): this round changes no item");
+    }
     let st = store();
-    let mut round = make_round(meta, &st.rounds, rules, due, today);
+    let mut round = make_round_with(meta, &st.rounds, rules, due, today, items.as_ref());
     round.id = round.id.max(st.done + 1);
     round
 }
@@ -735,6 +1075,7 @@ fn publish_in(st: &mut Store, round: Round) {
     let power = Arc::new(round.power.clone());
     st.view = Some(view_of(&round, &power));
     st.powers.insert(round.id, power);
+    st.item_powers.insert(round.id, Arc::new(round.item_power.clone()));
     st.rounds.push(round);
     write(st);
 }
@@ -778,7 +1119,14 @@ struct Run {
     key: RunKey,
     last_tick: usize,
     /// None until decided; Some(None) = no balance.
-    power: Option<Option<Arc<BTreeMap<String, i32>>>>,
+    power: Option<Option<RunPower>>,
+}
+
+/// What a run plays: every champion's power, and the items' (None: no item change).
+#[derive(Clone)]
+struct RunPower {
+    champions: Arc<BTreeMap<String, i32>>,
+    items: Option<Arc<BTreeMap<String, i32>>>,
 }
 
 static RUNS: LazyLock<Mutex<VecDeque<Run>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -789,7 +1137,7 @@ fn run_key(sim: &StableSim<'_>) -> RunKey {
 
 /// This run's balance, decided once it has its champions (None: not yet). The server's run takes the newest round
 /// (`on`: the setting) and keeps it; any other run plays what was kept (none when nothing was).
-fn decide_run(sim: &StableSim<'_>, on: bool) -> Option<Option<Arc<BTreeMap<String, i32>>>> {
+fn decide_run(sim: &StableSim<'_>, on: bool, items_on: bool) -> Option<Option<RunPower>> {
     let mut sides: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     let mut missing = 0;
     for i in 0..sim.player_count() {
@@ -804,12 +1152,13 @@ fn decide_run(sim: &StableSim<'_>, on: bool) -> Option<Option<Arc<BTreeMap<Strin
     }
     let key = crate::ai_tactics::key(&sides);
     let first_run = sim.sim_origin().is_some_and(|o| SimOriginKindV1::from_code(o.kind) == Some(SimOriginKindV1::ServerPresim));
-    Some(round_for(key, first_run, on))
+    Some(round_for(key, first_run, on, items_on))
 }
 
 /// The power a run of the match `key` plays: the server's run (`first_run`) takes the newest round (none with the
-/// setting off) and keeps it under the key; any other run plays what was kept (none when nothing was).
-fn round_for(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<String, i32>>> {
+/// setting off) and keeps it under the key; any other run plays what was kept (none when nothing was). The items'
+/// power with it, unless the server's run had `item_balance` off (kept too, 2.9.0).
+fn round_for(key: String, first_run: bool, on: bool, items_on: bool) -> Option<RunPower> {
     let mut st = store();
     // no save open here (yet): nothing to play, nothing to keep
     st.file.as_ref()?;
@@ -818,6 +1167,10 @@ fn round_for(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<Stri
         // nothing ever played on this save: nothing to keep either
         if id == 0 && st.rounds.is_empty() {
             return None;
+        }
+        let items_changed = if items_on { st.items_off.remove(&key) } else { st.items_off.insert(key.clone()) };
+        if items_changed {
+            st.unwritten = true;
         }
         match st.kept.insert(key.clone(), id) {
             // the same match run again by the server: nothing new to write
@@ -828,6 +1181,7 @@ fn round_for(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<Stri
                     while st.order.len() > KEPT {
                         if let Some(old) = st.order.pop_front() {
                             st.kept.remove(&old);
+                            st.items_off.remove(&old);
                         }
                     }
                 }
@@ -837,10 +1191,17 @@ fn round_for(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<Stri
                 }
             }
         }
-        return st.powers.get(&id).cloned();
+        return run_power(&st, id, items_on);
     }
     let id = st.kept.get(&key).copied().unwrap_or(0);
-    st.powers.get(&id).cloned()
+    let items_on = !st.items_off.contains(&key);
+    run_power(&st, id, items_on)
+}
+
+fn run_power(st: &Store, id: u32, items_on: bool) -> Option<RunPower> {
+    let champions = st.powers.get(&id).cloned()?;
+    let items = if items_on { st.item_powers.get(&id).filter(|m| !m.is_empty()).cloned() } else { None };
+    Some(RunPower { champions, items })
 }
 
 /// The champions to give the buff now: alive, a power of their own, not carrying it yet - (entity id, power).
@@ -853,8 +1214,9 @@ pub fn missing(champions: &[(usize, String, bool, bool)], power: &BTreeMap<Strin
 }
 
 /// Every tick of every match (the mod's match hook): the run's balance (decided once) on each of its champions that
-/// does not carry it yet - at the start, and again after every respawn.
-pub fn on_tick(sim: &mut StableSim<'_>, on: bool) {
+/// does not carry it yet - at the start, and again after every respawn; every [`ITEM_EVERY`] ticks the items'
+/// corrections on their holders (2.9.0).
+pub fn on_tick(sim: &mut StableSim<'_>, on: bool, items_on: bool) {
     let key = run_key(sim);
     let tick = sim.tick();
     let power = {
@@ -876,10 +1238,10 @@ pub fn on_tick(sim: &mut StableSim<'_>, on: bool) {
         }
         run.last_tick = tick;
         if run.power.is_none() {
-            run.power = decide_run(sim, on);
+            run.power = decide_run(sim, on, items_on);
         }
         match &run.power {
-            Some(Some(p)) => Arc::clone(p),
+            Some(Some(p)) => p.clone(),
             _ => return,
         }
     };
@@ -890,8 +1252,59 @@ pub fn on_tick(sim: &mut StableSim<'_>, on: bool) {
             (c.id(), c.name().unwrap_or_default(), c.is_alive(), has)
         })
         .collect();
-    for (id, pw) in missing(&champions, &power) {
+    for (id, pw) in missing(&champions, &power.champions) {
         sim.add_buff(id, &buff(pw));
+    }
+    if let Some(items) = power.items.filter(|_| tick.is_multiple_of(ITEM_EVERY)) {
+        item_pass(sim, &items);
+    }
+}
+
+/// The items' corrections on their holders (2.9.0, [`crate::items::corrections`]): added for an item with power,
+/// replaced when its numbers moved, taken off once the item is gone.
+fn item_pass(sim: &mut StableSim<'_>, items: &BTreeMap<String, i32>) {
+    let Some(catalog) = crate::items::catalog() else { return };
+    let mut adds: Vec<(usize, BuffV1)> = Vec::new();
+    let mut removes: Vec<(usize, String)> = Vec::new();
+    for i in 0..sim.player_count() {
+        let Some(c) = sim.player_at(i).and_then(|p| p.champion()) else { continue };
+        if !c.is_alive() {
+            continue;
+        }
+        let id = c.id();
+        let mut owned: Vec<(String, BuffV1)> = Vec::new();
+        let mut have: Vec<(String, BuffV1)> = Vec::new();
+        for k in 0..c.buff_count() {
+            let Some(b) = c.buff_at(k) else { continue };
+            let name = b.name().to_string();
+            if name.starts_with(crate::items::OWNED) {
+                owned.push((name, b));
+            } else if name.starts_with(crate::items::CORRECTION) {
+                have.push((name, b));
+            }
+        }
+        let want = crate::items::corrections(&catalog, &owned, items);
+        for w in &want {
+            match have.iter().find(|(n, _)| n == w.name()) {
+                Some((_, b)) if crate::items::same_numbers(b, w) => {}
+                Some((n, _)) => {
+                    removes.push((id, n.clone()));
+                    adds.push((id, *w));
+                }
+                None => adds.push((id, *w)),
+            }
+        }
+        for (n, _) in &have {
+            if !want.iter().any(|w| w.name() == n) {
+                removes.push((id, n.clone()));
+            }
+        }
+    }
+    for (id, name) in removes {
+        sim.entity_remove_buff(id, &name);
+    }
+    for (id, b) in adds {
+        sim.add_buff(id, &b);
     }
 }
 
@@ -911,7 +1324,12 @@ pub fn reset_for_tests() {
 mod tests {
     use super::*;
 
-    const RULES: Rules = Rules { count: 10, max_step: 10 };
+    /// The champions' power a run plays (the items' left out), as the tests before 2.9.0 read it.
+    fn champs(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<String, i32>>> {
+        round_for(key, first_run, on, true).map(|p| p.champions)
+    }
+
+    const RULES: Rules = Rules { count: 10, max_step: 10, items: false, item_count: 5, item_max: 10 };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
         Candidate { name, win, evidence, since_change: None }
@@ -929,7 +1347,7 @@ mod tests {
         // 21.3 points over: -32, held to -10; 12 over: -18 -> -10; 4 under: +6; gwen has too few games; 50.5 is fine
         assert_eq!(got, [("maddie", -10), ("zeri", -10), ("weak", 6)]);
         // a round's count keeps the furthest
-        assert_eq!(decide(&[cand("a", 60.0, 50.0), cand("b", 70.0, 50.0)], &before, Rules { count: 1, max_step: 10 })[0].champion, "b");
+        assert_eq!(decide(&[cand("a", 60.0, 50.0), cand("b", 70.0, 50.0)], &before, Rules { count: 1, ..RULES })[0].champion, "b");
         // just outside the band: under a step, no change
         assert!(decide(&[cand("a", 52.2, 50.0)], &before, RULES).is_empty());
     }
@@ -937,7 +1355,7 @@ mod tests {
     #[test]
     fn rounds_add_up_to_the_cap() {
         let mut before = BTreeMap::new();
-        before.insert("maddie".to_string(), -25);
+        before.insert("maddie".to_string(), -(CAP - 5));
         let out = decide(&[cand("maddie", 70.0, 100.0)], &before, RULES);
         assert_eq!((out[0].step, out[0].total), (-5, -CAP), "held to the cap in all");
         before.insert("maddie".to_string(), -CAP);
@@ -1084,10 +1502,14 @@ mod tests {
     #[test]
     fn the_reason_is_the_win_rate_and_the_limits() {
         let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total };
-        assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_cap");
-        assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53", "rounded away from the band");
-        assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44");
-        assert_eq!(reason(&c(70.0, -5, -30), RULES), "pma_wr_70,pma_total");
+        assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
+        assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
+        assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
+        // the power in all when other rounds moved it before (2.9.0), the limit in all at CAP
+        assert_eq!(reason(&c(70.0, -5, -30), RULES), "pma_wr_70,pma_power_m5,pma_sum_m30");
+        assert_eq!(reason(&c(70.0, -5, -CAP), RULES), format!("pma_wr_70,pma_power_m5,pma_sum_m{CAP},pma_total"));
+        assert_eq!(reason(&c(40.0, 8, 0), RULES), "pma_wr_40,pma_power_p8", "back to its own numbers: no sum");
+        assert_eq!((signed_code(-11), signed_code(9)), ("m11".to_string(), "p9".to_string()));
     }
 
     #[test]
@@ -1127,7 +1549,7 @@ mod tests {
         assert_eq!(keys, ["Champion", "PatchChanges", "PatchReason", "Team"]);
         assert_eq!(pc02.title_bind[0].1, "tft_maddie");
         assert!(pc02.title_bind[1].1.starts_with(r##"[{"key":"#asset/base/text/champion?stat.attack""##), "{}", pc02.title_bind[1].1);
-        assert_eq!(pc02.title_bind[2].1, "pma_wr_74,pma_cap");
+        assert_eq!(pc02.title_bind[2].1, "pma_wr_74,pma_power_m10,pma_cap");
         let tail: Vec<(&str, &str)> = pc02.content_bind[4..].iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(
             tail,
@@ -1153,19 +1575,19 @@ mod tests {
         let file = std::env::temp_dir().join(format!("pma_balance_test_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&file);
         // no save open: nothing
-        assert_eq!(round_for("k".into(), true, true), None);
+        assert_eq!(champs("k".into(), true, true), None);
         assert_eq!(due_now(Some("1.1"), None), None);
         open_file(file.clone());
         // a save with no round: nothing played, nothing kept
-        assert_eq!(round_for("k".into(), true, true), None);
+        assert_eq!(champs("k".into(), true, true), None);
         assert_eq!(due_now(Some("1.1"), None), Some(Due::First("1.1".into())));
         let mut power = BTreeMap::new();
         power.insert("maddie".to_string(), -10);
         publish(Round { id: 1, version: "1.1".into(), power: power.clone(), ..Round::default() });
         assert_eq!(view().map(|v| (v.id, v.power.get("maddie").copied())), Some((1, Some(-10))));
         // the server's run takes round 1; the client's run of the same match plays it too
-        assert_eq!(round_for("k".into(), true, true).as_deref(), Some(&power));
-        assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power));
+        assert_eq!(champs("k".into(), true, true).as_deref(), Some(&power));
+        assert_eq!(champs("k".into(), false, true).as_deref(), Some(&power));
         // a later round does not change a match already played
         let mut power2 = BTreeMap::new();
         power2.insert("maddie".to_string(), -20);
@@ -1177,19 +1599,19 @@ mod tests {
             ..Round::default()
         });
         assert_eq!(view().map(|v| v.steps.get("maddie").copied()), Some(Some(-10)));
-        assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power), "a replay plays its own round");
+        assert_eq!(champs("k".into(), false, true).as_deref(), Some(&power), "a replay plays its own round");
         // a run of a match nothing was kept for (from before): none
-        assert_eq!(round_for("other".into(), false, true), None);
+        assert_eq!(champs("other".into(), false, true), None);
         // with the setting off, a new match plays none - and its replays too
-        assert_eq!(round_for("off".into(), true, false), None);
-        assert_eq!(round_for("off".into(), false, true), None);
+        assert_eq!(champs("off".into(), true, false), None);
+        assert_eq!(champs("off".into(), false, true), None);
         // the book survives the session
         close();
         assert_eq!(view(), None);
         open_file(file.clone());
         assert_eq!(rounds().len(), 2);
         assert_eq!(view().map(|v| v.id), Some(2));
-        assert_eq!(round_for("k".into(), false, true).as_deref(), Some(&power));
+        assert_eq!(champs("k".into(), false, true).as_deref(), Some(&power));
         assert_eq!(notes().len(), 2);
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
@@ -1209,15 +1631,15 @@ mod tests {
         for id in 1..=3u32 {
             let power = [("maddie".to_string(), -10 * id as i32)].into_iter().collect();
             publish(Round { id, version: format!("1.{id}"), power, ..Round::default() });
-            round_for(format!("match{id}"), true, true);
+            champs(format!("match{id}"), true, true);
         }
         close();
         // its save opened by 2.8.2: the save's news has two rounds (the third was made after it was saved)
         open_book_file(own.clone(), legacy.clone(), 2);
         assert_eq!(rounds().iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(view().map(|v| (v.id, v.power.get("maddie").copied())), Some((2, Some(-20))));
-        assert_eq!(round_for("match2".into(), false, true).map(|p| p["maddie"]), Some(-20));
-        assert_eq!(round_for("match3".into(), false, true), None, "a round after this save is not played");
+        assert_eq!(champs("match2".into(), false, true).map(|p| p["maddie"]), Some(-20));
+        assert_eq!(champs("match3".into(), false, true), None, "a round after this save is not played");
         assert!(legacy.exists(), "the old book stays for that career's other saves");
         close();
         // the career's later save opened again (its own book now, whatever became of the old one): the third round
@@ -1225,7 +1647,7 @@ mod tests {
         let _ = std::fs::remove_file(&legacy);
         open_book_file(own.clone(), legacy.clone(), 3);
         assert_eq!(rounds().len(), 3);
-        assert_eq!(round_for("match3".into(), false, true).map(|p| p["maddie"]), Some(-30));
+        assert_eq!(champs("match3".into(), false, true).map(|p| p["maddie"]), Some(-30));
         close();
         // back on the earlier save, and it goes its own way: its round takes the later one's place
         open_book_file(own.clone(), legacy.clone(), 2);
@@ -1322,5 +1744,245 @@ mod tests {
         assert!(body.contains("【加强】\n某英雄：胜率 44.0%"), "{body}");
         let (title, body) = news(&round, &|n: &str| n.to_string());
         assert!(title == "Patch Meta AI balance patch 2027.4.1b" && body.starts_with("[Nerfs]"), "{title} / {body}");
+    }
+
+    // ===================== 2.9.0: items, the log, the wider limits =====================
+
+    const ITEM_RULES: Rules = Rules { count: 10, max_step: 10, items: true, item_count: 5, item_max: 10 };
+
+    fn builder(name: &str, win: f32, after: f32, evidence: f32, items: &[&str]) -> Builder {
+        Builder { champion: name.into(), win, after, evidence, items: items.iter().map(|s| s.to_string()).collect() }
+    }
+
+    fn names(keys: &[&str]) -> BTreeMap<String, String> {
+        keys.iter().map(|k| (k.to_string(), format!("名字{k}"))).collect()
+    }
+
+    #[test]
+    fn an_item_whose_builders_still_win_too_much_is_cut() {
+        let always = |_: &str| true;
+        let before = BTreeMap::new();
+        // five builders at 62% after this round's own champion changes: 12 over 50, drawn to 12 x 5/9 = 6.7,
+        // 4.7 beyond the band, a step of -9
+        let five: Vec<Builder> = (0..5).map(|i| builder(&format!("c{i}"), 64.0, 62.0, 100.0, &["rfc"])).collect();
+        let out = decide_items(&five, &names(&["rfc"]), &before, &always, ITEM_RULES);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].item.as_str(), out[0].users, out[0].step, out[0].total), ("rfc", 5, -9, -9));
+        assert!((out[0].win - 64.0).abs() < 1e-4, "the notes give the builders' win rate as it is");
+        // three builders are too few to judge an item; builders with few games do not count
+        let three: Vec<Builder> = (0..3).map(|i| builder(&format!("c{i}"), 70.0, 70.0, 100.0, &["rfc"])).collect();
+        assert!(decide_items(&three, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
+        let mut thin = three.clone();
+        thin.push(builder("new", 70.0, 70.0, MIN_EVIDENCE - 1.0, &["rfc"]));
+        assert!(decide_items(&thin, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
+        // the builders' win rate once their own nerfs work is what counts: fine after them, no item change
+        let fixed: Vec<Builder> = (0..6).map(|i| builder(&format!("c{i}"), 60.0, 51.0, 100.0, &["rfc"])).collect();
+        assert!(decide_items(&fixed, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
+        // far off: held to item_max a round, CAP in all; weak builders get the item buffed
+        let far: Vec<Builder> = (0..20).map(|i| builder(&format!("c{i}"), 80.0, 80.0, 500.0, &["rfc", "weak"])).collect();
+        let out = decide_items(&far, &names(&["rfc"]), &before, &always, ITEM_RULES);
+        assert_eq!((out[0].step, out[0].total), (-10, -10));
+        let was: BTreeMap<String, i32> = [("rfc".to_string(), -(CAP - 4))].into_iter().collect();
+        let out = decide_items(&far, &names(&["rfc"]), &was, &always, ITEM_RULES);
+        assert_eq!((out[0].step, out[0].total), (-4, -CAP));
+        let weak: Vec<Builder> = (0..8).map(|i| builder(&format!("c{i}"), 40.0, 40.0, 100.0, &["staff"])).collect();
+        assert!(decide_items(&weak, &names(&["staff"]), &before, &always, ITEM_RULES)[0].step > 0);
+        // an item that has to wait, and the round's count keeps the furthest
+        let wait = |item: &str| item != "rfc";
+        assert!(decide_items(&five, &names(&["rfc"]), &before, &wait, ITEM_RULES).is_empty());
+        let mut mixed = five.clone();
+        mixed.extend((0..5).map(|i| builder(&format!("d{i}"), 70.0, 70.0, 100.0, &["bc"])));
+        let out = decide_items(&mixed, &names(&["rfc", "bc"]), &before, &always, Rules { item_count: 1, ..ITEM_RULES });
+        assert_eq!(out.iter().map(|c| c.item.as_str()).collect::<Vec<_>>(), ["bc"]);
+    }
+
+    fn inputs(builds: &[(&str, &[&str])]) -> crate::items::Inputs {
+        let b: crate::items::Builds =
+            builds.iter().map(|(h, items)| (h.to_string(), items.iter().map(|s| s.to_string()).collect())).collect();
+        let names = builds.iter().flat_map(|(_, items)| items.iter()).map(|k| (k.to_string(), format!("名字{k}"))).collect();
+        crate::items::Inputs { builds: Arc::new(b), names }
+    }
+
+    #[test]
+    fn a_round_changes_items_with_the_champions_and_keeps_their_power() {
+        let mut m = meta();
+        // four more strong builders of one item; maddie (73%) builds it too
+        for i in 0..4 {
+            m.champions.push(champ(&format!("adc{i}"), 64.0, 120.0));
+        }
+        // the middle of the field stays at 50%: champions at 50% play the most
+        for i in 0..3 {
+            m.champions.push(champ(&format!("mid{i}"), 50.0, 300.0));
+        }
+        let builds: Vec<(&str, &[&str])> = vec![
+            ("maddie", &["rfc"]),
+            ("adc0", &["rfc"]),
+            ("adc1", &["rfc"]),
+            ("adc2", &["rfc"]),
+            ("adc3", &["rfc"]),
+            ("fine", &["staff"]),
+        ];
+        let inp = inputs(&builds);
+        let today = Some((2027, 10, 1));
+        let round = make_round_with(&m, &[], ITEM_RULES, &Due::First("2027.4.1".into()), today, Some(&inp));
+        assert!(round.changes.iter().any(|c| c.champion == "maddie"), "the champions as before");
+        assert_eq!(round.items.len(), 1, "{:?}", round.items);
+        assert_eq!(round.items[0].item, "rfc");
+        assert_eq!(round.item_power.get("rfc"), Some(&round.items[0].total));
+        // the item balance off: no item change, the power so far carried on
+        let next = make_round_with(&m, std::slice::from_ref(&round), RULES, &Due::Late("2027.4.1".into()), today, Some(&inp));
+        assert!(next.items.is_empty());
+        assert_eq!(next.item_power, round.item_power);
+        // the item just changed waits for its builders' games
+        let again = make_round_with(&m, std::slice::from_ref(&round), ITEM_RULES, &Due::Late("2027.4.1".into()), today, Some(&inp));
+        assert!(again.items.is_empty(), "no games since: {:?}", again.items);
+        // the log says why these champions and no more
+        assert!(round.summary.starts_with("10 champions rated"), "{}", round.summary);
+        assert!(round.summary.contains("changed (balance_count 10)"), "{}", round.summary);
+    }
+
+    #[test]
+    fn the_log_says_why_a_round_changed_fewer_than_balance_count() {
+        let c = |name: &'static str, win: f32, evidence: f32, since: Option<f32>| Candidate { name, win, evidence, since_change: since };
+        let cands = [
+            c("a", 70.0, 100.0, None),
+            c("b", 65.0, 100.0, Some(5.0)),
+            c("cap", 60.0, 100.0, None),
+            c("near", 52.2, 100.0, None),
+            c("few", 75.0, 10.0, None),
+            c("in", 50.0, 100.0, None),
+        ];
+        let before: BTreeMap<String, i32> = [("cap".to_string(), -CAP)].into_iter().collect();
+        let rules = Rules { count: 60, max_step: 50, ..RULES };
+        let could = qualified(&cands, &before, rules);
+        let text = summarize(&cands, &before, rules, could.len(), could.len().min(rules.count));
+        assert!(text.starts_with("6 champions rated, 5 with 30 games or more, 4 of those outside 48-52%"), "{text}");
+        assert!(text.contains("1 waiting") && text.contains("1 at the 50% limit") && text.contains("1 too close"), "{text}");
+        assert!(text.contains("1 could change, 1 changed (balance_count 60)"), "{text}");
+    }
+
+    #[test]
+    fn the_item_news_names_each_item_its_builders_and_numbers() {
+        let mut round = Round { id: 4, version: "2027.5.0".into(), label: "2027.5.0".into(), ..Round::default() };
+        assert_eq!(item_news(&round, true, &|_| Vec::new()), None, "no item changed: no news");
+        round.items = vec![
+            ItemChange { item: "staff".into(), name: "大天使之杖".into(), users: 6, win: 43.5, step: 6, total: 6 },
+            ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.5, step: -10, total: -20 },
+        ];
+        let lines = |c: &ItemChange| {
+            if c.item == "rfc" {
+                vec![("攻击速度".to_string(), "31".to_string(), "28".to_string())]
+            } else {
+                Vec::new()
+            }
+        };
+        let (title, content) = item_news(&round, true, &lines).unwrap();
+        assert_eq!(title, "电竞大脑装备平衡 2027.5.0");
+        let rows: Vec<&str> = content.lines().collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].contains("特效不变"), "{}", rows[0]);
+        assert_eq!(rows[1], "【削弱】疾射火炮：出它的 4 个英雄平均胜率约 64.5% → 装备数值 -10%（累计 -20%）：攻击速度 31 → 28");
+        assert!(rows[2].starts_with("【加强】大天使之杖") && !rows[2].ends_with("："), "{}", rows[2]);
+        let (title, content) = item_news(&round, false, &lines).unwrap();
+        assert_eq!(title, "Patch Meta AI item balance 2027.5.0");
+        assert!(
+            content.contains("[Nerf] 疾射火炮: its 4 builders win about 64.5% -> item numbers -10% (-20% in all): 攻击速度 31 → 28"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn a_matchs_runs_play_its_items_unless_its_first_run_had_them_off() {
+        let _serial = crate::tests::serial();
+        reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_items_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        open_file(file.clone());
+        let power = [("maddie".to_string(), -10)].into_iter().collect();
+        let item_power = [("rfc".to_string(), -10)].into_iter().collect();
+        publish(Round { id: 1, version: "1.1".into(), power, item_power, ..Round::default() });
+        let items_of = |p: Option<RunPower>| p.and_then(|p| p.items).map(|m| m.get("rfc").copied());
+        // the server's run with the item balance on: every run of the match plays the items
+        assert_eq!(items_of(round_for("on".into(), true, true, true)), Some(Some(-10)));
+        assert_eq!(items_of(round_for("on".into(), false, true, false)), Some(Some(-10)), "a later run follows the first");
+        // with it off: the champions' power, no items - for its replays too, after the book is read again
+        let off = round_for("off".into(), true, true, false).expect("a run power");
+        assert_eq!(off.champions.get("maddie"), Some(&-10));
+        assert!(off.items.is_none());
+        assert_eq!(items_of(round_for("off".into(), false, true, true)), None);
+        close();
+        open_file(file.clone());
+        assert_eq!(items_of(round_for("off".into(), false, true, true)), None);
+        assert_eq!(items_of(round_for("on".into(), false, true, true)), Some(Some(-10)));
+        let _ = std::fs::remove_file(&file);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn the_model_reads_each_rounds_steps() {
+        let round = Round {
+            id: 1,
+            version: "2027.4.1".into(),
+            merged: false,
+            matches: 586,
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10 }],
+            ..Round::default()
+        };
+        let got = model_rounds_of(&[round]);
+        assert_eq!(
+            got,
+            [crate::meta::BalanceRound { version: "2027.4.1".into(), merged: false, matches: 586, steps: vec![("maddie".into(), -10)] }]
+        );
+        // the round log line reads as one line
+        let c = |name: &'static str, win: f32| Candidate { name, win, evidence: 100.0, since_change: Some(5.0) };
+        let text = summarize(&[c("a", 70.0), c("b", 30.0)], &BTreeMap::new(), RULES, 0, 0);
+        assert!(!text.contains("  "), "{text}");
+        assert!(text.contains("2 waiting for 30 games with their new numbers"), "{text}");
+    }
+
+    #[test]
+    fn win_rates_count_from_the_middle_of_the_field() {
+        let mut m = meta();
+        for i in 0..3 {
+            m.champions.push(champ(&format!("mid{i}"), 50.0, 300.0));
+        }
+        let due = Due::First("2027.4.1".into());
+        let plain = make_round(&m, &[], RULES, &due, None);
+        let steps = |r: &Round| r.changes.iter().map(|c| (c.champion.clone(), c.step)).collect::<Vec<_>>();
+        assert_eq!(steps(&plain), [("maddie".to_string(), -10), ("weak".to_string(), 6)]);
+        assert!(plain.summary.ends_with("the model's 50.0% counts as 50%"), "{}", plain.summary);
+        // the model's strength 0 is not the field's: every champion a step stronger changes as before
+        let mut up = m.clone();
+        for c in &mut up.champions {
+            c.strength += 0.4;
+        }
+        assert!((field_centre(&up) - 0.4).abs() < 1e-6);
+        let shifted = make_round(&up, &[], RULES, &due, None);
+        assert_eq!(steps(&shifted), steps(&plain));
+        assert!((shifted.changes[0].win - plain.changes[0].win).abs() < 1e-3, "the notes give the win against the field");
+        assert!(shifted.summary.ends_with("the model's 59.9% counts as 50%"), "{}", shifted.summary);
+        // the field strong as a whole: champions at the model's 50% are its weak end, and get buffed
+        let mut strong = m.clone();
+        for c in strong.champions.iter_mut().filter(|c| c.name.starts_with("mid")) {
+            c.strength = logit(0.58);
+        }
+        let out = make_round(&strong, &[], RULES, &due, None);
+        assert!(out.changes.iter().any(|c| c.champion == "fine" && c.step > 0), "{:?}", steps(&out));
+        // this patch's picks set the middle once there are enough of them - the median: maddie in every game does
+        // not move it
+        let mut picked = m.clone();
+        for c in &mut picked.champions {
+            c.current.games = if c.name == "maddie" { 100 } else { 60 };
+        }
+        assert_eq!(field_centre(&picked), 0.0);
+        for c in &mut picked.champions {
+            c.current.games = if c.name == "maddie" { 400 } else { 10 };
+        }
+        assert!(field_centre(&picked) > 0.9, "picks alone: maddie is the field");
+        for c in &mut picked.champions {
+            c.current.games = 5;
+        }
+        assert_eq!(field_centre(&picked), 0.0, "a patch just begun: the recent games decide");
+        assert_eq!(field_centre(&Meta::default()), 0.0);
     }
 }
