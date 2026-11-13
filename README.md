@@ -56,13 +56,14 @@
 
 ## 2.9.0：装备平衡补丁（`item_balance`）；英雄上限 60、调整上限 50；补丁公告写明强度
 
+- **胜率按场上的英雄算**（用户：「先修再打包」）：模型的胜率是和强度 0 比的——它先验的中心，一个谁都不用的英雄——不是和场上的英雄比。用户的存档（2027.5.0）里，这一版打满 30 场的 38 个英雄，模型平均算 59.4%，实际平均只赢 51.8%；照这样，下一轮能改的 53 个英雄里 51 个是削弱，包括实际只赢 38%～44% 的瑟庄妮、塔里克、悠米；泽丽、金克丝、千珏 第一轮被砍时实际胜率都在 50% 左右，被砍 20% 之后掉到 33%～40%。现在一轮先找这一版场上的中间点（`balance::field_centre`：每个英雄的强度按它这一版的出场次数算的中位数；这一版不到 300 次出场时按近期场次），把它当 50%，每个英雄的胜率按它换算（`field_win`）再和 48%–52% 比；装备的出装英雄也一样。用中位数不用平均数：一个场场都出的英雄不会让其他英雄都显得偏弱。同一个存档按新算法：能改的 47 个里 9 个削弱、38 个加强（`balance_count` 20 时 5 个削弱、15 个加强），装备一件都不用改。`diag.log` 那一行最后写着换算点（`the model's 57.4% counts as 50%`）；版本分析页和 `meta_table.txt` 仍显示模型自己的数。
 - **装备平衡**（用户：「那可以加一个46的装备平衡补丁吧」「完整版补丁」）：装了 alele 的 4+6 装备包、开 `item_balance=on` 后，每一轮平衡补丁也改它的成品装备。
   - 4+6 的装备数值写在它自己的 DLL 里；英雄拿到一件装备时身上挂 `item_owned_<mod id>_<装备 key>_<8 位十六进制>` 的常驻效果，带着这件装备的数值（key 截短到效果名放得下：`alele_runes_and_items` 是 20 个字符）。它的 `item-catalog.json` 列出每件装备的 key、名字、品级、种类和数值（`packageValues.stats`，字段名就是效果的字段名），`alele_equipment_selection/ai-tail-builds.json`（选择器发布给游戏的）列出每个英雄的出装：6 个装备位，`specified` 的写着装备 key（`src/items.rs`）。
   - **挑装备**（`balance::decide_items`）：一件装备至少有 `ITEM_MIN_USERS`（4）个场次够的英雄在出才看它；这些英雄的胜率按场次加权平均（每人最多 `ITEM_WEIGHT` 200 场），先扣掉本轮英雄改动的效果（一步强度大约收回 1/1.5 个胜率点），再按人数 n 乘 n/(n+4) 往 50% 收；收完仍在 50±2 之外的，每超 1 个点调 2%（`ITEM_PER_POINT`）。这样装备只管英雄改动之后还剩下的偏差：砍到累计上限还很强的英雄、一起强的一类英雄。单版最多 `item_balance_max`，累计最多 50%；每版最多 `item_balance_count` 件；改过的装备要等出它的英雄再打 60 场（`ITEM_MIN_GAMES`）。
   - **比赛里**（`balance::on_tick` → `item_pass`）：每 10 tick 看一次每个英雄身上的 4+6 装备效果，按本场比赛记下的那一轮给它挂 `patch_meta_ai_item_<装备序号>`：每项数值的 p%（四舍五入）。装备换掉了就摘掉，数值变了就换。只改数值：特效不变；无符号的数值（穿透、韧性、射程……）效果只能加，削弱时不动。同一场比赛的每次模拟（服务器预演、你看的那场、回放）用同一轮；服务器那次关着 `item_balance` 的比赛，之后每次都不改装备（账本的 `items_off`）。
   - **说明**：装备改动单独发一条新闻「电竞大脑装备平衡 v<版本>」（`balance::item_news`）：每件装备出它的英雄数和平均胜率、本次和累计、每项数值前后。4+6 的装备说明仍显示原来的数值。符文不改。
   - 出装文件几十 MB：后台线程读，文件变了（选择器重新发布）才重读，每 20 秒看一次修改时间。
-- **英雄上限 60、调整上限 50**（用户：「英雄上限调多点吧 最多60个 还有max也调高点」）：`balance_count` 最多可填 60（原来 40），`balance_max` 最多 50（原来 30），累计上限 `CAP` 50%（原来 30%：赛娜、麦迪砍满 30% 还在 65%～70%）。
+- **英雄上限 60、调整上限 50**（用户：「英雄上限调多点吧 最多60个 还有max也调高点」）：`balance_count` 最多可填 60（原来 40），`balance_max` 最多 50（原来 30），累计上限 `CAP` 50%（原来 30%）。
 - **补丁公告写明强度**（一位玩家把「强度 -11%」看成了属性上的 -5% / -6%，以为没砍到位）：原因一栏在胜率之后加两句：`pma_power_<m|p><n>`「本次强度 -11%（攻击力、法术强度 -5%，生命值 -6%）。」和改过不止一次时的 `pma_sum_<m|p><n>`「累计强度 -20%。」（17 种语言，`tools/news_i18n.py`）。
 - **日志写明为什么只改这么多**（同一位玩家：「我设置50个就砍了20个」）：每一轮 `diag.log` 多一行 `[balance] round N: … rated, … with 30 games or more, … outside 48-52%: … waiting …, … at the 50% limit, … too close …; X could change, Y changed (balance_count Z)`。`balance_count` 只是上限。
 
@@ -238,7 +239,7 @@
 
 ## English
 
-2.9.0: **item balance** (`item_balance`, with alele's "4+6" item pack): each balance round also changes the pack's finished items whose builders (heroes whose published build names the item, 4 or more with games) stay outside 48-52% once that round's own champion changes are counted - 2% of the item's numbers a point beyond, at most `item_balance_max` a round and 50% in all; a second buff on each holder carries the change (numbers only, unsigned ones never go down), and the changes are news of their own. `balance_count` now goes up to 60, `balance_max` and the overall limit to 50. Patch-note reasons now also say a change's power this patch and in all, and `diag.log` says why a round changed fewer champions than `balance_count`.
+2.9.0: balance rounds measure every win rate against the middle of the patch's field (the median strength of its picks counts as 50%) instead of the model's strength 0 - on the user's save the popular champions averaged 59.4% in the model and 51.8% in their games, so nearly every round was nerfs. **Item balance** (`item_balance`, with alele's "4+6" item pack): each balance round also changes the pack's finished items whose builders (heroes whose published build names the item, 4 or more with games) stay outside 48-52% once that round's own champion changes are counted - 2% of the item's numbers a point beyond, at most `item_balance_max` a round and 50% in all; a second buff on each holder carries the change (numbers only, unsigned ones never go down), and the changes are news of their own. `balance_count` now goes up to 60, `balance_max` and the overall limit to 50. Patch-note reasons now also say a change's power this patch and in all, and `diag.log` says why a round changed fewer champions than `balance_count`.
 
 Patch Meta AI is a native Teamfight Manager 2 mod (stable mod API, game 0.6+). Version 2 fits one regularised logistic regression over your save's matches - champion strength per patch (a random walk across patches, wider where the patch notes changed a champion), lane offsets, each player's own strength and champion mastery, ally synergy and opponent matchups - on a background thread, and uses it for:
 

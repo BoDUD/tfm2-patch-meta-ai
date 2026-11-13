@@ -13,6 +13,12 @@
 //!   strong is cut again next patch). A champion a round changed waits until it has played [`MIN_EVIDENCE`] games
 //!   with its new numbers ([`games_since_change`]; 2.8.1 - the first rounds on a save, a hotfix and the game's patch
 //!   two days later, cut the same ten champions twice on the games from before the first cut).
+//! - **Against the field** (2.9.0, the user 2026-11-13: 「先修再打包」): the win rates a round reads are measured from
+//!   the middle of this patch's field ([`field_centre`], [`field_win`]), not from the model's strength 0 - its
+//!   prior's centre, a champion nobody may play. On one save (2027.5.0) the 38 champions with 30 games that patch
+//!   averaged 59.4% in the model and 51.8% in their games; the round due wanted 51 nerfs and 2 buffs, champions at
+//!   38-44% in their games among the nerfs, and Zeri, Jinx and Kindred, at about 50% when the first rounds cut them
+//!   20%, had fallen to 33-40%.
 //! - **In every match**: a champion's power is a permanent buff ([`BUFF`]), half on damage (attack and magic power),
 //!   half on health ([`buff`]), put on it at the start and again on every respawn (a new entity).
 //! - **Every run alike**: a match is simulated more than once (the server's run is the result, the client plays it
@@ -66,6 +72,9 @@ pub const PER_POINT: f32 = 1.5;
 pub const CAP: i32 = 50;
 /// Recent games (each patch back counting half, the model's `evidence`) before a champion's win rate is trusted.
 pub const MIN_EVIDENCE: f32 = 30.0;
+/// Picks this patch (ten a match) before they set the middle of the field ([`field_centre`]); fewer (a patch just
+/// begun): the champions' recent games ([`MIN_EVIDENCE`]'s evidence) do.
+pub const CENTRE_MIN_PICKS: f32 = 300.0;
 /// Items (2.9.0): builders with games enough ([`MIN_EVIDENCE`]) an item needs before it is judged; each builder
 /// weighs its games, at most [`ITEM_WEIGHT`]; their win rate is drawn toward 50 by n / (n + [`ITEM_SHRINK`]) (a few
 /// builders say little about the item); within [`ITEM_BAND`] points of 50 it is left alone, beyond it a step of
@@ -160,8 +169,40 @@ pub struct Round {
     pub summary: String,
 }
 
-/// A champion the model rates: name, win rate (percent), recent games, and its games since a round last changed it
-/// (None: no round did).
+/// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
+/// every game it was picked in this patch ([`CENTRE_MIN_PICKS`] picks or more; else by its recent games). The
+/// model's strength 0 is its prior's centre - a champion nobody may play - and measured from it nearly every
+/// champion played is too strong (on one save the 38 champions with 30 games of a patch: 59.4% in the model, 51.8%
+/// in their games). The median rather than the mean: a champion in every game does not make all the others look
+/// weak. 0 without any game.
+pub fn field_centre(meta: &Meta) -> f32 {
+    let picks: f32 = meta.champions.iter().map(|c| c.current.games as f32).sum();
+    let by_picks = picks >= CENTRE_MIN_PICKS;
+    let mut field: Vec<(f32, f32)> = meta
+        .champions
+        .iter()
+        .map(|c| (c.strength, if by_picks { c.current.games as f32 } else { c.evidence }))
+        .filter(|(strength, weight)| *weight > 0.0 && strength.is_finite())
+        .collect();
+    field.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let half = field.iter().map(|(_, weight)| weight).sum::<f32>() / 2.0;
+    let mut seen = 0.0;
+    for (strength, weight) in &field {
+        seen += weight;
+        if seen >= half {
+            return *strength;
+        }
+    }
+    0.0
+}
+
+/// A champion's win rate against the field (percent): its strength measured from [`field_centre`].
+pub fn field_win(champion: &crate::meta::Champion, centre: f32) -> f32 {
+    crate::glm::sigmoid(champion.strength - centre) * 100.0
+}
+
+/// A champion the model rates: name, win rate against the field (percent, [`field_win`]), recent games, and its
+/// games since a round last changed it (None: no round did).
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate<'a> {
     pub name: &'a str,
@@ -372,12 +413,13 @@ pub fn make_round_with(
     let merged = matches!(due, Due::Patch(_));
     let label = if merged { version.clone() } else { hotfix_label(rounds, &version) };
     let before = last.map(|r| r.power.clone()).unwrap_or_default();
+    let centre = field_centre(meta);
     let candidates: Vec<Candidate<'_>> = meta
         .champions
         .iter()
         .map(|c| Candidate {
             name: &c.name,
-            win: c.win_rate() * 100.0,
+            win: field_win(c, centre),
             evidence: c.evidence,
             since_change: games_since_change(rounds, &meta.versions, c),
         })
@@ -391,7 +433,11 @@ pub fn make_round_with(
         .filter_map(|c| Some((c.gap()?.abs(), c.name.to_string(), c.since_change.unwrap_or(0.0))))
         .collect();
     held.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    let summary = summarize(&candidates, &before, rules, could.len(), changes.len());
+    let summary = format!(
+        "{}; win rates against this patch's field: the model's {:.1}% counts as 50%",
+        summarize(&candidates, &before, rules, could.len(), changes.len()),
+        crate::glm::sigmoid(centre) * 100.0
+    );
     let mut power = before;
     for c in &changes {
         if c.total == 0 {
@@ -408,7 +454,7 @@ pub fn make_round_with(
                 .iter()
                 .filter_map(|c| {
                     let items = inputs.builds.get(&c.name)?.clone();
-                    let win = c.win_rate() * 100.0;
+                    let win = field_win(c, centre);
                     let step = changes.iter().find(|x| x.champion == c.name).map_or(0, |x| x.step);
                     Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / PER_POINT, evidence: c.evidence, items })
                 })
@@ -1744,6 +1790,10 @@ mod tests {
         for i in 0..4 {
             m.champions.push(champ(&format!("adc{i}"), 64.0, 120.0));
         }
+        // the middle of the field stays at 50%: champions at 50% play the most
+        for i in 0..3 {
+            m.champions.push(champ(&format!("mid{i}"), 50.0, 300.0));
+        }
         let builds: Vec<(&str, &[&str])> = vec![
             ("maddie", &["rfc"]),
             ("adc0", &["rfc"]),
@@ -1767,7 +1817,7 @@ mod tests {
         let again = make_round_with(&m, std::slice::from_ref(&round), ITEM_RULES, &Due::Late("2027.4.1".into()), today, Some(&inp));
         assert!(again.items.is_empty(), "no games since: {:?}", again.items);
         // the log says why these champions and no more
-        assert!(round.summary.starts_with("7 champions rated"), "{}", round.summary);
+        assert!(round.summary.starts_with("10 champions rated"), "{}", round.summary);
         assert!(round.summary.contains("changed (balance_count 10)"), "{}", round.summary);
     }
 
@@ -1846,5 +1896,51 @@ mod tests {
         assert_eq!(items_of(round_for("on".into(), false, true, true)), Some(Some(-10)));
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
+    }
+
+    #[test]
+    fn win_rates_count_from_the_middle_of_the_field() {
+        let mut m = meta();
+        for i in 0..3 {
+            m.champions.push(champ(&format!("mid{i}"), 50.0, 300.0));
+        }
+        let due = Due::First("2027.4.1".into());
+        let plain = make_round(&m, &[], RULES, &due, None);
+        let steps = |r: &Round| r.changes.iter().map(|c| (c.champion.clone(), c.step)).collect::<Vec<_>>();
+        assert_eq!(steps(&plain), [("maddie".to_string(), -10), ("weak".to_string(), 6)]);
+        assert!(plain.summary.ends_with("the model's 50.0% counts as 50%"), "{}", plain.summary);
+        // the model's strength 0 is not the field's: every champion a step stronger changes as before
+        let mut up = m.clone();
+        for c in &mut up.champions {
+            c.strength += 0.4;
+        }
+        assert!((field_centre(&up) - 0.4).abs() < 1e-6);
+        let shifted = make_round(&up, &[], RULES, &due, None);
+        assert_eq!(steps(&shifted), steps(&plain));
+        assert!((shifted.changes[0].win - plain.changes[0].win).abs() < 1e-3, "the notes give the win against the field");
+        assert!(shifted.summary.ends_with("the model's 59.9% counts as 50%"), "{}", shifted.summary);
+        // the field strong as a whole: champions at the model's 50% are its weak end, and get buffed
+        let mut strong = m.clone();
+        for c in strong.champions.iter_mut().filter(|c| c.name.starts_with("mid")) {
+            c.strength = logit(0.58);
+        }
+        let out = make_round(&strong, &[], RULES, &due, None);
+        assert!(out.changes.iter().any(|c| c.champion == "fine" && c.step > 0), "{:?}", steps(&out));
+        // this patch's picks set the middle once there are enough of them - the median: maddie in every game does
+        // not move it
+        let mut picked = m.clone();
+        for c in &mut picked.champions {
+            c.current.games = if c.name == "maddie" { 100 } else { 60 };
+        }
+        assert_eq!(field_centre(&picked), 0.0);
+        for c in &mut picked.champions {
+            c.current.games = if c.name == "maddie" { 400 } else { 10 };
+        }
+        assert!(field_centre(&picked) > 0.9, "picks alone: maddie is the field");
+        for c in &mut picked.champions {
+            c.current.games = 5;
+        }
+        assert_eq!(field_centre(&picked), 0.0, "a patch just begun: the recent games decide");
+        assert_eq!(field_centre(&Meta::default()), 0.0);
     }
 }
