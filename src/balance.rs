@@ -114,7 +114,8 @@ pub struct Rules {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Change {
     pub champion: String,
-    /// The model's win rate for it when the round was made (percent) and its recent games.
+    /// Its win rate against the field when the round was made (percent, [`field_win`]; the model's own before 2.9.0)
+    /// and its recent games.
     pub win: f32,
     pub evidence: f32,
     /// This round's step and its power after it (percent).
@@ -516,7 +517,7 @@ fn summarize(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
         .count();
     let close = outside.len().saturating_sub(waiting + at_limit + could);
     format!(
-        "{} champions rated, {} with {MIN_EVIDENCE} games or more, {} of those outside {}-{}%: {waiting} waiting for          {MIN_EVIDENCE} games with their new numbers, {at_limit} at the {CAP}% limit, {close} too close to the band for a          step; {could} could change, {changed} changed (balance_count {})",
+        "{} champions rated, {} with {MIN_EVIDENCE} games or more, {} of those outside {}-{}%: {waiting} waiting for {MIN_EVIDENCE} games with their new numbers, {at_limit} at the {CAP}% limit, {close} too close to the band for a step; {could} could change, {changed} changed (balance_count {})",
         candidates.len(),
         rated.len(),
         outside.len(),
@@ -538,8 +539,27 @@ pub fn factors(power: i32) -> (f64, f64) {
     (1.0 + f64::from(damage) / 100.0, 1.0 + f64::from(power - damage) / 100.0)
 }
 
+/// The rounds as the model reads them (2.9.0, [`crate::meta::own_steps`]): each step's size, where its games are.
+pub fn model_rounds_of(rounds: &[Round]) -> Vec<crate::meta::BalanceRound> {
+    rounds
+        .iter()
+        .map(|r| crate::meta::BalanceRound {
+            version: r.version.clone(),
+            merged: r.merged,
+            matches: r.matches,
+            steps: r.changes.iter().map(|c| (c.champion.clone(), c.step)).collect(),
+        })
+        .collect()
+}
+
+/// This save's rounds for the model ([`model_rounds_of`]).
+pub fn model_rounds() -> Vec<crate::meta::BalanceRound> {
+    model_rounds_of(&rounds())
+}
+
 /// The patch notes of the rounds for the model: each round gives each champion it changed its direction (+1
-/// buffed, -1 nerfed) in its patch, as the game's own notes do (the client adds up the notes of a patch).
+/// buffed, -1 nerfed) in its patch, as the game's own notes do (the client adds up the notes of a patch). Since
+/// 2.9.0 the model takes the steps' size from [`model_rounds`] and these lines give no direction of their own.
 pub fn notes_of(rounds: &[Round]) -> Vec<PatchNote> {
     rounds
         .iter()
@@ -1896,6 +1916,28 @@ mod tests {
         assert_eq!(items_of(round_for("on".into(), false, true, true)), Some(Some(-10)));
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
+    }
+
+    #[test]
+    fn the_model_reads_each_rounds_steps() {
+        let round = Round {
+            id: 1,
+            version: "2027.4.1".into(),
+            merged: false,
+            matches: 586,
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10 }],
+            ..Round::default()
+        };
+        let got = model_rounds_of(&[round]);
+        assert_eq!(
+            got,
+            [crate::meta::BalanceRound { version: "2027.4.1".into(), merged: false, matches: 586, steps: vec![("maddie".into(), -10)] }]
+        );
+        // the round log line reads as one line
+        let c = |name: &'static str, win: f32| Candidate { name, win, evidence: 100.0, since_change: Some(5.0) };
+        let text = summarize(&[c("a", 70.0), c("b", 30.0)], &BTreeMap::new(), RULES, 0, 0);
+        assert!(!text.contains("  "), "{text}");
+        assert!(text.contains("2 waiting for 30 games with their new numbers"), "{text}");
     }
 
     #[test]

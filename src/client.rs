@@ -1352,6 +1352,7 @@ fn rebuild(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now:
         champions: st.champions.clone(),
         stats: st.stats.clone(),
         notes: model_notes(&st.notes),
+        balance: crate::balance::model_rounds(),
         current,
         settings: cfg.model(),
         backtest,

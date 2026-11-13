@@ -680,7 +680,8 @@ tier_list=auto
 ; rank counted as solo_weight of a match). It rates at the same time
 ;   - each champion's strength in each patch: from one patch to the next it may move about
 ;     `drift` (untouched) or `change` (buffed / nerfed in the patch notes, moved by patch_shift
-;     in that direction) - so games from before a balance change still count, just less;
+;     in that direction; a balance patch of this mod's by its size, about a point for each 1.5% of
+;     power) - so games from before a balance change still count, just less;
 ;   - each champion's strength in each lane (`roles`);
 ;   - each player's own strength and their mastery of each champion (`players`, `mastery`):
 ;     a champion is not rated up just because the best team plays it;
@@ -688,7 +689,8 @@ tier_list=auto
 ; Larger values let the data move an effect further from "no effect" (log-odds).
 ; 用最近 patches 个版本的全部比赛（大会 + 单排×solo_weight）拟合一个模型，同时估计：
 ;   - 每个英雄在每个版本的强度：相邻版本间未改动的英雄最多变化约 drift，被加强/削弱的
-;     最多约 change（并按 patch_shift 朝改动方向预移）——改动前的比赛仍然计入，只是权重变小；
+;     最多约 change（并按 patch_shift 朝改动方向预移；本 Mod 自己的平衡补丁按改动幅度预移，每 1.5%
+;     强度约 1 个胜率点）——改动前的比赛仍然计入，只是权重变小；
 ;   - 英雄在每个位置的强度（roles）；
 ;   - 选手本人的实力和对每个英雄的熟练度（players、mastery）：不会因为强队爱用就高估某英雄；
 ;   - 队友配合与对位克制（pairs）。

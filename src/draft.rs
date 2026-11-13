@@ -1006,7 +1006,7 @@ mod tests {
         let (names, games) = simulate(2000, "1.1", |n| if n == "c" { 0.4 } else { 0.0 }, 5);
         let champions: Vec<String> = NAMES.iter().map(|s| s.to_string()).collect();
         let meta = build(
-            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None },
+            &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] },
             &Settings::default(),
         );
         Snapshot::new(meta, HashMap::new())
@@ -1456,7 +1456,7 @@ c=Mid
         let mut champions: Vec<String> = crate::knowledge::get().positions.keys().cloned().collect();
         champions.sort();
         let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
-        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None }, &Settings::default());
+        let meta = build(&Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] }, &Settings::default());
         let pool: Vec<u16> = champions.iter().filter_map(|c| meta.names.get(c)).collect();
         let base = Arc::new(Snapshot::new(meta, HashMap::new()));
         let none = Lineups::default();
