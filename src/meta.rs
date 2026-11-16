@@ -52,6 +52,9 @@ pub struct Settings {
     pub change_sd: f32,
     /// Win-rate step the patch notes' direction suggests (0.02 = 2 points).
     pub patch_shift: f32,
+    /// Percent of power a balance step takes for each win-rate point it should move its champion (2.10.0,
+    /// `balance_per_point`; [`step_shift`]).
+    pub balance_per_point: f32,
     /// Champions reworked in the current patch: their history barely counts.
     pub reworked: Vec<String>,
     pub role_sd: f32,
@@ -89,6 +92,7 @@ impl Default for Settings {
             drift_sd: 0.08,
             change_sd: 0.3,
             patch_shift: 0.02,
+            balance_per_point: crate::balance::DEFAULT_PER_POINT,
             reworked: Vec::new(),
             role_sd: 0.3,
             athlete_sd: 0.35,
@@ -427,15 +431,16 @@ pub fn own_steps(rounds: &[BalanceRound], names: &Names, versions: &[String], ma
     out
 }
 
-/// The log-odds a balance step should move a champion (2.9.0): [`crate::balance::PER_POINT`] percent of power a
-/// win-rate point. The notes' `patch_shift` (2 points) is what a game patch's lines suggest; on the user's save 25
-/// balance steps of -10% moved their champions -6.9 points in their games, and the model, expecting 2, read them
-/// about 5 points too strong a patch later (Maddie: 65.6% in the model, 45.7% in her games, cut again).
-pub fn step_shift(step: f32) -> f32 {
-    if step == 0.0 {
+/// The log-odds a balance step should move a champion (2.9.0): `per_point` percent of power a win-rate point (the
+/// setting `balance_per_point` since 2.10.0, the same number the rounds' steps are made with; 1.5 before). The notes'
+/// `patch_shift` (2 points) is what a game patch's lines suggest; on the user's save 25 balance steps of -10% moved
+/// their champions -6.9 points in their games, and the model, expecting 2, read them about 5 points too strong a patch
+/// later (Maddie: 65.6% in the model, 45.7% in her games, cut again).
+pub fn step_shift(step: f32, per_point: f32) -> f32 {
+    if step == 0.0 || per_point <= 0.0 {
         return 0.0;
     }
-    logit((0.5 + step / crate::balance::PER_POINT / 100.0).clamp(0.05, 0.95))
+    logit((0.5 + step / per_point / 100.0).clamp(0.05, 0.95))
 }
 
 struct Registry {
@@ -755,7 +760,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             let note = inp.notes.iter().rev().find(|n| n.is_for(&versions[v as usize]));
             let dir = note.map_or(0, |n| n.direction(&name));
             let step = own.get(&(c, v)).copied();
-            let mean = if own_lines.contains(&(c, v)) { 0.0 } else { dir as f32 * shift } + step.map_or(0.0, step_shift);
+            let mean = if own_lines.contains(&(c, v)) { 0.0 } else { dir as f32 * shift }
+                + step.map_or(0.0, |s| step_shift(s, set.balance_per_point));
             let reworked = v == cur_index && set.reworked.contains(&name);
             let sd = if reworked {
                 set.first_sd
@@ -1374,9 +1380,12 @@ pub(crate) mod tests {
         assert!((at(m, 1).unwrap() + 14.0).abs() < 1e-4, "{own:?}");
         assert!((at(k, 2).unwrap() - 11.0).abs() < 1e-4, "{own:?}");
         assert_eq!(own.len(), 3, "a patch no longer kept and a champion unknown here are left out: {own:?}");
-        assert!((step_shift(-10.0) - logit(0.5 - 10.0 / 150.0)).abs() < 1e-6);
-        assert_eq!(step_shift(0.0), 0.0);
-        assert!(step_shift(-200.0).is_finite() && step_shift(200.0).is_finite());
+        // 2.9.0's 1.5% a point, 2.10.0's default 2.5 (balance_per_point)
+        assert!((step_shift(-10.0, 1.5) - logit(0.5 - 10.0 / 150.0)).abs() < 1e-6);
+        assert!((step_shift(-10.0, 2.5) - logit(0.46)).abs() < 1e-6);
+        assert!((step_shift(20.0, 2.5) - logit(0.58)).abs() < 1e-6);
+        assert_eq!(step_shift(0.0, 2.5), 0.0);
+        assert!(step_shift(-200.0, 1.0).is_finite() && step_shift(200.0, 1.0).is_finite());
     }
 
     #[test]
@@ -1397,8 +1406,10 @@ pub(crate) mod tests {
         let note = PatchNote { versions: vec!["1.2".into()], changes: [("c".to_string(), -1)].into_iter().collect(), ..PatchNote::default() };
         let rounds = [BalanceRound { version: "1.2".into(), merged: true, matches: 0, steps: vec![("c".into(), -10)] }];
         let inp = Inputs { games: &games, names: &names, champions: &champions, notes: std::slice::from_ref(&note), current: "1.2", warm: None, stats: None, balance: &[] };
-        let by_note = build(&inp, &Settings::default());
-        let by_step = build(&Inputs { balance: &rounds, ..inp }, &Settings::default());
+        // 2.9.0's 1.5% a point: a -10% step expected to take 6.7 points
+        let set = Settings { balance_per_point: 1.5, ..Settings::default() };
+        let by_note = build(&inp, &set);
+        let by_step = build(&Inputs { balance: &rounds, ..inp }, &set);
         let (a, b) = (by_note.champion("c").unwrap(), by_step.champion("c").unwrap());
         assert!(b.strength < a.strength - 0.02, "the step's size moves it further: {} vs {}", b.strength, a.strength);
         assert!(b.history[0].0 > b.strength, "{:?}", b.history);
@@ -1406,5 +1417,11 @@ pub(crate) mod tests {
         // champions the round did not touch stay where the notes put them
         let (e1, e2) = (by_note.champion("e").unwrap().strength, by_step.champion("e").unwrap().strength);
         assert!((e1 - e2).abs() < 0.03, "{e1} vs {e2}");
+        // balance_per_point sets what a step is expected to do (2.10.0): at 2.5% a point the same cut is expected to
+        // take 4 points - less than at 1.5, more than the notes' 2
+        let wider = build(&Inputs { balance: &rounds, ..inp }, &Settings { balance_per_point: 2.5, ..Settings::default() });
+        let w = wider.champion("c").unwrap();
+        assert!(b.strength < w.strength - 0.005 && w.strength < a.strength - 0.005, "1.5: {} 2.5: {} notes: {}", b.strength, w.strength, a.strength);
+        assert_eq!(Settings::default().balance_per_point, crate::balance::DEFAULT_PER_POINT);
     }
 }

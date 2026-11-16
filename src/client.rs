@@ -1822,6 +1822,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
     let rules = crate::balance::Rules {
         count: cfg.balance_count,
         max_step: cfg.balance_max,
+        per_point: cfg.balance_per_point,
         items: cfg.item_balance,
         item_count: cfg.item_balance_count,
         item_max: cfg.item_balance_max,

@@ -8,11 +8,12 @@
 //!   a first one when the setting is turned on, as a hotfix of the current patch (`2027.4.1b`, [`Due::First`]); and a
 //!   hotfix when the game made no patch for [`LATE_DAYS`] game days ([`Due::Late`]).
 //! - **What**: the champions the model rates furthest outside [`BAND`] - with [`MIN_EVIDENCE`] recent games or more,
-//!   at most `balance_count` of them - change by [`PER_POINT`] percent of power for every win-rate point outside the
-//!   band, at most `balance_max` a round, at most [`CAP`] in all (rounds add up, as in League: a champion still too
-//!   strong is cut again next patch). A champion a round changed waits until it has played [`MIN_EVIDENCE`] games
-//!   with its new numbers ([`games_since_change`]; 2.8.1 - the first rounds on a save, a hotfix and the game's patch
-//!   two days later, cut the same ten champions twice on the games from before the first cut).
+//!   at most `balance_count` of them - change by `balance_per_point` percent of power for every win-rate point outside
+//!   the band ([`Rules::per_point`], [`DEFAULT_PER_POINT`]), at most `balance_max` a round, at most [`CAP`] in all
+//!   (rounds add up, as in League: a champion still too strong is cut again next patch). A champion a round changed
+//!   waits until it has played [`MIN_EVIDENCE`] games with its new numbers ([`games_since_change`]; 2.8.1 - the first
+//!   rounds on a save, a hotfix and the game's patch two days later, cut the same ten champions twice on the games
+//!   from before the first cut).
 //! - **Against the field** (2.9.0, the user 2026-11-13: 「先修再打包」): the win rates a round reads are measured from
 //!   the middle of this patch's field ([`field_centre`], [`field_win`]), not from the model's strength 0 - its
 //!   prior's centre, a champion nobody may play. On one save (2027.5.0) the 38 champions with 30 games that patch
@@ -64,8 +65,15 @@ use crate::{diag, paths};
 pub const BUFF: &str = "patch_meta_ai_balance";
 /// Win rates inside this band (percent) are left alone.
 pub const BAND: (f32, f32) = (48.0, 52.0);
-/// Power changed for every win-rate point outside the band (percent of power).
-pub const PER_POINT: f32 = 1.5;
+/// Power changed for every win-rate point outside the band (percent of power), unless `balance_per_point` says
+/// otherwise ([`Rules::per_point`]; the model expects a step to move its champion by as much, `meta::step_shift`).
+/// 1.5 (a fixed `PER_POINT`) until 2.10.0 (the user, 2026-11-17: 「你要所有英雄达到整体平衡啊 不能只找超模吧」): on the
+/// user's save, 2699 games of the 4+6 item era, a fit over champions, players and side with each champion's power per
+/// patch as a covariate gave 0.7-1.5 log-odds per 100% of power (best about 1.0; 1.5% a point means 2.67) - the steps
+/// moved their champions about 2.5 times less than the rule thought, and the strong champions stayed strong after
+/// their cuts (Tryndamere at -32% and Kog'Maw at -35% still won about 60%). Some of our own kit changes came with
+/// cuts and bias the fit low, so 2.5 rather than the fit's 3.85.
+pub const DEFAULT_PER_POINT: f32 = 2.5;
 /// A champion's (and an item's) power stays within this much of its own (percent). 50 since 2.9.0 (the user,
 /// 2026-11-13: 「还有max也调高点」 - 30 held the champions that did not move at -30%, and `balance_max` up to 50 needs
 /// room in all as well).
@@ -98,11 +106,14 @@ const TICK_WINDOW: usize = 600;
 /// Runs remembered (their decided balance).
 const RUNS_KEPT: usize = 64;
 
-/// How big a round is (settings `balance_count`, `balance_max`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How big a round is (settings `balance_count`, `balance_max`, `balance_per_point`).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rules {
     pub count: usize,
     pub max_step: i32,
+    /// Percent of power a win-rate point outside the band (2.10.0, `balance_per_point`, [`DEFAULT_PER_POINT`]): the
+    /// step a champion gets, and what the items expect of it ([`Builder::after`]).
+    pub per_point: f32,
     /// The 4+6 pack's items too (2.9.0, `item_balance`), at most `item_count` a round, each a step of at most
     /// `item_max` (percent of its numbers).
     pub items: bool,
@@ -255,12 +266,17 @@ fn games_since_round(round: &Round, versions: &[String], champion: &crate::meta:
 }
 
 /// The changes of a round: the champions furthest outside [`BAND`] with enough games (recent ones, and since their
-/// last change), at most `rules.count`, each a step of [`PER_POINT`] a point outside the band (at most
+/// last change), at most `rules.count`, each a step of `rules.per_point` a point outside the band (at most
 /// `rules.max_step`), their power kept within [`CAP`].
 pub fn decide(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules: Rules) -> Vec<Change> {
     let mut out = qualified(candidates, before, rules);
     out.truncate(rules.count);
     out
+}
+
+/// The step a champion `gap` points outside the band wants (negative above it), before `rules.max_step` and [`CAP`].
+fn wanted(gap: f32, rules: Rules) -> i32 {
+    ((-(gap * rules.per_point)).round() as i32).clamp(-rules.max_step, rules.max_step)
 }
 
 /// Every change [`decide`] could make, furthest outside the band first (before `rules.count` cuts the list).
@@ -271,7 +287,7 @@ fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
         .filter_map(|c| {
             // above the band: a nerf; below it: a buff
             let gap = c.gap()?;
-            let want = ((-(gap * PER_POINT)).round() as i32).clamp(-rules.max_step, rules.max_step);
+            let want = wanted(gap, rules);
             let was = before.get(c.name).copied().unwrap_or(0);
             let total = (was + want).clamp(-CAP, CAP);
             let step = total - was;
@@ -285,11 +301,12 @@ fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
 }
 
 /// A champion as the items see it (2.9.0): its win rate, the win rate once this round's own change to it works (a
-/// step closes step / [`PER_POINT`] points), its games, and the finished items its published build names.
+/// step closes step / [`Rules::per_point`] points), its games, and the finished items its published build names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Builder {
     pub champion: String,
     pub win: f32,
+    /// The win rate once this round's step works: `win + step / per_point`.
     pub after: f32,
     pub evidence: f32,
     pub items: Vec<String>,
@@ -457,7 +474,7 @@ pub fn make_round_with(
                     let items = inputs.builds.get(&c.name)?.clone();
                     let win = field_win(c, centre);
                     let step = changes.iter().find(|x| x.champion == c.name).map_or(0, |x| x.step);
-                    Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / PER_POINT, evidence: c.evidence, items })
+                    Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / rules.per_point, evidence: c.evidence, items })
                 })
                 .collect();
             // an item a round changed waits for its builders' games since
@@ -509,20 +526,20 @@ fn summarize(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
         .iter()
         .filter(|c| c.settled())
         .filter(|c| {
-            let gap = c.gap().unwrap_or(0.0);
-            let want = ((-(gap * PER_POINT)).round() as i32).clamp(-rules.max_step, rules.max_step);
+            let want = wanted(c.gap().unwrap_or(0.0), rules);
             let was = before.get(c.name).copied().unwrap_or(0);
             want != 0 && (was + want).clamp(-CAP, CAP) == was
         })
         .count();
     let close = outside.len().saturating_sub(waiting + at_limit + could);
     format!(
-        "{} champions rated, {} with {MIN_EVIDENCE} games or more, {} of those outside {}-{}%: {waiting} waiting for {MIN_EVIDENCE} games with their new numbers, {at_limit} at the {CAP}% limit, {close} too close to the band for a step; {could} could change, {changed} changed (balance_count {})",
+        "{} champions rated, {} with {MIN_EVIDENCE} games or more, {} of those outside {}-{}%: {waiting} waiting for {MIN_EVIDENCE} games with their new numbers, {at_limit} at the {CAP}% limit, {close} too close to the band for a step ({}% of power a point); {could} could change, {changed} changed (balance_count {})",
         candidates.len(),
         rated.len(),
         outside.len(),
         BAND.0,
         BAND.1,
+        rules.per_point,
         rules.count
     )
 }
@@ -1329,7 +1346,7 @@ mod tests {
         round_for(key, first_run, on, true).map(|p| p.champions)
     }
 
-    const RULES: Rules = Rules { count: 10, max_step: 10, items: false, item_count: 5, item_max: 10 };
+    const RULES: Rules = Rules { count: 10, max_step: 10, per_point: DEFAULT_PER_POINT, items: false, item_count: 5, item_max: 10 };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
         Candidate { name, win, evidence, since_change: None }
@@ -1344,12 +1361,28 @@ mod tests {
             RULES,
         );
         let got: Vec<(&str, i32)> = out.iter().map(|c| (c.champion.as_str(), c.step)).collect();
-        // 21.3 points over: -32, held to -10; 12 over: -18 -> -10; 4 under: +6; gwen has too few games; 50.5 is fine
-        assert_eq!(got, [("maddie", -10), ("zeri", -10), ("weak", 6)]);
+        // 2.5% a point: 21.3 points over: -53, held to -10; 12 over: -30 -> -10; 4 under: +10; gwen has too few games;
+        // 50.5 is fine
+        assert_eq!(got, [("maddie", -10), ("zeri", -10), ("weak", 10)]);
         // a round's count keeps the furthest
         assert_eq!(decide(&[cand("a", 60.0, 50.0), cand("b", 70.0, 50.0)], &before, Rules { count: 1, ..RULES })[0].champion, "b");
-        // just outside the band: under a step, no change
-        assert!(decide(&[cand("a", 52.2, 50.0)], &before, RULES).is_empty());
+        // just outside the band: under half a percent, no change
+        assert!(decide(&[cand("a", 52.1, 50.0)], &before, RULES).is_empty());
+    }
+
+    #[test]
+    fn the_step_is_balance_per_point_a_point() {
+        let before = BTreeMap::new();
+        let rules = |per_point: f32| Rules { max_step: 40, per_point, ..RULES };
+        let step = |win: f32, per_point: f32| decide(&[cand("x", win, 100.0)], &before, rules(per_point)).first().map_or(0, |c| c.step);
+        // 4 points over / 6 under: 2.9.0's fixed 1.5, 2.10.0's default 2.5, and more
+        assert_eq!((step(56.0, 1.5), step(56.0, 2.5), step(56.0, 4.0)), (-6, -10, -16));
+        assert_eq!((step(42.0, 1.5), step(42.0, 2.5), step(42.0, 5.0)), (9, 15, 30));
+        // still held to balance_max
+        assert_eq!(decide(&[cand("x", 70.0, 100.0)], &before, Rules { per_point: 5.0, ..RULES })[0].step, -10);
+        // the log says the size of a point
+        let text = summarize(&[cand("x", 56.0, 100.0)], &before, rules(4.0), 1, 1);
+        assert!(text.contains("(4% of power a point)"), "{text}");
     }
 
     #[test]
@@ -1363,7 +1396,7 @@ mod tests {
         // nerfed too far: buffed back
         before.insert("maddie".to_string(), -20);
         let out = decide(&[cand("maddie", 44.0, 100.0)], &before, RULES);
-        assert_eq!((out[0].step, out[0].total), (6, -14));
+        assert_eq!((out[0].step, out[0].total), (10, -10));
     }
 
     fn logit(p: f32) -> f32 {
@@ -1414,7 +1447,7 @@ mod tests {
         let rounds = vec![rounds[0].clone(), second];
         let later = meta_with_games(&["2027.4.1", "2027.4.2", "2027.4.3"], &[200, 40, 0]);
         let third = make_round(&later, &rounds, RULES, &Due::Patch("2027.4.3".into()), Some((2027, 10, 20)));
-        assert_eq!((third.power.get("maddie"), third.power.get("weak")), (Some(&-20), Some(&12)));
+        assert_eq!((third.power.get("maddie"), third.power.get("weak")), (Some(&-20), Some(&20)));
         assert!(third.held.is_empty());
         // a change merged into a game patch counts that patch's games (all with the new numbers)
         let rounds = vec![rounds[0].clone(), rounds[1].clone(), third];
@@ -1434,7 +1467,7 @@ mod tests {
         assert_eq!(first_due, Due::First("2027.4.1".into()));
         let first = make_round(&meta(), &[], RULES, &first_due, today);
         assert_eq!((first.id, first.version.as_str(), first.label.as_str(), first.merged), (1, "2027.4.1", "2027.4.1b", false));
-        assert_eq!((first.power.get("maddie"), first.power.get("weak"), first.power.get("fine")), (Some(&-10), Some(&6), None));
+        assert_eq!((first.power.get("maddie"), first.power.get("weak"), first.power.get("fine")), (Some(&-10), Some(&10), None));
         let rounds = vec![first];
         // the same patch, days later: none
         assert_eq!(due(&rounds, Some("2027.4.1"), Some((2027, 10, 30))), None);
@@ -1748,7 +1781,7 @@ mod tests {
 
     // ===================== 2.9.0: items, the log, the wider limits =====================
 
-    const ITEM_RULES: Rules = Rules { count: 10, max_step: 10, items: true, item_count: 5, item_max: 10 };
+    const ITEM_RULES: Rules = Rules { items: true, ..RULES };
 
     fn builder(name: &str, win: f32, after: f32, evidence: f32, items: &[&str]) -> Builder {
         Builder { champion: name.into(), win, after, evidence, items: items.iter().map(|s| s.to_string()).collect() }
@@ -1839,6 +1872,13 @@ mod tests {
         // the log says why these champions and no more
         assert!(round.summary.starts_with("10 champions rated"), "{}", round.summary);
         assert!(round.summary.contains("changed (balance_count 10)"), "{}", round.summary);
+        // the items expect a champion's own step to close step / balance_per_point points (2.10.0): at 1.5 the cut
+        // builders are expected nearer the band than at 2.5, and the item is cut less
+        let item = |per_point: f32| {
+            let rules = Rules { per_point, item_max: 20, ..ITEM_RULES };
+            make_round_with(&m, &[], rules, &Due::First("2027.4.1".into()), today, Some(&inp)).items[0].step
+        };
+        assert_eq!((item(1.5), item(2.5)), (-7, -10));
     }
 
     #[test]
@@ -1848,7 +1888,7 @@ mod tests {
             c("a", 70.0, 100.0, None),
             c("b", 65.0, 100.0, Some(5.0)),
             c("cap", 60.0, 100.0, None),
-            c("near", 52.2, 100.0, None),
+            c("near", 52.1, 100.0, None),
             c("few", 75.0, 10.0, None),
             c("in", 50.0, 100.0, None),
         ];
@@ -1949,7 +1989,7 @@ mod tests {
         let due = Due::First("2027.4.1".into());
         let plain = make_round(&m, &[], RULES, &due, None);
         let steps = |r: &Round| r.changes.iter().map(|c| (c.champion.clone(), c.step)).collect::<Vec<_>>();
-        assert_eq!(steps(&plain), [("maddie".to_string(), -10), ("weak".to_string(), 6)]);
+        assert_eq!(steps(&plain), [("maddie".to_string(), -10), ("weak".to_string(), 10)]);
         assert!(plain.summary.ends_with("the model's 50.0% counts as 50%"), "{}", plain.summary);
         // the model's strength 0 is not the field's: every champion a step stronger changes as before
         let mut up = m.clone();
