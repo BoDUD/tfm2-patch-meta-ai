@@ -655,6 +655,8 @@ ai_tactics=off
 ;           health), in every match. balance_count is a ceiling: a champion also needs 30 recent
 ;           games, a win rate outside 48-52% and room under the limit, so a patch may change fewer.
 ;           A champion changed waits for 30 games with its new numbers before the next change.
+;           2.10.0 makes one hotfix right away on a save whose newest patch was made by an older
+;           version, so that its rules (balance_per_point, 80%, balance_unpicked) work at once.
 ;           The changes are the game's own patch notes (inbox, patch history), with the patch's
 ;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
 ;           While this is on the game's own champion patches are off (its settings are put back
@@ -665,6 +667,8 @@ ai_tactics=off
 ;           累计最多 80%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
 ;           才会再改。balance_count 只是上限：英雄还要近期场次够 30、胜率在 48%–52% 之外、
 ;           没到累计上限才会被改，所以一版改的可能比它少。
+;           2.10.0 装上后，存档最新一轮是旧版本做的，读档时马上出一次热修复，按新规则
+;           （balance_per_point、80%、balance_unpicked）重新校准，只出这一次。
 ;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
 ;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
 ;           （关掉本项时恢复游戏原来的设置）。

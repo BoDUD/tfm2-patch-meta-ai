@@ -54,6 +54,23 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.10.0：每个胜率点的步子 `balance_per_point`（默认 2.5）、累计上限 80%、冷门英雄先加强、装上马上校准
+
+用户：「另外进行一下在4+6装备mod环境下的数值调整 有些英雄感觉比较超模了」，接着「你要所有英雄达到整体平衡啊 不能只找超模吧」。
+
+- **量出来的步子**：在用户存档 4+6 环境的 2699 场比赛上做了一个拟合——英雄、选手、红蓝方一起，每个英雄每个版本的平衡强度作协变量：强度每 100% 约 0.7～1.5 个对数几率（不同先验下，最可能约 1.0），也就是 -10% 只让胜率掉 2～4 个点；而 1.5%/点相当于假设 2.67（-10% 掉 6.7 个点）。平衡补丁每一刀实际只有预想的四成左右效果，所以强势英雄砍了几刀还是强（泰达米尔累计 -32%、克格莫 -35%，胜率仍在 60% 左右）。同一时期我们自己的英雄改动（泰达米尔的嗜血、克格莫的虚空形态）和砍的时间重合，会让拟合偏小，所以没用拟合的 3.85，取保守的 2.5。
+- **`balance_per_point`**（新设置，1～5，默认 2.5，原来的常量 `PER_POINT` 1.5）：英雄每偏 1 个点的步长、装备平衡里出装英雄本轮改动后的预期胜率（`after = win + step / per_point`）、模型对平衡改动的预期（`meta::step_shift(step, per_point)`，`meta::Settings::balance_per_point`）都用它。装备自己的 `ITEM_PER_POINT`（2%）不变。
+- **上限**：英雄累计上限 `CAP` 50% → 80%，`balance_max` 可填 1～80；装备分出 `ITEM_CAP`，仍是 50%。默认 `balance_count` 10 → 30、`balance_max` 10 → 20（settings.ini 里写了数的照旧）。累计上限的原因代码换成 `pma_total_80`（「累计调整已到 ±80% 的上限。」），`pma_total` 仍是 ±50%，2.9.0 写过的公告不变；`pma_power_*` / `pma_sum_*` 扩到 ±80。
+- **冷门英雄**（`balance_unpicked`，0～60，默认 20，0 = 关）：近期场次不到 30 的英雄没法按胜率判断，平衡补丁从来不改；游戏自带补丁里给冷门英雄的加强也随 `balance` 关掉了（用户存档 212 个英雄里 131 个在 4+6 环境下不到 30 场，40 个一场没有）。现在每一轮另外加强其中最多 `balance_unpicked` 个（`balance::unpicked`），不占 `balance_count`：
+  - 条件：这个存档的英雄池里（保留的比赛里被选或被禁过至少一次：`meta::Champion::drafted`；LoL-only 过滤掉的 72 个基础英雄一次都没出现，不算）、近期场次 < 30、对场上胜率 ≤ 50%、强度 < +30%；
+  - 每次 +10%（不超过 `balance_max`），这条规则最多加到 +30%；近期场次最少的先加，再按胜率低的先加；
+  - 原因代码 `pma_unpicked`（17 种语言）：「近几个版本很少有人选（场次不到 30 场），先小幅加强，等有了比赛数据再按胜率调整。」；
+  - 模型照常读这些改动的幅度（`own_steps`）；打满 30 场之后按胜率规则正常调整，加过头的会砍回来。
+- **装上马上校准**：`Round` 多了 `rules`（规则版本；2.10.0 做的写 `RULES_VERSION` = 2，旧账本读出来是 0）。账本最新一轮的 `rules` < 2 时 `due()` 马上给出 `Due::Recalibration`：当前版本的热修复（如 `2028.2.0b`，单独一篇公告，和第一轮 `Due::First` 一样走读档后的 `sync_balance → make → publish → apply_balance`）。游戏同时出了新版本时先出那个版本的（它也按新规则做）。做过一轮之后不会再出；「改后打满 30 场」照旧。
+- **日志**：每一轮那一行多写每点多少强度和冷门加强了几个、符合条件的有几个；冷门加强在 `diag.log`、`meta_table.txt` 里标 `unpicked`。
+- **用户存档的预计**（离线重跑，`balance_count` 60 / `balance_max` 25 / `balance_unpicked` 20 / 每点 2.5）：读档马上出的 2028.2.0b 按胜率削弱 7 个、加强 7 个（最多 ±6%：场次够的英雄对场上胜率都在 35%～57%，最偏的几个还在等改后的 30 场），另外 20 个冷门英雄各 +10%，装备不动。同样的数据按 2.9.0 下个版本只有 5 个削弱、1 个加强。（离线用的 history 文件里 2028.2.0 只有 44 场，存档里有 142 场：真正读档时泰达米尔、魔腾、赛娜这几个会打满改后的 30 场，大概也会动。）
+- 测试：`cargo test` 偶发失败（`draft::tests` 和 `ui::draft_screen` 的测试同时改进程共享的状态）修掉了：选人界面的四个测试也拿串行锁。
+
 ## 2.9.0：装备平衡补丁（`item_balance`）；英雄上限 60、调整上限 50；补丁公告写明强度
 
 - **胜率按场上的英雄算**（用户：「先修再打包」）：模型的胜率是和强度 0 比的——它先验的中心，一个谁都不用的英雄——不是和场上的英雄比。用户的存档（2027.5.0）里，这一版打满 30 场的 38 个英雄，模型平均算 59.4%，实际平均只赢 51.8%；照这样，下一轮能改的 53 个英雄里 51 个是削弱，包括实际只赢 38%～44% 的瑟庄妮、塔里克、悠米；泽丽、金克丝、千珏 第一轮被砍时实际胜率都在 50% 左右，被砍 20% 之后掉到 33%～40%。现在一轮先找这一版场上的中间点（`balance::field_centre`：每个英雄的强度按它这一版的出场次数算的中位数；这一版不到 300 次出场时按近期场次），把它当 50%，每个英雄的胜率按它换算（`field_win`）再和 48%–52% 比；装备的出装英雄也一样。用中位数不用平均数：一个场场都出的英雄不会让其他英雄都显得偏弱。同一个存档按新算法：能改的 47 个里 9 个削弱、38 个加强（`balance_count` 20 时 5 个削弱、15 个加强），装备一件都不用改。`diag.log` 那一行最后写着换算点（`the model's 57.4% counts as 50%`）；版本分析页和 `meta_table.txt` 仍显示模型自己的数。
@@ -207,8 +224,10 @@
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | | `balance` | off | 由本 Mod 出版本平衡补丁（每版把胜率离 48%–52% 最远的英雄调强/调弱，所有比赛生效；写进游戏自己的补丁公告和补丁历史，BP/百科的属性显示改动后的数值；开着时游戏自带的英雄补丁关掉） |
-| | `balance_count` | 10 | 每个版本最多改几个英雄（1～60；只是上限：英雄还要场次够 30、胜率在 48%–52% 之外、用新数值打满 30 场、没到累计上限） |
-| | `balance_max` | 10 | 每个英雄每个版本最多调多少（强度百分比，1～50，累计最多 50%） |
+| | `balance_count` | 30 | 每个版本最多改几个英雄（1～60；只是上限：英雄还要场次够 30、胜率在 48%–52% 之外、用新数值打满 30 场、没到累计上限；2.10.0 前默认 10） |
+| | `balance_max` | 20 | 每个英雄每个版本最多调多少（强度百分比，1～80，累计最多 80%；2.10.0 前默认 10、最多 50） |
+| | `balance_per_point` | 2.5 | 胜率每偏 1 个点调多少强度（1～5；模型也按它预期一刀的效果；2.10.0 前固定 1.5） |
+| | `balance_unpicked` | 20 | 每个版本最多给几个冷门英雄（近期场次不到 30、存档里被选或被禁过、对场上胜率 ≤ 50%）先加强 10%，这条规则最多到 +30%（0～60，0 = 关；不占 `balance_count`） |
 | | `item_balance` | off | 连 alele 的 4+6 装备一起平衡（2.9.0；要先开 `balance`、装 4+6 装备包）：出这件装备的英雄算上本轮英雄改动后仍偏离 48%–52% 时调它的数值，单独发新闻 |
 | | `item_balance_count` | 5 | 每个版本最多改几件装备（1～30） |
 | | `item_balance_max` | 10 | 每件装备每个版本最多调多少（装备数值的百分比，1～50，累计最多 50%） |
@@ -243,6 +262,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.10.0 (the user: "make every champion balanced, not just cut the overpowered ones"): a fit over the user's 2699 games of the 4+6 item era (champions, players and side, with each champion's balance power per patch as a covariate) gave 0.7-1.5 log-odds per 100% of power - a -10% step moved its champion 2-4 points where the rule's 1.5% a point expected 6.7, so the strong champions stayed strong after their cuts. The step is now a setting, `balance_per_point` (default 2.5, 1-5; cautious, since some of our own kit changes came with cuts), used by the champion rule, the items' expectation of a champion's step and the model's expectation of a step. The champions' overall limit goes from 50% to 80% (`balance_max` up to 80; items keep 50%); the defaults are now 30 champions and 20% a round. **Unpicked buffs** (`balance_unpicked`, default 20, 0 = off): champions of the save's pool (picked or banned in a kept match) with fewer than 30 recent games, at most 50% against the field and under +30% get +10% each round (up to +30% through this rule; fewest games first, then the weakest), besides `balance_count`, so that they get played and judged. A book whose newest round was made under older rules gets one hotfix of the current patch at once (`Due::Recalibration`, `Round::rules`).
 
 2.9.0: the model expects a balance step to move its champion by its size (1.5% of power a win-rate point; a hotfix split over its patch and the next by the matches after it) instead of the notes' fixed 2 points, which had kept just-cut champions about 5 points too strong. Balance rounds measure every win rate against the middle of the patch's field (the median strength of its picks counts as 50%) instead of the model's strength 0 - on the user's save the popular champions averaged 59.4% in the model and 51.8% in their games, so nearly every round was nerfs. **Item balance** (`item_balance`, with alele's "4+6" item pack): each balance round also changes the pack's finished items whose builders (heroes whose published build names the item, 4 or more with games) stay outside 48-52% once that round's own champion changes are counted - 2% of the item's numbers a point beyond, at most `item_balance_max` a round and 50% in all; a second buff on each holder carries the change (numbers only, unsigned ones never go down), and the changes are news of their own. `balance_count` now goes up to 60, `balance_max` and the overall limit to 50. Patch-note reasons now also say a change's power this patch and in all, and `diag.log` says why a round changed fewer champions than `balance_count`.
 
