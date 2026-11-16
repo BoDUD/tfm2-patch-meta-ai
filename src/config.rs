@@ -155,8 +155,8 @@ impl Default for Config {
             ai_variety: 1.0,
             ai_tactics: false,
             balance: false,
-            balance_count: 10,
-            balance_max: 10,
+            balance_count: 30,
+            balance_max: 20,
             balance_per_point: crate::balance::DEFAULT_PER_POINT,
             item_balance: false,
             item_balance_count: 5,
@@ -294,14 +294,15 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
         "balance" => cfg.balance = flag(value)?,
-        // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」)
+        // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」); balance_max up to the
+        // champions' CAP, 80 since 2.10.0
         "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 60.0) as usize,
         "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
         // 2.10.0 (the user: 「你要所有英雄达到整体平衡啊 不能只找超模吧」; `balance::DEFAULT_PER_POINT`)
         "balance_per_point" => cfg.balance_per_point = number(value)?.clamp(1.0, 5.0),
         "item_balance" => cfg.item_balance = flag(value)?,
         "item_balance_count" => cfg.item_balance_count = number(value)?.round().clamp(1.0, 30.0) as usize,
-        "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
+        "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::ITEM_CAP as f32) as i32,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
             cfg.recency = None;
@@ -644,7 +645,7 @@ ai_tactics=off
 ;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
 ;           furthest outside a 48-52% win rate (with enough games, at most balance_count, up to
 ;           60) get balance_per_point % of power stronger or weaker for every point outside (at
-;           most balance_max a patch, up to 50; 50% in all; half on attack / magic power, half on
+;           most balance_max a patch, up to 80; 80% in all; half on attack / magic power, half on
 ;           health), in every match. balance_count is a ceiling: a champion also needs 30 recent
 ;           games, a win rate outside 48-52% and room under the limit, so a patch may change fewer.
 ;           A champion changed waits for 30 games with its new numbers before the next change.
@@ -654,16 +655,18 @@ ai_tactics=off
 ;           when this is turned off).
 ; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
 ;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个，
-;           最多可填 60）每偏 1 个点调 balance_per_point % 的强度（单版最多 balance_max，最多可填 50；
-;           累计最多 50%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
+;           最多可填 60）每偏 1 个点调 balance_per_point % 的强度（单版最多 balance_max，最多可填 80；
+;           累计最多 80%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
 ;           才会再改。balance_count 只是上限：英雄还要近期场次够 30、胜率在 48%–52% 之外、
 ;           没到累计上限才会被改，所以一版改的可能比它少。
 ;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
 ;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
 ;           （关掉本项时恢复游戏原来的设置）。
 balance=off
-balance_count=10
-balance_max=10
+; 2.10.0 defaults: 30 champions and 20% a patch (10 and 10 before)
+; 2.10.0 起的默认值：每版最多 30 个英雄、单版最多 20%（以前 10 和 10）
+balance_count=30
+balance_max=20
 ; balance_per_point : percent of power for each win-rate point outside 48-52%, 1-5 (2.10.0;
 ;           1.5 before). The model expects a step to move its champion by as much. Measured on a
 ;           save's 4+6 games, 10% of power moved a champion about 2.5 points (1.5 assumed 6.7):
@@ -871,6 +874,22 @@ ban_pick=yes
         assert!(warnings.is_empty());
         assert_eq!((cfg.tier_list, cfg.ban_pick), (Switch::Auto, Switch::On));
         assert_eq!(parse("tier_list=maybe").1.len(), 1);
+    }
+
+    #[test]
+    fn the_balance_limits_and_their_defaults() {
+        let d = Config::default();
+        // 2.10.0: 30 champions and 20% a patch by default (10 / 10 before); the items' as they were
+        assert_eq!((d.balance_count, d.balance_max, d.item_balance_count, d.item_balance_max), (30, 20, 5, 10));
+        let cfg = parse("balance_count=70\nbalance_max=100\nitem_balance_count=40\nitem_balance_max=100\n").0;
+        // a champion's step up to its CAP (80), an item's up to ITEM_CAP (50)
+        assert_eq!((cfg.balance_count, cfg.balance_max, cfg.item_balance_count, cfg.item_balance_max), (60, 80, 30, 50));
+        assert_eq!((crate::balance::CAP, crate::balance::ITEM_CAP), (80, 50));
+        let cfg = parse("balance_count=0\nbalance_max=-3\nitem_balance_max=0\n").0;
+        assert_eq!((cfg.balance_count, cfg.balance_max, cfg.item_balance_max), (1, 1, 1));
+        // a settings.ini that names them keeps its own numbers
+        let cfg = parse("balance_count=20\nbalance_max=10\n").0;
+        assert_eq!((cfg.balance_count, cfg.balance_max), (20, 10));
     }
 
     #[test]

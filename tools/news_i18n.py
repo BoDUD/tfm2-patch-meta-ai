@@ -4,15 +4,17 @@
 The game's patch notes give each champion a reason as codes of `patch.reason.*` texts; the balance patches' codes
 (`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100), the change's power this patch and in all
 (`pma_power_<m|p><n>`, `pma_sum_<m|p><n>`, 2.9.0: -11 is `m11`, n up to CAP) and the limits that held a change
-(`pma_cap`, `pma_total`). A text cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what
-patch notes without a champion change say (`server::UNCHANGED_TEXT`).
+(`pma_cap`, `pma_total_<CAP>`: 2.10.0's limit of 80; `pma_total` stays 2.9.0's 50 for the notes written then). A text
+cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what patch notes without a
+champion change say (`server::UNCHANGED_TEXT`).
 
     python tools/news_i18n.py
 """
 import json
 import os
 
-CAP = 50  # balance::CAP
+CAP = 80  # balance::CAP (2.10.0)
+LEGACY_CAP = 50  # 2.9.0's, in `pma_total`: the notes it wrote at its limit keep saying 50
 
 # (above the band, below it, near it, the round's limit, the overall limit); {n} is the win rate
 TEXTS = {
@@ -227,7 +229,8 @@ def reasons(lang):
         text = above if n > 52 else below if n < 48 else near
         out[f"pma_wr_{n}"] = text.format(n=n)
     out["pma_cap"] = cap
-    out["pma_total"] = total.format(cap=CAP)
+    out["pma_total"] = total.format(cap=LEGACY_CAP)
+    out[f"pma_total_{CAP}"] = total.format(cap=CAP)
     power, power_hp, in_all = POWER.get(lang, POWER["en"])
     signed = lambda v: f"{v:+d}"
     for v in range(-CAP, CAP + 1):

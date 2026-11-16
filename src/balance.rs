@@ -74,10 +74,12 @@ pub const BAND: (f32, f32) = (48.0, 52.0);
 /// their cuts (Tryndamere at -32% and Kog'Maw at -35% still won about 60%). Some of our own kit changes came with
 /// cuts and bias the fit low, so 2.5 rather than the fit's 3.85.
 pub const DEFAULT_PER_POINT: f32 = 2.5;
-/// A champion's (and an item's) power stays within this much of its own (percent). 50 since 2.9.0 (the user,
-/// 2026-11-13: 「还有max也调高点」 - 30 held the champions that did not move at -30%, and `balance_max` up to 50 needs
-/// room in all as well).
-pub const CAP: i32 = 50;
+/// A champion's power stays within this much of its own (percent). 50 since 2.9.0 (the user, 2026-11-13: 「还有max也
+/// 调高点」), 80 since 2.10.0: the steps are bigger now ([`DEFAULT_PER_POINT`]), and the strongest champions were held
+/// at -32% and -35% while they still won about 60%. `balance_max` goes up to it. The items keep [`ITEM_CAP`].
+pub const CAP: i32 = 80;
+/// An item's power stays within this much of its numbers (percent): 2.9.0's [`CAP`], kept for the items in 2.10.0.
+pub const ITEM_CAP: i32 = 50;
 /// Recent games (each patch back counting half, the model's `evidence`) before a champion's win rate is trusted.
 pub const MIN_EVIDENCE: f32 = 30.0;
 /// Picks this patch (ten a match) before they set the middle of the field ([`field_centre`]); fewer (a patch just
@@ -315,7 +317,7 @@ pub struct Builder {
 /// The item changes of a round (2.9.0): for each item named by [`ITEM_MIN_USERS`] builders or more with games, their
 /// win rate after this round's champion changes, weighted by games (at most [`ITEM_WEIGHT`] each) and drawn toward 50
 /// by n / (n + [`ITEM_SHRINK`]); beyond [`ITEM_BAND`] points of 50 a step of [`ITEM_PER_POINT`] a point (at most
-/// `rules.item_max`), the power kept within [`CAP`]; an item `settled` says not yet waits. Furthest first, at most
+/// `rules.item_max`), the power kept within [`ITEM_CAP`]; an item `settled` says not yet waits. Furthest first, at most
 /// `rules.item_count`. `names`: the items that can change (finished ones), with their names.
 pub fn decide_items(
     builders: &[Builder],
@@ -347,7 +349,7 @@ pub fn decide_items(
         };
         let want = ((-(gap * ITEM_PER_POINT)).round() as i32).clamp(-rules.item_max, rules.item_max);
         let was = before.get(item).copied().unwrap_or(0);
-        let total = (was + want).clamp(-CAP, CAP);
+        let total = (was + want).clamp(-ITEM_CAP, ITEM_CAP);
         let step = total - was;
         if step == 0 || !settled(item) {
             continue;
@@ -654,7 +656,8 @@ pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
 }
 
 /// A change's reason as the game's notes give one: codes of `patch.reason.*` texts, comma-separated - the model's
-/// win rate (`pma_wr_<n>`, rounded away from the band), and whether the round's or the overall limit held it.
+/// win rate (`pma_wr_<n>`, rounded away from the band), the power this round and in all, and whether the round's or
+/// the overall limit held it (`pma_cap`, `pma_total_<CAP>`).
 pub fn reason(c: &Change, rules: Rules) -> String {
     let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
     let mut codes = vec![format!("pma_wr_{n}")];
@@ -669,8 +672,10 @@ pub fn reason(c: &Change, rules: Rules) -> String {
     if c.step.abs() >= rules.max_step {
         codes.push("pma_cap".to_string());
     }
+    // the limit in all: a code of its own since 2.10.0 (`pma_total_80`), so that the notes 2.9.0 wrote at its limit
+    // keep saying 50% (`pma_total`)
     if c.total.abs() >= CAP {
-        codes.push("pma_total".to_string());
+        codes.push(format!("pma_total_{CAP}"));
     }
     codes.join(",")
 }
@@ -1538,9 +1543,11 @@ mod tests {
         assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
         assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
         assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
-        // the power in all when other rounds moved it before (2.9.0), the limit in all at CAP
+        // the power in all when other rounds moved it before (2.9.0), the limit in all at CAP (80 since 2.10.0, a code
+        // of its own: 2.9.0's notes at its 50% keep theirs)
         assert_eq!(reason(&c(70.0, -5, -30), RULES), "pma_wr_70,pma_power_m5,pma_sum_m30");
-        assert_eq!(reason(&c(70.0, -5, -CAP), RULES), format!("pma_wr_70,pma_power_m5,pma_sum_m{CAP},pma_total"));
+        assert_eq!(reason(&c(70.0, -5, -50), RULES), "pma_wr_70,pma_power_m5,pma_sum_m50", "50% is no limit any more");
+        assert_eq!(reason(&c(70.0, -5, -CAP), RULES), "pma_wr_70,pma_power_m5,pma_sum_m80,pma_total_80");
         assert_eq!(reason(&c(40.0, 8, 0), RULES), "pma_wr_40,pma_power_p8", "back to its own numbers: no sum");
         assert_eq!((signed_code(-11), signed_code(9)), ("m11".to_string(), "p9".to_string()));
     }
@@ -1811,13 +1818,14 @@ mod tests {
         // the builders' win rate once their own nerfs work is what counts: fine after them, no item change
         let fixed: Vec<Builder> = (0..6).map(|i| builder(&format!("c{i}"), 60.0, 51.0, 100.0, &["rfc"])).collect();
         assert!(decide_items(&fixed, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
-        // far off: held to item_max a round, CAP in all; weak builders get the item buffed
+        // far off: held to item_max a round, ITEM_CAP in all (still 50 where the champions' CAP is 80); weak builders
+        // get the item buffed
         let far: Vec<Builder> = (0..20).map(|i| builder(&format!("c{i}"), 80.0, 80.0, 500.0, &["rfc", "weak"])).collect();
         let out = decide_items(&far, &names(&["rfc"]), &before, &always, ITEM_RULES);
         assert_eq!((out[0].step, out[0].total), (-10, -10));
-        let was: BTreeMap<String, i32> = [("rfc".to_string(), -(CAP - 4))].into_iter().collect();
+        let was: BTreeMap<String, i32> = [("rfc".to_string(), -(ITEM_CAP - 4))].into_iter().collect();
         let out = decide_items(&far, &names(&["rfc"]), &was, &always, ITEM_RULES);
-        assert_eq!((out[0].step, out[0].total), (-4, -CAP));
+        assert_eq!((out[0].step, out[0].total), (-4, -50));
         let weak: Vec<Builder> = (0..8).map(|i| builder(&format!("c{i}"), 40.0, 40.0, 100.0, &["staff"])).collect();
         assert!(decide_items(&weak, &names(&["staff"]), &before, &always, ITEM_RULES)[0].step > 0);
         // an item that has to wait, and the round's count keeps the furthest
@@ -1897,7 +1905,7 @@ mod tests {
         let could = qualified(&cands, &before, rules);
         let text = summarize(&cands, &before, rules, could.len(), could.len().min(rules.count));
         assert!(text.starts_with("6 champions rated, 5 with 30 games or more, 4 of those outside 48-52%"), "{text}");
-        assert!(text.contains("1 waiting") && text.contains("1 at the 50% limit") && text.contains("1 too close"), "{text}");
+        assert!(text.contains("1 waiting") && text.contains("1 at the 80% limit") && text.contains("1 too close"), "{text}");
         assert!(text.contains("1 could change, 1 changed (balance_count 60)"), "{text}");
     }
 
