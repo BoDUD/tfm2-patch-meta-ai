@@ -5,8 +5,9 @@
 //! game's did:
 //!
 //! - **When**: a round for every patch the game makes (its patch notes appear in the player's news, [`Due::Patch`]);
-//!   a first one when the setting is turned on, as a hotfix of the current patch (`2027.4.1b`, [`Due::First`]); and a
-//!   hotfix when the game made no patch for [`LATE_DAYS`] game days ([`Due::Late`]).
+//!   a first one when the setting is turned on, as a hotfix of the current patch (`2027.4.1b`, [`Due::First`]); a
+//!   hotfix when the game made no patch for [`LATE_DAYS`] game days ([`Due::Late`]); and (2.10.0) one hotfix at once
+//!   on a book whose newest round was made under older rules ([`Due::Recalibration`], [`RULES_VERSION`]).
 //! - **What**: the champions the model rates furthest outside [`BAND`] - with [`MIN_EVIDENCE`] recent games or more,
 //!   at most `balance_count` of them - change by `balance_per_point` percent of power for every win-rate point outside
 //!   the band ([`Rules::per_point`], [`DEFAULT_PER_POINT`]), at most `balance_max` a round, at most [`CAP`] in all
@@ -111,6 +112,11 @@ pub const ITEM_EVERY: usize = 10;
 pub const UNPICKED_STEP: i32 = 10;
 /// Through the unpicked buffs a champion's power goes up to this much, never above (percent).
 pub const UNPICKED_CAP: i32 = 30;
+/// The balance rules a round is made under ([`Round::rules`]): 2 = 2.10.0's ([`DEFAULT_PER_POINT`] and
+/// `balance_per_point`, [`CAP`] 80, [`unpicked`] buffs). Rounds of 2.8.0 - 2.9.0 wrote no number (0; 1 stands for
+/// 2.9.0's rules). A book whose newest round is older gets a hotfix under the new ones at once
+/// ([`Due::Recalibration`]).
+pub const RULES_VERSION: u32 = 2;
 /// Game days after a round without a new game patch before the next round comes as a hotfix of the same patch (the
 /// game makes one every 4-6 weeks; with its champion changes off it might make none).
 pub const LATE_DAYS: i64 = 60;
@@ -201,6 +207,9 @@ pub struct Round {
     /// Why these champions and no more (the log: how many had games, were outside the band, waited, were at the limit).
     #[serde(skip)]
     pub summary: String,
+    /// The balance rules it was made under ([`RULES_VERSION`]; 0: a round of 2.8.0 - 2.9.0, which wrote none).
+    #[serde(default)]
+    pub rules: u32,
 }
 
 /// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
@@ -422,12 +431,16 @@ pub enum Due {
     First(String),
     /// [`LATE_DAYS`] game days without a new game patch: a hotfix of the current one.
     Late(String),
+    /// The newest round was made under older rules ([`Round::rules`] below [`RULES_VERSION`]; 2.10.0, the user:
+    /// 「你要所有英雄达到整体平衡啊 不能只找超模吧」): a hotfix of the game's current patch at once (as [`Due::First`]),
+    /// the new rules put to work without waiting for the game's next patch. Due once: that round is made under them.
+    Recalibration(String),
 }
 
 impl Due {
     pub fn version(&self) -> &str {
         match self {
-            Due::Patch(v) | Due::First(v) | Due::Late(v) => v,
+            Due::Patch(v) | Due::First(v) | Due::Late(v) | Due::Recalibration(v) => v,
         }
     }
 }
@@ -450,6 +463,11 @@ pub fn due(rounds: &[Round], patch: Option<&str>, today: Option<(i32, u32, u32)>
     // a patch newer than every round's: the game moved on
     if !rounds.iter().any(|r| r.version == patch) && compare_versions(patch, &last.version) == std::cmp::Ordering::Greater {
         return Some(Due::Patch(patch.to_string()));
+    }
+    // the newest round made under older rules (a book of 2.9.0 or before): a hotfix now, under the new ones. A game
+    // patch due at the same time came first above - its round is made under the new rules and puts them to work too.
+    if last.rules < RULES_VERSION {
+        return Some(Due::Recalibration(patch.to_string()));
     }
     let (made, today) = (last.date?, today?);
     (day_number(today) - day_number(made) >= LATE_DAYS).then(|| Due::Late(patch.to_string()))
@@ -572,6 +590,7 @@ pub fn make_round_with(
         items: item_changes,
         item_power,
         summary,
+        rules: RULES_VERSION,
     }
 }
 
@@ -2187,5 +2206,49 @@ mod tests {
         assert_eq!(back, round.changes);
         let old: Change = serde_json::from_str(r#"{"champion":"x","win":50.0,"evidence":40.0,"step":-5,"total":-5}"#).unwrap();
         assert!(!old.unpicked, "a book of 2.9.0");
+    }
+
+    // ===================== 2.10.0: the recalibration hotfix =====================
+
+    #[test]
+    fn a_book_from_before_2_10_gets_one_recalibration_hotfix() {
+        let today = Some((2028, 3, 20));
+        // a book of 2.9.0: its rounds wrote no rules; the newest a game patch's, maddie cut in its notes
+        let old: Round = serde_json::from_str(
+            r#"{"id":9,"version":"2028.2.0","label":"2028.2.0","merged":true,"date":[2028,3,15],"matches":250,
+                "changes":[{"champion":"maddie","win":70.0,"evidence":200.0,"step":-5,"total":-5}],"power":{"maddie":-5}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.rules, 0);
+        let rounds = vec![old];
+        // due at once (five days after the round, long before LATE_DAYS): a hotfix of the game's current patch
+        let now = due(&rounds, Some("2028.2.0"), today).unwrap();
+        assert_eq!(now, Due::Recalibration("2028.2.0".into()));
+        let m = meta_with_games(&["2028.1.2", "2028.2.0"], &[300, 10]);
+        let fix = make_round(&m, &rounds, RULES, &now, today);
+        assert_eq!((fix.id, fix.label.as_str(), fix.merged, fix.rules), (10, "2028.2.0b", false, RULES_VERSION));
+        // the settled rule still holds: maddie has 10 games since her cut; weak, never changed, is buffed
+        assert!(fix.changes.iter().all(|c| c.champion != "maddie"), "{:?}", fix.changes);
+        assert_eq!((fix.power.get("maddie"), fix.power.get("weak")), (Some(&-5), Some(&10)));
+        assert_eq!(fix.held.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["maddie"]);
+        // once: after it nothing more until the game's next patch (nor by age before LATE_DAYS)
+        let rounds = vec![rounds[0].clone(), fix];
+        assert_eq!(due(&rounds, Some("2028.2.0"), today), None);
+        assert_eq!(due(&rounds, Some("2028.2.0"), Some((2028, 4, 30))), None);
+        assert_eq!(due(&rounds, Some("2028.2.1"), today), Some(Due::Patch("2028.2.1".into())));
+        // the number is kept in the book: read again, still nothing due
+        let json = serde_json::to_string(&rounds[1]).unwrap();
+        assert!(json.contains(r#""rules":2"#), "{json}");
+        let read: Round = serde_json::from_str(&json).unwrap();
+        assert_eq!(due(&[rounds[0].clone(), read], Some("2028.2.0"), today), None);
+        // the game's patch due at the same time comes first: its round is made under the new rules as well
+        let old_only = &rounds[..1];
+        assert_eq!(due(old_only, Some("2028.2.1"), today), Some(Due::Patch("2028.2.1".into())));
+        let patched = make_round(&m, old_only, RULES, &Due::Patch("2028.2.1".into()), today);
+        assert_eq!((patched.merged, patched.rules), (true, RULES_VERSION));
+        assert_eq!(due(&[old_only[0].clone(), patched], Some("2028.2.1"), today), None);
+        // no patch known: nothing yet; an empty book: the first round, as before
+        assert_eq!(due(old_only, None, today), None);
+        assert_eq!(due(&[], Some("2028.2.0"), today), Some(Due::First("2028.2.0".into())));
     }
 }

@@ -2036,6 +2036,9 @@ mod tests {
         nameless: bool,
         /// The save's own id as the server says it (none: a server that gives none).
         save_id: String,
+        /// The server answers the balance requests (ok), and the requests it got (2.10.0's recalibration test).
+        answer_balance: bool,
+        balance_requests: Vec<BalanceRequest>,
     }
 
     impl Source for FakeGame {
@@ -2106,6 +2109,11 @@ mod tests {
             }
             if command == server::APPLY_BALANCE || command == server::PREPARE_BALANCE {
                 self.balance_sent.push(command.to_string());
+                if let (true, true, Ok(req)) = (self.answer_balance, command == server::APPLY_BALANCE, BalanceRequest::parse(payload)) {
+                    let answer = format!("{}/{}\tok\twritten", u8::from(req.off), req.round);
+                    self.events.push((server::BALANCE_RESULT.to_string(), answer.into_bytes()));
+                    self.balance_requests.push(req);
+                }
                 return true;
             }
             assert_eq!(command, APPLY_TIERS);
@@ -2743,5 +2751,47 @@ mod tests {
         assert_eq!(next_patch_day(schedule, (2028, 1, 1)), Some((2028, 2, 1)));
         assert_eq!(next_patch_day(schedule, (2028, 2, 2)), None);
         assert_eq!(next_patch_day("{", (2027, 1, 1)), None);
+    }
+
+    #[test]
+    fn a_book_of_2_9_gets_its_recalibration_hotfix_when_the_save_loads_once() {
+        let _serial = crate::tests::serial();
+        with_temp_dir();
+        // the save's book as 2.9.0 left it: one round, for the game's patch 1.3, in its notes (no rules number)
+        let id = "recal0123456789a";
+        let file = crate::paths::mod_dir().join(format!("balance-{id}.json"));
+        let old = r#"{"v":1,"rounds":[{"id":1,"version":"1.3","label":"1.3","merged":true,"date":[2026,2,28],"matches":250,
+            "changes":[{"champion":"a","win":70.0,"evidence":200.0,"step":-10,"total":-10}],"power":{"a":-10}}],"kept":[]}"#;
+        std::fs::write(&file, old).unwrap();
+        config::set_for_tests(Config { balance: true, ..Config::default() });
+        let mut g = save();
+        g.book = (id.to_string(), 1);
+        g.answer_balance = true;
+        let now = frames(&mut g, 300, Instant::now());
+        // made at the load, a day after the round: a hotfix of the game's patch, under 2.10.0's rules
+        let rounds = crate::balance::rounds();
+        assert_eq!(rounds.len(), 2, "{rounds:?}");
+        let r = &rounds[1];
+        assert_eq!((r.id, r.version.as_str(), r.label.as_str(), r.merged, r.rules), (2, "1.3", "1.3b", false, crate::balance::RULES_VERSION));
+        // and handed to the server as patch notes of its own
+        let req = g.balance_requests.iter().find(|q| q.round == 2).expect("round 2 sent to the server");
+        let note = req.note.as_ref().expect("its notes");
+        assert_eq!((note.label.as_str(), note.merge, req.off), ("1.3b", false, true));
+        assert_eq!(st_acked(), Some((true, 2)));
+        // once: frames later, the next day, the save opened again - no other round
+        g.date = (2026, 3, 2);
+        let now = frames(&mut g, 300, now);
+        assert_eq!(crate::balance::rounds().len(), 2);
+        tick(&mut g, false, now);
+        frames(&mut g, 300, now + Duration::from_secs(60));
+        assert_eq!(crate::balance::rounds().len(), 2, "the book read again has the hotfix");
+        crate::balance::reset_for_tests();
+        crate::reset_for_tests();
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// What the server last confirmed of the balance (the state's).
+    fn st_acked() -> Option<(bool, u32)> {
+        lock().as_ref().and_then(|st| st.balance.acked)
     }
 }
