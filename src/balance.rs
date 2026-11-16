@@ -14,6 +14,10 @@
 //!   waits until it has played [`MIN_EVIDENCE`] games with its new numbers ([`games_since_change`]; 2.8.1 - the first
 //!   rounds on a save, a hotfix and the game's patch two days later, cut the same ten champions twice on the games
 //!   from before the first cut).
+//! - **Every champion** (2.10.0, `balance_unpicked`): champions with fewer than [`MIN_EVIDENCE`] recent games have no
+//!   win rate to judge; a round also buffs some of them by [`UNPICKED_STEP`] (up to [`UNPICKED_CAP`]), besides
+//!   `balance_count`, so that they get played and judged ([`unpicked`]) - the game's own patches did that before
+//!   this mod replaced them.
 //! - **Against the field** (2.9.0, the user 2026-11-13: 「先修再打包」): the win rates a round reads are measured from
 //!   the middle of this patch's field ([`field_centre`], [`field_win`]), not from the model's strength 0 - its
 //!   prior's centre, a champion nobody may play. On one save (2027.5.0) the 38 champions with 30 games that patch
@@ -98,6 +102,15 @@ pub const ITEM_PER_POINT: f32 = 2.0;
 pub const ITEM_MIN_GAMES: f32 = 60.0;
 /// A match looks at its champions' items every this many ticks (an item is bought now and then).
 pub const ITEM_EVERY: usize = 10;
+/// "Unpicked" buffs (2.10.0, `balance_unpicked`; the user: 「你要所有英雄达到整体平衡啊 不能只找超模吧」): a champion with
+/// fewer than [`MIN_EVIDENCE`] recent games is never judged by its win rate, and the game's own patches - whose
+/// "unpicked" buffs brought such champions back - are off while this mod makes them. On the user's save 131 of the
+/// 212 champions had fewer than 30 games in the 4+6 era, 40 none, and no round touched them. So a round also buffs
+/// some of them ([`unpicked`]) by this much, to bring them into play: once they have [`MIN_EVIDENCE`] games the
+/// win-rate rule takes over, and cuts back what was too much.
+pub const UNPICKED_STEP: i32 = 10;
+/// Through the unpicked buffs a champion's power goes up to this much, never above (percent).
+pub const UNPICKED_CAP: i32 = 30;
 /// Game days after a round without a new game patch before the next round comes as a hotfix of the same patch (the
 /// game makes one every 4-6 weeks; with its champion changes off it might make none).
 pub const LATE_DAYS: i64 = 60;
@@ -116,6 +129,9 @@ pub struct Rules {
     /// Percent of power a win-rate point outside the band (2.10.0, `balance_per_point`, [`DEFAULT_PER_POINT`]): the
     /// step a champion gets, and what the items expect of it ([`Builder::after`]).
     pub per_point: f32,
+    /// Unpicked buffs a round makes at most (2.10.0, `balance_unpicked`, [`UNPICKED_STEP`]; 0: none), besides
+    /// `count`.
+    pub unpicked: usize,
     /// The 4+6 pack's items too (2.9.0, `item_balance`), at most `item_count` a round, each a step of at most
     /// `item_max` (percent of its numbers).
     pub items: bool,
@@ -134,6 +150,10 @@ pub struct Change {
     /// This round's step and its power after it (percent).
     pub step: i32,
     pub total: i32,
+    /// An unpicked buff (2.10.0, [`UNPICKED_STEP`]): too few games for its win rate to count (`win` is the model's
+    /// guess), buffed to be played. Its reason in the notes says so ([`reason`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unpicked: bool,
 }
 
 /// One item's change in a round (2.9.0, `item_balance`): the 4+6 pack's key and the item's name, how many champions
@@ -215,14 +235,16 @@ pub fn field_win(champion: &crate::meta::Champion, centre: f32) -> f32 {
     crate::glm::sigmoid(champion.strength - centre) * 100.0
 }
 
-/// A champion the model rates: name, win rate against the field (percent, [`field_win`]), recent games, and its
-/// games since a round last changed it (None: no round did).
+/// A champion the model rates: name, win rate against the field (percent, [`field_win`]), recent games, its games
+/// since a round last changed it (None: no round did), and whether it is in this save's pool (2.10.0: picked or
+/// banned in a kept game, `meta::Champion::drafted`; only those get [`unpicked`] buffs).
 #[derive(Clone, Copy, Debug)]
 pub struct Candidate<'a> {
     pub name: &'a str,
     pub win: f32,
     pub evidence: f32,
     pub since_change: Option<f32>,
+    pub pooled: bool,
 }
 
 impl Candidate<'_> {
@@ -294,12 +316,42 @@ fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
             let total = (was + want).clamp(-CAP, CAP);
             let step = total - was;
             (step != 0).then(|| {
-                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total })
+                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total, unpicked: false })
             })
         })
         .collect();
     out.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.champion.cmp(&b.1.champion)));
     out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// The unpicked buffs of a round (2.10.0, [`UNPICKED_STEP`]), besides `rules.count`: champions of this save's pool
+/// ([`Candidate::pooled`]) with fewer than [`MIN_EVIDENCE`] recent games, at most 50% against the field and under
+/// [`UNPICKED_CAP`] of power - the fewest games first, then the weakest - at most `rules.unpicked` of them. Each a step
+/// of [`UNPICKED_STEP`] (at most `rules.max_step`), its power not above [`UNPICKED_CAP`] through it. No wait for games
+/// since their last change: they have too few to wait for. Also how many were eligible (for the log).
+pub fn unpicked(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules: Rules) -> (Vec<Change>, usize) {
+    let mut eligible: Vec<(&Candidate<'_>, i32)> = candidates
+        .iter()
+        .filter(|c| c.pooled && c.evidence < MIN_EVIDENCE && c.win <= 50.0)
+        .filter_map(|c| {
+            let was = before.get(c.name).copied().unwrap_or(0);
+            (was < UNPICKED_CAP).then_some((c, was))
+        })
+        .collect();
+    eligible.sort_by(|(a, _), (b, _)| {
+        a.evidence.total_cmp(&b.evidence).then_with(|| a.win.total_cmp(&b.win)).then_with(|| a.name.cmp(b.name))
+    });
+    let n = eligible.len();
+    let step = UNPICKED_STEP.min(rules.max_step);
+    let out = eligible
+        .into_iter()
+        .take(rules.unpicked)
+        .map(|(c, was)| {
+            let total = (was + step).min(UNPICKED_CAP);
+            Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step: total - was, total, unpicked: true }
+        })
+        .collect();
+    (out, n)
 }
 
 /// A champion as the items see it (2.9.0): its win rate, the win rate once this round's own change to it works (a
@@ -442,10 +494,11 @@ pub fn make_round_with(
             win: field_win(c, centre),
             evidence: c.evidence,
             since_change: games_since_change(rounds, &meta.versions, c),
+            pooled: c.drafted > 0,
         })
         .collect();
     let could = qualified(&candidates, &before, rules);
-    let changes: Vec<Change> = could.iter().take(rules.count).cloned().collect();
+    let mut changes: Vec<Change> = could.iter().take(rules.count).cloned().collect();
     // out of the band with games enough, but not since their last change: next round, maybe
     let mut held: Vec<(f32, String, f32)> = candidates
         .iter()
@@ -453,11 +506,16 @@ pub fn make_round_with(
         .filter_map(|c| Some((c.gap()?.abs(), c.name.to_string(), c.since_change.unwrap_or(0.0))))
         .collect();
     held.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // the unpicked buffs (2.10.0), besides balance_count: champions with too few games for the rule above
+    let (fresh, eligible) = unpicked(&candidates, &before, rules);
     let summary = format!(
-        "{}; win rates against this patch's field: the model's {:.1}% counts as 50%",
+        "{}; {} unpicked buffs of {eligible} eligible (balance_unpicked {}: in this save's pool, under {MIN_EVIDENCE} recent games, at most 50% against the field, under +{UNPICKED_CAP}%); win rates against this patch's field: the model's {:.1}% counts as 50%",
         summarize(&candidates, &before, rules, could.len(), changes.len()),
+        fresh.len(),
+        rules.unpicked,
         crate::glm::sigmoid(centre) * 100.0
     );
+    changes.extend(fresh);
     let mut power = before;
     for c in &changes {
         if c.total == 0 {
@@ -660,7 +718,8 @@ pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
 /// the overall limit held it (`pma_cap`, `pma_total_<CAP>`).
 pub fn reason(c: &Change, rules: Rules) -> String {
     let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
-    let mut codes = vec![format!("pma_wr_{n}")];
+    // an unpicked buff (2.10.0) says why instead of a win rate too few games stand behind, and no limit held it
+    let mut codes = vec![if c.unpicked { "pma_unpicked".to_string() } else { format!("pma_wr_{n}") }];
     // the power this round and in all (2.9.0; the user: 「一起加上」 - a player read -11% of power as the -5% / -6% of
     // the lines and thought it barely cut)
     if c.step != 0 {
@@ -668,6 +727,9 @@ pub fn reason(c: &Change, rules: Rules) -> String {
     }
     if c.total != 0 && c.total != c.step {
         codes.push(format!("pma_sum_{}", signed_code(c.total)));
+    }
+    if c.unpicked {
+        return codes.join(",");
     }
     if c.step.abs() >= rules.max_step {
         codes.push("pma_cap".to_string());
@@ -867,11 +929,17 @@ pub fn news(round: &Round, label: &dyn Fn(&str) -> String) -> (String, String) {
         for c in list {
             let damage = c.step / 2;
             let health = c.step - damage;
+            // why: its win rate, or (an unpicked buff, 2.10.0) its few games
+            let why = match (chinese, c.unpicked) {
+                (true, false) => format!("胜率 {:.1}%（目标 48%–52%）", c.win),
+                (true, true) => format!("近几个版本很少有人选（近期 {:.0} 场）", c.evidence),
+                (false, false) => format!("win rate {:.1}% (target 48-52%)", c.win),
+                (false, true) => format!("rarely picked lately ({:.0} recent games)", c.evidence),
+            };
             lines.push(if chinese {
                 format!(
-                    "{}：胜率 {:.1}%（目标 48%–52%）→ 强度 {:+}%（攻击/法强 {:+}%，生命 {:+}%），累计 {:+}%",
+                    "{}：{why}→ 强度 {:+}%（攻击/法强 {:+}%，生命 {:+}%），累计 {:+}%",
                     label(&c.champion),
-                    c.win,
                     c.step,
                     damage,
                     health,
@@ -879,9 +947,8 @@ pub fn news(round: &Round, label: &dyn Fn(&str) -> String) -> (String, String) {
                 )
             } else {
                 format!(
-                    "{}: win rate {:.1}% (target 48-52%) -> power {:+}% (attack / magic power {:+}%, health {:+}%), {:+}% in all",
+                    "{}: {why} -> power {:+}% (attack / magic power {:+}%, health {:+}%), {:+}% in all",
                     label(&c.champion),
-                    c.win,
                     c.step,
                     damage,
                     health,
@@ -1351,10 +1418,10 @@ mod tests {
         round_for(key, first_run, on, true).map(|p| p.champions)
     }
 
-    const RULES: Rules = Rules { count: 10, max_step: 10, per_point: DEFAULT_PER_POINT, items: false, item_count: 5, item_max: 10 };
+    const RULES: Rules = Rules { count: 10, max_step: 10, per_point: DEFAULT_PER_POINT, unpicked: 0, items: false, item_count: 5, item_max: 10 };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
-        Candidate { name, win, evidence, since_change: None }
+        Candidate { name, win, evidence, since_change: None, pooled: true }
     }
 
     #[test]
@@ -1539,7 +1606,7 @@ mod tests {
 
     #[test]
     fn the_reason_is_the_win_rate_and_the_limits() {
-        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total };
+        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false };
         assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
         assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
         assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
@@ -1561,9 +1628,9 @@ mod tests {
             merged: true,
             date: Some((2027, 10, 1)),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10 },
-                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20 },
-                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10 },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false },
+                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20, unpicked: false },
+                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10, unpicked: false },
             ],
             ..Round::default()
         };
@@ -1635,7 +1702,7 @@ mod tests {
             id: 2,
             version: "1.2".into(),
             power: power2.clone(),
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20 }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20, unpicked: false }],
             ..Round::default()
         });
         assert_eq!(view().map(|v| v.steps.get("maddie").copied()), Some(Some(-10)));
@@ -1754,7 +1821,7 @@ mod tests {
             version: version.into(),
             changes: changes
                 .into_iter()
-                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s })
+                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s, unpicked: false })
                 .collect(),
             ..Round::default()
         };
@@ -1772,8 +1839,8 @@ mod tests {
             version: "2027.4.1".into(),
             label: "2027.4.1b".into(),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10 },
-                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6 },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false },
+                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6, unpicked: false },
             ],
             ..Round::default()
         };
@@ -1891,7 +1958,7 @@ mod tests {
 
     #[test]
     fn the_log_says_why_a_round_changed_fewer_than_balance_count() {
-        let c = |name: &'static str, win: f32, evidence: f32, since: Option<f32>| Candidate { name, win, evidence, since_change: since };
+        let c = |name: &'static str, win: f32, evidence: f32, since: Option<f32>| Candidate { name, win, evidence, since_change: since, pooled: true };
         let cands = [
             c("a", 70.0, 100.0, None),
             c("b", 65.0, 100.0, Some(5.0)),
@@ -1973,7 +2040,7 @@ mod tests {
             version: "2027.4.1".into(),
             merged: false,
             matches: 586,
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10 }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10, unpicked: false }],
             ..Round::default()
         };
         let got = model_rounds_of(&[round]);
@@ -1982,7 +2049,7 @@ mod tests {
             [crate::meta::BalanceRound { version: "2027.4.1".into(), merged: false, matches: 586, steps: vec![("maddie".into(), -10)] }]
         );
         // the round log line reads as one line
-        let c = |name: &'static str, win: f32| Candidate { name, win, evidence: 100.0, since_change: Some(5.0) };
+        let c = |name: &'static str, win: f32| Candidate { name, win, evidence: 100.0, since_change: Some(5.0), pooled: true };
         let text = summarize(&[c("a", 70.0), c("b", 30.0)], &BTreeMap::new(), RULES, 0, 0);
         assert!(!text.contains("  "), "{text}");
         assert!(text.contains("2 waiting for 30 games with their new numbers"), "{text}");
@@ -2032,5 +2099,93 @@ mod tests {
         }
         assert_eq!(field_centre(&picked), 0.0, "a patch just begun: the recent games decide");
         assert_eq!(field_centre(&Meta::default()), 0.0);
+    }
+
+    // ===================== 2.10.0: unpicked buffs =====================
+
+    fn pooled(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
+        Candidate { name, win, evidence, since_change: None, pooled: true }
+    }
+
+    #[test]
+    fn champions_with_too_few_games_get_unpicked_buffs() {
+        let before: BTreeMap<String, i32> =
+            [("buffed".to_string(), 25), ("full".to_string(), 30), ("cut".to_string(), -40)].into_iter().collect();
+        let cands = [
+            pooled("none", 45.0, 0.0),
+            pooled("none_weak", 40.0, 0.0),
+            pooled("few", 49.0, 12.0),
+            // above 50% against the field: no
+            pooled("strong", 55.0, 3.0),
+            // 30 games: the win-rate rule's
+            pooled("enough", 45.0, 30.0),
+            // never picked or banned on this save (a base hero under a LoL-only filter)
+            Candidate { pooled: false, ..pooled("base", 30.0, 0.0) },
+            // +25 so far: +5 to the rule's +30
+            pooled("buffed", 48.0, 20.0),
+            // +30: no more through this rule
+            pooled("full", 47.0, 1.0),
+            // cut once, nobody plays it now: buffed too
+            pooled("cut", 44.0, 25.0),
+        ];
+        let (out, eligible) = unpicked(&cands, &before, Rules { unpicked: 3, ..RULES });
+        assert_eq!(eligible, 5, "none, none_weak, few, buffed, cut");
+        // the fewest games first, then the weakest
+        let got: Vec<(&str, i32, i32)> = out.iter().map(|c| (c.champion.as_str(), c.step, c.total)).collect();
+        assert_eq!(got, [("none_weak", 10, 10), ("none", 10, 10), ("few", 10, 10)]);
+        assert!(out.iter().all(|c| c.unpicked));
+        // room for all: each to its limit
+        let (out, _) = unpicked(&cands, &before, Rules { unpicked: 60, ..RULES });
+        let got: Vec<(&str, i32, i32)> = out.iter().map(|c| (c.champion.as_str(), c.step, c.total)).collect();
+        assert_eq!(got, [("none_weak", 10, 10), ("none", 10, 10), ("few", 10, 10), ("buffed", 5, 30), ("cut", 10, -30)]);
+        // off; and a step held to balance_max
+        assert!(unpicked(&cands, &before, RULES).0.is_empty(), "balance_unpicked 0");
+        assert_eq!(unpicked(&cands, &before, Rules { unpicked: 1, max_step: 4, ..RULES }).0[0].step, 4);
+        // once one has its 30 games the win-rate rule takes it over - and cuts back what was too much
+        let played = Candidate { since_change: Some(40.0), ..pooled("buffed", 60.0, 100.0) };
+        assert!(unpicked(&[played], &before, Rules { unpicked: 60, ..RULES }).0.is_empty());
+        let out = decide(&[played], &before, RULES);
+        assert_eq!((out[0].step, out[0].total, out[0].unpicked), (-10, 15, false));
+    }
+
+    #[test]
+    fn a_round_makes_unpicked_buffs_besides_balance_count() {
+        let mut m = meta();
+        for c in &mut m.champions {
+            c.drafted = 50;
+        }
+        // three champions with too few games: two drafted on this save, one never
+        for (name, win, evidence, drafted) in [("rare", 45.0, 4.0, 3), ("new", 47.0, 0.0, 1), ("base", 40.0, 0.0, 0)] {
+            m.champions.push(crate::meta::Champion { drafted, ..champ(name, win, evidence) });
+        }
+        let rules = Rules { count: 1, unpicked: 5, ..RULES };
+        let round = make_round(&m, &[], rules, &Due::First("2027.4.1".into()), None);
+        let got: Vec<(&str, i32, bool)> = round.changes.iter().map(|c| (c.champion.as_str(), c.step, c.unpicked)).collect();
+        // balance_count 1: maddie by her win rate; the unpicked ones on top of it, the never-drafted one not
+        assert_eq!(got, [("maddie", -10, false), ("new", 10, true), ("rare", 10, true)]);
+        assert_eq!((round.power.get("new"), round.power.get("rare"), round.power.get("base")), (Some(&10), Some(&10), None));
+        assert!(round.summary.contains("1 changed (balance_count 1); 2 unpicked buffs of 2 eligible (balance_unpicked 5"), "{}", round.summary);
+        assert!(round.summary.ends_with("counts as 50%"), "{}", round.summary);
+        // the model reads their steps like any other's
+        let steps = &model_rounds_of(std::slice::from_ref(&round))[0].steps;
+        assert!(steps.contains(&("new".to_string(), 10)) && steps.contains(&("maddie".to_string(), -10)), "{steps:?}");
+        // the notes say why, not a win rate; no limit codes
+        let reason_of = |name: &str| reason(round.changes.iter().find(|c| c.champion == name).unwrap(), rules);
+        assert_eq!(reason_of("new"), "pma_unpicked,pma_power_p10");
+        let again = Change { step: 10, total: 20, ..round.changes[1].clone() };
+        assert_eq!(reason(&again, rules), "pma_unpicked,pma_power_p10,pma_sum_p20");
+        // and so does the plain news
+        let (_, body) = news(&round, &|n: &str| if n == "new" { "新英雄".to_string() } else { "某英雄".to_string() });
+        assert!(body.contains("新英雄：近几个版本很少有人选（近期 0 场）→ 强度 +10%（攻击/法强 +5%，生命 +5%），累计 +10%"), "{body}");
+        // the next round: still unpicked, buffed again up to +30 in all
+        let next = make_round(&m, std::slice::from_ref(&round), rules, &Due::Late("2027.4.1".into()), None);
+        assert_eq!(next.power.get("new"), Some(&20));
+        // an unpicked change is kept in the book as such; the others as before
+        let json = serde_json::to_string(&round.changes).unwrap();
+        assert!(json.contains(r#""unpicked":true"#) && json.matches("unpicked").count() == 2, "{json}");
+        let back: Vec<Change> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, round.changes);
+        let old: Change = serde_json::from_str(r#"{"champion":"x","win":50.0,"evidence":40.0,"step":-5,"total":-5}"#).unwrap();
+        assert!(!old.unpicked, "a book of 2.9.0");
     }
 }

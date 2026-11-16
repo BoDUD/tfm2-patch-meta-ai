@@ -1823,6 +1823,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         count: cfg.balance_count,
         max_step: cfg.balance_max,
         per_point: cfg.balance_per_point,
+        unpicked: cfg.balance_unpicked,
         items: cfg.item_balance,
         item_count: cfg.item_balance_count,
         item_max: cfg.item_balance_max,
@@ -1855,7 +1856,11 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                 };
                 if let Some(due) = crate::balance::due_now(patch.as_deref(), today) {
                     let round = crate::balance::make(&snapshot.meta, rules, &due, today);
-                    let list: Vec<String> = round.changes.iter().map(|c| format!("{} {:+} ({:.1}%)", c.champion, c.step, c.win)).collect();
+                    let list: Vec<String> = round
+                        .changes
+                        .iter()
+                        .map(|c| format!("{} {:+} ({:.1}%{})", c.champion, c.step, c.win, if c.unpicked { ", unpicked" } else { "" }))
+                        .collect();
                     diag::log(&format!(
                         "[balance] round {} {} ({:?}): {}",
                         round.id,

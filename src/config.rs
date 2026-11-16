@@ -70,6 +70,9 @@ pub struct Config {
     /// Percent of power a round changes a champion by for every win-rate point outside the band, and the move the
     /// model expects of such a step (2.10.0, 1.0-5.0; 1.5 fixed before).
     pub balance_per_point: f32,
+    /// Champions with too few games for their win rate a round buffs at most (2.10.0, `balance::UNPICKED_STEP`; 0 =
+    /// none, up to 60), besides `balance_count`.
+    pub balance_unpicked: usize,
     /// The 4+6 item pack's items in the balance patches too (`item_balance`, 2.9.0), at most `item_balance_count` a
     /// round, each a step of at most `item_balance_max` (percent of the item's numbers).
     pub item_balance: bool,
@@ -158,6 +161,7 @@ impl Default for Config {
             balance_count: 30,
             balance_max: 20,
             balance_per_point: crate::balance::DEFAULT_PER_POINT,
+            balance_unpicked: 20,
             item_balance: false,
             item_balance_count: 5,
             item_balance_max: 10,
@@ -300,6 +304,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
         // 2.10.0 (the user: 「你要所有英雄达到整体平衡啊 不能只找超模吧」; `balance::DEFAULT_PER_POINT`)
         "balance_per_point" => cfg.balance_per_point = number(value)?.clamp(1.0, 5.0),
+        "balance_unpicked" => cfg.balance_unpicked = number(value)?.round().clamp(0.0, 60.0) as usize,
         "item_balance" => cfg.item_balance = flag(value)?,
         "item_balance_count" => cfg.item_balance_count = number(value)?.round().clamp(1.0, 30.0) as usize,
         "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::ITEM_CAP as f32) as i32,
@@ -541,7 +546,7 @@ pub fn summary(c: &Config) -> String {
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
-         balance={} balance_count={} balance_max={} balance_per_point={} item_balance={} item_balance_count={} item_balance_max={}",
+         balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -590,6 +595,7 @@ pub fn summary(c: &Config) -> String {
         c.balance_count,
         c.balance_max,
         c.balance_per_point,
+        c.balance_unpicked,
         if c.item_balance { "on" } else { "off" },
         c.item_balance_count,
         c.item_balance_max
@@ -675,6 +681,15 @@ balance_max=20
 ;           预期一刀的效果。按一个存档 4+6 环境下的比赛实测，强度改 10% 胜率约变 2.5 个点（1.5 以为会变
 ;           6.7 个点），所以取偏保守的 2.5。
 balance_per_point=2.5
+; balance_unpicked : champions with fewer than 30 recent games are never judged by their win rate.
+;           Each patch also buffs up to this many of them by 10% of power (0 = off, up to 60; not
+;           counted in balance_count): those this save's careers drafted (picked or banned at least
+;           once in the kept matches), at most 50% against the field, the fewest games first, never
+;           above +30% through this rule. Once one has 30 games its win rate decides again.
+; balance_unpicked : 近期场次不到 30 场的英雄没法按胜率判断。每个版本另外给其中最多这么多个先加强 10%
+;           （0 = 关，最多 60；不占 balance_count）：只看这个存档里被选过或被禁过的、和场上比胜率不高于 50%
+;           的，场次最少的先加，这条规则最多加到 +30%。打满 30 场后照常按胜率调整。
+balance_unpicked=20
 ; item_balance : with alele's "4+6" item pack (alele_runes_and_items + alele_equipment_selection)
 ;                the balance patches change its finished items too: an item whose builders (the
 ;                heroes whose published build names it, 4 or more with games) still win too much or
@@ -890,6 +905,16 @@ ban_pick=yes
         // a settings.ini that names them keeps its own numbers
         let cfg = parse("balance_count=20\nbalance_max=10\n").0;
         assert_eq!((cfg.balance_count, cfg.balance_max), (20, 10));
+    }
+
+    #[test]
+    fn balance_unpicked_is_read_and_clamped() {
+        let unpicked = |text: &str| parse(text).0.balance_unpicked;
+        assert_eq!(Config::default().balance_unpicked, 20);
+        assert_eq!((unpicked("balance_unpicked=0"), unpicked("balance_unpicked=7.6")), (0, 8), "0 = off");
+        assert_eq!((unpicked("balance_unpicked=70"), unpicked("balance_unpicked=-5")), (60, 0), "kept within 0-60");
+        assert_eq!(parse("balance_unpicked=many").1.len(), 1);
+        assert!(summary(&Config::default()).contains("balance_unpicked=20"));
     }
 
     #[test]
