@@ -102,6 +102,10 @@ pub struct Config {
     pub stat_prior: bool,
     /// ... or the save's own matches decide (`auto`, the default).
     pub stat_prior_auto: bool,
+    /// The players' abilities in the model (2.11.0, `skills`; on by default - the user: 「你帮我直接启用就行」), or the
+    /// save's own matches decide (`auto`).
+    pub skills: bool,
+    pub skills_auto: bool,
     /// Newer matches count more: a match this many competition matches older counts half
     /// (`None`: all alike)...
     pub recency: Option<f32>,
@@ -181,6 +185,8 @@ impl Default for Config {
             lol_prior_auto: true,
             stat_prior: true,
             stat_prior_auto: true,
+            skills: true,
+            skills_auto: false,
             recency: None,
             recency_auto: true,
             reworked: Vec::new(),
@@ -233,6 +239,8 @@ impl Config {
             lol_prior_auto: self.lol_prior_auto,
             stat_prior: self.stat_prior,
             stat_prior_auto: self.stat_prior_auto,
+            skills: self.skills,
+            skills_auto: self.skills_auto,
             recency: self.recency,
             recency_auto: self.recency_auto,
             ..crate::meta::Settings::default()
@@ -347,6 +355,14 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "stats" if value.trim().eq_ignore_ascii_case("auto") => {
             cfg.stat_prior = true;
             cfg.stat_prior_auto = true;
+        }
+        "skills" if value.trim().eq_ignore_ascii_case("auto") => {
+            cfg.skills = true;
+            cfg.skills_auto = true;
+        }
+        "skills" => {
+            cfg.skills = flag(value)?;
+            cfg.skills_auto = false;
         }
         "stats" => {
             cfg.stat_prior = flag(value)?;
@@ -552,7 +568,7 @@ fn reload(path: &PathBuf) {
 pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
-         lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
+         lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
          balance_skip=[{}] item_balance_skip=[{}]",
@@ -569,6 +585,11 @@ pub fn summary(c: &Config) -> String {
         c.solo_weight,
         if c.lol_prior_auto { "auto".to_string() } else { c.lol_prior.to_string() },
         match (c.stat_prior_auto, c.stat_prior) {
+            (true, _) => "auto",
+            (false, true) => "on",
+            (false, false) => "off",
+        },
+        match (c.skills_auto, c.skills) {
             (true, _) => "auto",
             (false, true) => "on",
             (false, false) => "off",
@@ -780,6 +801,14 @@ lol_prior=auto
 ; 英雄从自己的属性出发（攻击、法强、生命、护甲、魔抗、移速及其成长，和同类英雄比）：模型从比赛里学
 ; 每项属性值多少胜率，比赛少的英雄按属性相近的英雄的表现估计。auto = 用最新的比赛检验开 / 关哪个更准；on / off。
 stats=auto
+; skills : the players' abilities (from each match record: their abilities and lane rating at the
+;          match) in the model, so a champion the strongest teams play is not rated up for their
+;          players: the tier list and the balance read the champion's own strength. on (default) /
+;          off / auto (on when that predicts the save's newest matches better).
+; skills : 把选手能力值（每场比赛记录里选手当时的各项能力和位置评分）放进模型，强队常用的英雄不会因为
+;          选手强而被高估：梯队和平衡补丁看的是英雄自己的强度。on（默认）/ off / auto（用最新比赛
+;          检验，更准才开）。
+skills=on
 ; recency : newer matches count more - a match this many competition matches older counts half.
 ;           Hero mods change champions without a new game patch; this lets the model follow them.
 ;           auto = check off / 400 / 1200 against the save's newest matches; off; or a number (50+).

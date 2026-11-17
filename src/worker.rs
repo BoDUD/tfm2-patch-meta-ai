@@ -66,6 +66,8 @@ pub struct Choice {
     pub stat_prior: bool,
     /// How much newer matches count (`Settings::recency`).
     pub recency: Option<f32>,
+    /// The players' abilities in the model (2.11.0, `Settings::skills`).
+    pub skills: bool,
     /// The scale on the log-odds for win chances.
     pub scale: f32,
 }
@@ -91,7 +93,10 @@ fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -
             let set = Settings { lol_prior: *w, stat_prior: *s, ..settings.clone() };
             let Some(bt) = meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)) else { continue };
             if best.as_ref().is_none_or(|(_, loss)| bt.log_loss < *loss) {
-                best = Some((Choice { games, lol_prior: *w, stat_prior: *s, recency: settings.recency, scale: bt.scale }, bt.log_loss));
+                best = Some((
+                    Choice { games, lol_prior: *w, stat_prior: *s, recency: settings.recency, skills: settings.skills, scale: bt.scale },
+                    bt.log_loss,
+                ));
             }
         }
     }
@@ -99,7 +104,7 @@ fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -
     // then how much newer matches should count, with the rest as chosen
     if settings.recency_auto {
         for half in RECENCY_CHOICES {
-            let set = Settings { lol_prior: choice.lol_prior, stat_prior: choice.stat_prior, recency: half, ..settings.clone() };
+            let set = Settings { lol_prior: choice.lol_prior, stat_prior: choice.stat_prior, recency: half, skills: choice.skills, ..settings.clone() };
             if half == settings.recency {
                 continue;
             }
@@ -109,14 +114,31 @@ fn calibrate(inputs: &Inputs<'_>, settings: &Settings, last: &mut Calibration) -
             }
         }
     }
+    // then the players' abilities, on or off (2.11.0, `skills=auto`)
+    if settings.skills_auto {
+        let set = Settings {
+            lol_prior: choice.lol_prior,
+            stat_prior: choice.stat_prior,
+            recency: choice.recency,
+            skills: !choice.skills,
+            ..settings.clone()
+        };
+        if let Some(bt) = meta::backtest(&Inputs { warm: None, ..*inputs }, &set, holdout(games)) {
+            if bt.log_loss < loss {
+                choice = Choice { skills: !choice.skills, scale: bt.scale, ..choice };
+            }
+        }
+    }
     crate::diag::log(&format!(
-        "[model] held-out check ({games} matches): lol_prior {}{}, stats {}{}, recency {}{}, win chances scaled by {:.2}",
+        "[model] held-out check ({games} matches): lol_prior {}{}, stats {}{}, recency {}{}, skills {}{}, win chances scaled by {:.2}",
         choice.lol_prior,
         if settings.lol_prior_auto { " (auto)" } else { "" },
         if choice.stat_prior { "on" } else { "off" },
         if settings.stat_prior_auto { " (auto)" } else { "" },
         choice.recency.map_or("off".to_string(), |h| format!("{h:.0}")),
         if settings.recency_auto { " (auto)" } else { "" },
+        if choice.skills { "on" } else { "off" },
+        if settings.skills_auto { " (auto)" } else { "" },
         choice.scale
     ));
     *last = Some(choice);
@@ -142,10 +164,12 @@ fn run(job: Job, warm: Option<&Meta>, calibration: &mut Calibration) -> Done {
         settings.lol_prior = c.lol_prior;
         settings.stat_prior = c.stat_prior;
         settings.recency = c.recency;
+        settings.skills = c.skills;
     }
     let mut meta = meta::build(&inputs, &settings);
     meta.lol_prior_chosen = chosen.is_some() && job.settings.lol_prior_auto;
     meta.stat_prior_chosen = chosen.is_some() && job.settings.stat_prior_auto;
+    meta.skills_chosen = chosen.is_some() && job.settings.skills_auto;
     meta.calibration = chosen.map(|c| c.scale);
     let backtest = if job.backtest {
         meta::backtest(&Inputs { warm: None, ..inputs }, &settings, holdout(job.games.len()))

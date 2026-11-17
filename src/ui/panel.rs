@@ -495,6 +495,20 @@ fn model_page(meta: &Meta, context: &Context) -> Page {
     if meta.open_slot.is_some() {
         rows.push(vec![("Composition 阵容缺口".into(), DIM), (gaps.join(" · "), TEXT)]);
     }
+    // the players' abilities (2.11.0): what one standard deviation of each is worth to its side, in win-rate points
+    match meta.skill_norms {
+        Some(_) => {
+            let mut weights: Vec<(usize, f32)> = meta.skill_weights.iter().map(|e| e.value).enumerate().collect();
+            weights.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let list: Vec<String> =
+                weights.iter().map(|(k, w)| format!("{} {}", crate::history::SKILL_NAMES_ZH[*k], signed(pts(*w)))).collect();
+            rows.push(vec![
+                ("Players 选手能力".into(), DIM),
+                (format!("{}{}", list.join(" · "), if meta.skills_chosen { " (auto)" } else { "" }), TEXT),
+            ]);
+        }
+        None => rows.push(vec![("Players 选手能力".into(), DIM), ("not in the model (skills=off, or no match with abilities yet) / 未用".into(), DIM)]),
+    }
     match &context.backtest {
         Some(bt) => {
             rows.push(vec![

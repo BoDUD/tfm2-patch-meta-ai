@@ -260,6 +260,7 @@ impl Scanner {
                     role: p.position.as_deref().and_then(Role::parse),
                     athlete: p.athlete,
                     lane_gold: p.lane_gold,
+                    skills: p.skills,
                 })
                 .collect()
         };
@@ -400,7 +401,7 @@ pub(crate) mod tests {
     #[test]
     fn match_keys_stay_as_the_history_files_know_them() {
         use std::hash::{Hash, Hasher};
-        let player = |c: &str| Player { champion: c.into(), position: None, athlete: None, lane_gold: None };
+        let player = |c: &str| Player { champion: c.into(), position: None, athlete: None, lane_gold: None, skills: None };
         let m = MatchSummary {
             version: "1.3".into(),
             blue_win: true,
