@@ -71,7 +71,9 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
          win%   = estimated win rate this patch with average team-mates and players, +- one sd\n\
          prev   = the same in the patch before\n\
          games  = this patch (competition) / kept patches; recent = tier evidence\n\
-         lanes  = estimated win rate in each lane (Top Jungle Mid Bottom Support), - = never played there\n\n",
+         lanes  = estimated win rate in each lane (Top Jungle Mid Bottom Support), - = never played there\n\
+         players / allies = in its kept games, how much stronger its side's players (by their abilities) and its\n\
+                  side's other champions were than the other side's (win-rate points): what its plain win rate owes them\n\n",
         crate::MOD_ID,
         crate::VERSION,
         meta.current,
@@ -79,8 +81,8 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
         balance_line(labels),
     );
     out.push_str(&format!(
-        "{:<22} {:>4} {:>12} {:>6} {:>11} {:>6} {:>5} {:>5}  {:<29} {}\n",
-        "champion", "tier", "win%", "prev", "games", "recent", "pick", "ban", "lanes T/J/M/B/S", "patch"
+        "{:<22} {:>4} {:>12} {:>6} {:>11} {:>6} {:>5} {:>5} {:>7} {:>6}  {:<29} {}\n",
+        "champion", "tier", "win%", "prev", "games", "recent", "pick", "ban", "players", "allies", "lanes T/J/M/B/S", "patch"
     ));
     for c in rows {
         let lanes: Vec<String> = Role::ALL
@@ -94,7 +96,7 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
             })
             .collect();
         out.push_str(&format!(
-            "{:<22} {:>4} {:>6.1}+-{:<4.1} {:>6} {:>11} {:>6.1} {:>4.0}% {:>4.0}%  {:<29} {}\n",
+            "{:<22} {:>4} {:>6.1}+-{:<4.1} {:>6} {:>11} {:>6.1} {:>4.0}% {:>4.0}% {:>7} {:>6}  {:<29} {}\n",
             crate::diag::clip(&labels.champion(&c.name), 22),
             tiers.get(&c.name).map_or("-", |t| t.as_str()),
             c.win_rate() * 100.0,
@@ -104,6 +106,8 @@ pub fn table(meta: &Meta, tiers: &HashMap<String, Tier>, labels: &Labels, summar
             c.evidence,
             c.pick_rate * 100.0,
             c.ban_rate * 100.0,
+            c.pilots.map_or("-".to_string(), |x| format!("{:+.1}", (sigmoid(x) - 0.5) * 100.0)),
+            c.allies.map_or("-".to_string(), |x| format!("{:+.1}", (sigmoid(x) - 0.5) * 100.0)),
             lanes.join("/"),
             match &c.last_change {
                 Some((v, d)) => format!("{} {v}", if *d > 0 { "buff" } else { "nerf" }),

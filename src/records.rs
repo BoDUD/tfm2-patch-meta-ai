@@ -32,6 +32,19 @@ pub struct Player {
     pub athlete: Option<u32>,
     /// Gold at the end of the lane phase.
     pub lane_gold: Option<i32>,
+    /// The player's abilities at the match and its rating of the lane it played (2.11.0, `history::Skills`).
+    pub skills: Option<crate::history::Skills>,
+}
+
+/// A player's abilities (`stat.aggressive` ... `stat.skill_hit`, `history::SKILL_KEYS`), the lane's rating left at
+/// 100 until the lane is known ([`players`]). None: the record has no abilities.
+fn abilities(map: &Map<String, Value>) -> Option<crate::history::Skills> {
+    let stat = map.get("stat")?.as_object()?;
+    let mut out = [100u8; crate::history::SKILLS];
+    for (slot, key) in out.iter_mut().zip(crate::history::SKILL_KEYS) {
+        *slot = stat.get(key)?.as_f64()?.round().clamp(0.0, 255.0) as u8;
+    }
+    Some(out)
 }
 
 const LANES: [&str; 5] = ["Top", "Jungle", "Mid", "Bottom", "Support"];
@@ -368,6 +381,13 @@ pub fn players(team: &Value) -> Vec<Player> {
     let mut ratings = Vec::new();
     collect_players(team, &mut out, &mut ratings, 0);
     assign_lanes(&mut out, &ratings);
+    // the abilities' last number: the player's rating of the lane it played (2.11.0)
+    for (p, r) in out.iter_mut().zip(&ratings) {
+        let lane = p.position.as_deref().and_then(crate::history::Role::parse);
+        if let (Some(skills), Some(r), Some(lane)) = (p.skills.as_mut(), r, lane) {
+            skills[crate::history::SKILLS - 1] = r[lane.index()].round().clamp(0.0, 255.0) as u8;
+        }
+    }
     out
 }
 
@@ -413,7 +433,7 @@ fn player(map: &Map<String, Value>) -> Option<Player> {
         .find_map(|k| map.get(*k))
         .and_then(label);
     let athlete = ["athlete", "athlete_id"].iter().find_map(|k| map.get(*k)).and_then(id);
-    Some(Player { champion, position, athlete, lane_gold: None })
+    Some(Player { champion, position, athlete, lane_gold: None, skills: abilities(map) })
 }
 
 /// Lane labels: `"Top"`, or a unit enum written as `{"Top": null}`, or an index.
@@ -545,7 +565,7 @@ mod tests {
         assert_eq!(m.red.len(), 5);
         assert_eq!(
             m.blue[0],
-            Player { champion: "fighter".into(), position: Some("Top".into()), athlete: Some(1), lane_gold: Some(3101) }
+            Player { champion: "fighter".into(), position: Some("Top".into()), athlete: Some(1), lane_gold: Some(3101), skills: None }
         );
         assert_eq!(m.blue[4].lane_gold, Some(1326));
         assert_eq!(m.red[0].lane_gold, None, "no performance for red");
@@ -571,8 +591,8 @@ mod tests {
         let Parsed::Match(m) = parse_record(json, false) else { panic!() };
         assert_eq!(m.version, "2.10");
         assert!(!m.blue_win && m.searched);
-        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()), athlete: None, lane_gold: None }]);
-        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()), athlete: None, lane_gold: None }]);
+        assert_eq!(m.blue, [Player { champion: "fighter".into(), position: Some("Top".into()), athlete: None, lane_gold: None, skills: None }]);
+        assert_eq!(m.red, [Player { champion: "ninja".into(), position: Some("1".into()), athlete: None, lane_gold: None, skills: None }]);
         assert_eq!(m.bans, [Vec::<String>::new(), Vec::new()], "bans inside a team are not read");
     }
 
@@ -637,5 +657,25 @@ mod tests {
         assert!(same_version_shape("1.3", "12.10"));
         assert!(!same_version_shape("1.3", "1.3.1"));
         assert!(!same_version_shape("1.3", "Season"));
+    }
+
+    #[test]
+    fn a_players_abilities_and_lane_rating_are_read() {
+        let stat = |top: u32, mid: u32| {
+            serde_json::json!({"aggressive": 61, "concentration": 62, "control_speed": 53, "ego": 70, "judgement": 43,
+                "last_hit": 60, "mental": 60, "order": 48, "positioning": 44, "roaming": 30, "skill_avoid": 54, "skill_hit": 51,
+                "top": top, "jungle": 0, "mid": mid, "bottom": 0, "support": 0, "language": {"5": 100}})
+        };
+        let team = serde_json::json!([
+            {"champion": "fighter", "position": "Top", "athlete_id": 1, "stat": stat(80, 0)},
+            {"champion": "ninja", "position": "Mid", "athlete_id": 2, "stat": stat(30, 90)},
+            {"champion": "archer", "position": "Mid", "athlete_id": 3},
+        ]);
+        let players = players(&team);
+        let skills = players[0].skills.expect("abilities");
+        assert_eq!(&skills[..12], &[61, 62, 53, 70, 43, 60, 60, 48, 44, 30, 54, 51]);
+        assert_eq!(skills[12], 80, "its rating of the lane it played");
+        assert_eq!(players[1].skills.unwrap()[12], 90);
+        assert_eq!(players[2].skills, None, "a player without abilities");
     }
 }

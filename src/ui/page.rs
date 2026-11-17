@@ -266,10 +266,12 @@ pub enum Sort {
     Pick,
     Ban,
     Presence,
+    /// What its games leaned on (2.11.0): its side's players and champions over the other side's.
+    Lean,
 }
 
 /// The table's columns: (sort key or none, x, width, heading).
-const COLUMNS: [(Option<Sort>, i32, u32); 11] = [
+const COLUMNS: [(Option<Sort>, i32, u32); 12] = [
     (Some(Sort::Rank), 0, 68),
     (None, 68, 260),
     (Some(Sort::Tier), 328, 72),
@@ -279,11 +281,12 @@ const COLUMNS: [(Option<Sort>, i32, u32); 11] = [
     (Some(Sort::Pick), 830, 100),
     (Some(Sort::Ban), 930, 100),
     (Some(Sort::Presence), 1030, 120),
-    (None, 1150, 300),
-    (None, 1450, 150),
+    (Some(Sort::Lean), 1150, 140),
+    (None, 1290, 180),
+    (None, 1470, 130),
 ];
 
-const SORT_IDS: [(Sort, &str); 8] = [
+const SORT_IDS: [(Sort, &str); 9] = [
     (Sort::Rank, "rank"),
     (Sort::Tier, "tier"),
     (Sort::Win, "win"),
@@ -292,6 +295,7 @@ const SORT_IDS: [(Sort, &str); 8] = [
     (Sort::Pick, "pick"),
     (Sort::Ban, "ban"),
     (Sort::Presence, "presence"),
+    (Sort::Lean, "lean"),
 ];
 
 const TABS: [(&str, &str, &str); 5] = [
@@ -907,6 +911,7 @@ impl MetaPage {
                 Sort::Pick => r.c.pick_rate,
                 Sort::Ban => r.c.ban_rate,
                 Sort::Presence => r.c.presence(),
+                Sort::Lean => r.c.pilots.unwrap_or(0.0) + r.c.allies.unwrap_or(0.0),
             }
         };
         rows.sort_by(|a, b| {
@@ -1081,7 +1086,7 @@ fn champions_source<U: Ui>(t: &mut Texts<'_, U>, lane: Option<Role>) -> String {
         8 + 76 + 52 * 5,
         color(BORDER)
     );
-    let headings: [String; 11] = [
+    let headings: [String; 12] = [
         "#".into(),
         "#asset/base/text/ui?statistics.champion_name".into(),
         "#asset/base/text/ui?statistics.tier".into(),
@@ -1091,6 +1096,7 @@ fn champions_source<U: Ui>(t: &mut Texts<'_, U>, lane: Option<Role>) -> String {
         t.get("col_pick", "Pick"),
         t.get("col_ban", "Ban"),
         t.get("col_presence", "Contest Rate"),
+        t.get("col_lean", "Players / Allies"),
         t.get("col_lanes", "Best Lanes"),
         t.get("col_patch", "Last Change"),
     ];
@@ -1108,19 +1114,25 @@ fn champions_source<U: Ui>(t: &mut Texts<'_, U>, lane: Option<Role>) -> String {
         }
     }
     let note = t.get("note_win", "Power win rate: how often a team wins with this champion this patch, its team-mates and players being average.");
+    // the players / allies column's note (2.11.0), a line of its own: a label shows one whole text reference
+    let lean_note = t.get(
+        "note_lean",
+        "Players / Allies: in its games, how much its side's players (by their abilities) and its side's other champions were stronger than the other side's, in win-rate points - what its plain win rate owes them.",
+    );
     format!(
         "{lane_bar}#data:color {{ y: 52px; width: 1600px; height: 916px; color: {}; rounding: Uniform {{ rounding: 12; }} \
          #header:color {{ width: 1600px; height: 56px; color: {}; rounding: Individual {{ top_left: 12; top_right: 12; }} {header}}} \
-         #list:scroll_view {{ y: 56px; width: 1600px; height: 828px; speed: 100; bar_width: 4; bar_padding: {{ bottom: 12px; }} \
+         #list:scroll_view {{ y: 56px; width: 1600px; height: 806px; speed: 100; bar_width: 4; bar_padding: {{ bottom: 12px; }} \
          bar: {{ source: \"asset/base/sprite/white\"; color: {}; hover: {{ color: #ecfbf8ff; }} }} \
          back: {{ source: \"asset/base/sprite/white\"; color: {}; }} \
          #contents:empty {{ width: 1600px; height: {ROW_PITCH}px; child_type: TopToBottom {{ spacing: 4px; }} }} }} \
-         {}}} ",
+         {}{}}} ",
         color(PANEL),
         color(HEADER),
         color(ACCENT),
         color(BORDER),
-        label("note", 21, 886, 1560, 24, 13, DIM, "Left", &note)
+        label("note", 21, 864, 1560, 24, 13, DIM, "Left", &note),
+        label("lean_note", 21, 888, 1560, 24, 13, DIM, "Left", &lean_note)
     )
 }
 
@@ -1144,18 +1156,21 @@ fn row_source(i: usize) -> String {
         label("pick", 851, 18, 80, 20, 18, TEXT, "Left", ""),
         label("ban", 951, 18, 80, 20, 18, TEXT, "Left", ""),
         label("presence", 1051, 18, 90, 20, 18, TEXT, "Left", ""),
+        // what its games leaned on (2.11.0): its side's players, its side's other champions (win-rate points)
+        label("pl", 1171, 18, 56, 20, 16, TEXT, "Left", ""),
+        label("al", 1229, 18, 56, 20, 16, DIM, "Left", ""),
         // best lanes: up to three lane icons with their win rate
         format!(
-            "#lanes:empty {{ x: 1171px; y: 0px; width: 280px; height: 56px; ignore_event: true; {}{}{}{}{}{} }} ",
+            "#lanes:empty {{ x: 1300px; y: 0px; width: 170px; height: 56px; ignore_event: true; {}{}{}{}{}{} }} ",
             image("i0", 0, 19, 18, "asset/base/ui/icons/top", 0xc2c6ceff),
-            label("t0", 22, 18, 64, 20, 16, TEXT, "Left", ""),
-            image("i1", 92, 19, 18, "asset/base/ui/icons/top", 0xc2c6ceff),
-            label("t1", 114, 18, 64, 20, 16, TEXT, "Left", ""),
-            image("i2", 184, 19, 18, "asset/base/ui/icons/top", 0xc2c6ceff),
-            label("t2", 206, 18, 64, 20, 16, TEXT, "Left", "")
+            label("t0", 20, 18, 36, 20, 15, TEXT, "Left", ""),
+            image("i1", 57, 19, 18, "asset/base/ui/icons/top", 0xc2c6ceff),
+            label("t1", 77, 18, 36, 20, 15, TEXT, "Left", ""),
+            image("i2", 114, 19, 18, "asset/base/ui/icons/top", 0xc2c6ceff),
+            label("t2", 134, 18, 36, 20, 15, TEXT, "Left", "")
         ),
-        image("pi", 1471, 18, 20, "asset/base/ui/icons/up_patch", GOOD),
-        label("patch", 1497, 18, 100, 20, 16, DIM, "Left", ""),
+        image("pi", 1478, 18, 20, "asset/base/ui/icons/up_patch", GOOD),
+        label("patch", 1502, 18, 96, 20, 16, DIM, "Left", ""),
     ]
     .concat();
     format!(
@@ -1172,6 +1187,14 @@ fn fill_row(ui: &mut impl Ui, i: usize, r: &RowData<'_>) {
     let c = r.c;
     ui.set_visible(&format!("{LIST}.r{i}"), true);
     ui.set_text(&p("rank"), &(i + 1).to_string());
+    // what its games leaned on (2.11.0): its side's players over the other side's by their abilities, its side's other
+    // champions over the other side's - win-rate points; red where its plain win rate owes them much
+    let points = |v: Option<f32>| v.map_or("-".to_string(), |x| format!("{:+.1}", (sigmoid(x) - 0.5) * 100.0));
+    ui.set_text(&p("pl"), &points(c.pilots));
+    ui.set_text(&p("al"), &points(c.allies));
+    let lean = (sigmoid(c.pilots.unwrap_or(0.0) + c.allies.unwrap_or(0.0)) - 0.5) * 100.0;
+    let lean_tone = if lean >= 3.0 { 0xef6471ff } else if lean <= -3.0 { 0x4cc38aff } else { TEXT };
+    ui.set_properties(&p("pl"), &format!("color: {};", color(lean_tone)));
     ui.set_champion_icon(&p("face.icon"), &c.name, 36.0);
     ui.set_text(&p("name"), &name_ref(&c.name));
     match r.tier {

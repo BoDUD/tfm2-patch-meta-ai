@@ -16,6 +16,10 @@
 //!   effects (Rapid Firecannon's range, Guardian Angel's revive ...) stay as they are, and the numbers a buff can only
 //!   add (penetration, tenacity ...: unsigned fields) are never taken away.
 //! - **The tooltips** stay the pack's own: they show an item's numbers before the patch (the patch notes give both).
+//! - **The notes' icons** (2.11.0; the user, 2026-11-17: 「装备补丁能不能把图片也补进去 现在单纯只有文字」): the
+//!   catalog names each item's icon (`icon`, a frame of the game's item icon sheet, which the pack replaces with its
+//!   own); the item news draws it in front of the item's name, the way the game's texts draw its stat icons
+//!   (`<i#sheet:frame>`, [`icon_text`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -37,6 +41,19 @@ pub const OWNED: &str = "item_owned_";
 pub const CORRECTION: &str = "patch_meta_ai_item_";
 /// The tier of finished items (the pack's `item_t5_...`; components are 1-4).
 pub const FINISHED: u32 = 5;
+/// The game's item icon sheet; the pack overrides it with its own, whose frames the catalog's `icon` names.
+pub const ICON_SHEET: &str = "asset/base/aseprite_resources/ingame/item_icons_18x18";
+
+/// An item's icon in a text, drawn the way the game's texts draw its stat icons (`<i#sheet:frame>`). Empty when the
+/// item names no icon (or a name a text tag cannot hold).
+pub fn icon_text(icon: &str) -> String {
+    let fits = !icon.is_empty() && icon.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if fits {
+        format!("<i#{ICON_SHEET}:{icon}>")
+    } else {
+        String::new()
+    }
+}
 
 macro_rules! stat_table {
     ($( ($field:ident, $signed:expr, $zh:expr, $en:expr) ),* $(,)?) => {
@@ -150,6 +167,8 @@ pub struct Item {
     pub equipment: bool,
     /// Its numbers: (index in [`STATS`], value).
     pub stats: Vec<(usize, f64)>,
+    /// Its icon's frame in [`ICON_SHEET`] (empty: none named).
+    pub icon: String,
 }
 
 impl Item {
@@ -191,6 +210,8 @@ struct RawItem {
     item_kind: String,
     #[serde(rename = "packageValues", default)]
     package_values: Option<RawValues>,
+    #[serde(default)]
+    icon: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -216,7 +237,7 @@ impl Catalog {
                 .map(|m| m.iter().filter_map(|(k, v)| Some((stat_index(k)?, v.as_f64()?))).filter(|(_, v)| *v != 0.0).collect())
                 .unwrap_or_default();
             cat.by_key.insert(key.clone(), cat.items.len());
-            cat.items.push(Item { key, name: it.name, tier, equipment: it.item_kind == "equipment", stats });
+            cat.items.push(Item { key, name: it.name, tier, equipment: it.item_kind == "equipment", stats, icon: it.icon });
         }
         (!cat.items.is_empty()).then_some(cat)
     }
@@ -518,6 +539,7 @@ mod tests {
         {"gameKey": "item_t1_0_0_0_0_0_0_0", "name": "十字镐", "tier": 1, "itemKind": "equipment",
          "packageValues": {"stats": {"attack": 25}}},
         {"gameKey": "item_t5_134_1_2_101_0_0_0", "name": "黑色切割者", "tier": 5, "itemKind": "equipment",
+         "icon": "i_t5_134_1_2_101_0_0_0",
          "packageValues": {"stats": {"attack": 40, "hp": 400, "skill_cooldown_mult": 20}}},
         {"gameKey": "item_t5_213456_0_0_101_0_0_0", "name": "甲", "tier": 5, "itemKind": "equipment",
          "packageValues": {"stats": {"hp": 300}}},
@@ -542,6 +564,11 @@ mod tests {
         let (i, bc) = cat.item("item_t5_134_1_2_101_0_0_0").unwrap();
         assert_eq!((i, bc.name.as_str(), bc.tier, bc.finished()), (1, "黑色切割者", 5, true));
         assert_eq!(bc.stats.len(), 3);
+        assert_eq!(bc.icon, "i_t5_134_1_2_101_0_0_0");
+        assert_eq!(icon_text(&bc.icon), "<i#asset/base/aseprite_resources/ingame/item_icons_18x18:i_t5_134_1_2_101_0_0_0>");
+        assert_eq!(cat.item("item_t1_0_0_0_0_0_0_0").unwrap().1.icon, "", "no icon named");
+        assert_eq!(icon_text(""), "");
+        assert_eq!(icon_text("a>b"), "", "nothing a text tag cannot hold");
         assert!(!cat.item("item_t1_0_0_0_0_0_0_0").unwrap().1.finished(), "a part");
         assert!(!cat.item("runes0_0_0_2").unwrap().1.finished(), "a rune");
         assert!(Catalog::parse("{}").is_none() && Catalog::parse("not json").is_none());
@@ -698,6 +725,13 @@ mod tests {
             .filter(|i| used.contains(&cat.items[*i].key))
             .count();
         println!("{} item buff names in the DLL: {known} told apart by the name alone, {finished_used} of them items the builds use", names.len());
+        // the notes' icons (2.11.0): every finished item the builds use names a frame of the pack's icon sheet
+        let sheet = std::fs::read_to_string(dir.join(ITEMS_MOD).join("aseprite_resources/ingame/item_icons_640X640#data.sprite_sheet")).unwrap();
+        let frames: serde_json::Value = serde_json::from_str(sheet.trim_start_matches('\u{feff}')).unwrap();
+        let frames = frames["images"].as_object().unwrap();
+        let missing: Vec<&String> = used.iter().filter(|k| !frames.contains_key(&cat.item(k).unwrap().1.icon)).copied().collect();
+        println!("icons: {} of {} built items have a frame in the pack's sheet", used.len() - missing.len(), used.len());
+        assert!(missing.is_empty(), "built items without an icon frame: {missing:?}");
         // the items the builds use, as a match will see them: a buff named by the key cut to 20 characters (the pack
         // makes most names as it goes, not from the DLL's list), with the item's own numbers
         let (mut by_name, mut by_numbers, mut lost) = (0, 0, Vec::new());

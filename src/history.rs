@@ -110,7 +110,19 @@ pub struct Slot {
     pub athlete: Option<u32>,
     /// Gold at the end of the lane phase.
     pub lane_gold: Option<i32>,
+    /// The player's abilities in this match ([`SKILL_KEYS`], then its rating of the lane it played), as the match
+    /// record gives them (2.11.0; None: a record or a kept match without them).
+    pub skills: Option<Skills>,
 }
+
+/// The abilities a match record gives each player (the athlete's `stat` as it was at the match).
+pub const SKILL_KEYS: [&str; 12] =
+    ["aggressive", "concentration", "control_speed", "ego", "judgement", "last_hit", "mental", "order", "positioning", "roaming", "skill_avoid", "skill_hit"];
+pub const SKILL_NAMES_ZH: [&str; SKILLS] =
+    ["攻击性", "专注", "操作", "自我", "判断", "补刀", "心态", "指挥", "站位", "游走", "躲技能", "命中", "位置评分"];
+/// The abilities and the rating of the lane played (100 = the player's main lane).
+pub const SKILLS: usize = 13;
+pub type Skills = [u8; SKILLS];
 
 /// Team-strategy choices ("setting=option") <-> small ids, shared by every save and thread.
 static TACTICS: Mutex<Option<Names>> = Mutex::new(None);

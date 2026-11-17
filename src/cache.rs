@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,9 @@ struct Stored {
     b: [Vec<String>; 2],
     x: [Vec<String>; 2],
     l: Option<f32>,
+    /// The players' abilities at the match (2.11.0, `history::Skills`), side by side as `p`; absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    a: Option<[Vec<Option<Vec<u8>>>; 2]>,
 }
 
 /// A save's name in the mod's files: the player's team id and a hash of its name.
@@ -92,6 +96,9 @@ pub fn encode<'a>(games: impl Iterator<Item = (&'a u64, &'a Game)>, names: &Name
                     .collect()
             }),
             l: g.length,
+            a: g.sides.iter().flatten().any(|s| s.skills.is_some()).then(|| {
+                [0, 1].map(|side| g.sides[side].iter().map(|s| s.skills.map(|k| k.to_vec())).collect())
+            }),
         })
         .collect();
     // newest last: keep the tail
@@ -103,20 +110,76 @@ pub fn encode<'a>(games: impl Iterator<Item = (&'a u64, &'a Game)>, names: &Name
 
 /// The matches in a file (record ids 0: they are older than anything the save lists now).
 pub fn decode(text: &str, names: &mut Names) -> Vec<(u64, Game)> {
-    let Ok(file) = serde_json::from_str::<File>(text) else { return Vec::new() };
-    if file.v != 1 {
-        return Vec::new();
+    parse(text).map(|p| build(p, names)).unwrap_or_default()
+}
+
+/// A history file parsed (its champions still names: [`build`] gives them the save's ids).
+pub struct Parsed(File);
+
+/// A history file's text parsed (None: not a history file of this format).
+pub fn parse(text: &str) -> Option<Parsed> {
+    let file = serde_json::from_str::<File>(text).ok()?;
+    (file.v == 1).then_some(Parsed(file))
+}
+
+/// A history file read and parsed on a thread of its own (2.11.0; the user, 2026-11-17: 「主界面读取数据的时候卡顿
+/// 优化了吧？」): the files are on the game's disk - on the user's a hard disk, where the 8.6 MB file of a long
+/// career held the frame it was read in for about half a second. Tests read it at once.
+pub struct Loading {
+    slot: Arc<Mutex<Option<Option<Parsed>>>>,
+}
+
+impl Loading {
+    pub fn start(path: PathBuf) -> Self {
+        let slot = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&slot);
+        let work = move || {
+            let parsed = std::fs::read_to_string(&path).ok().and_then(|text| parse(&text));
+            *out.lock().unwrap_or_else(PoisonError::into_inner) = Some(parsed);
+        };
+        if cfg!(test) {
+            work();
+        } else if let Err(err) = std::thread::Builder::new().name(format!("{}-history-read", crate::MOD_ID)).spawn(work) {
+            crate::diag::log(&format!("[cache] could not start the thread that reads the history file: {err}"));
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(None);
+        }
+        Loading { slot }
     }
-    file.games
+
+    /// One whose read never ends (tests).
+    pub fn pending() -> Self {
+        Loading { slot: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The file once read (`Some(None)`: missing, or not a history file); None while it is being read.
+    pub fn take(&self) -> Option<Option<Parsed>> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+/// A parsed file's matches, their champions given the save's ids.
+pub fn build(parsed: Parsed, names: &mut Names) -> Vec<(u64, Game)> {
+    parsed
+        .0
+        .games
         .into_iter()
         .map(|s| {
+            let skills = s.a;
+            let mut side_index = 0;
             let sides = s.p.map(|side| {
+                let kept = skills.as_ref().map(|a| &a[side_index]);
+                side_index += 1;
                 side.into_iter()
-                    .map(|(c, lane, athlete, gold)| Slot {
+                    .enumerate()
+                    .map(|(i, (c, lane, athlete, gold))| Slot {
                         champ: names.id(&c),
                         role: lane.as_deref().and_then(Role::parse),
                         athlete,
                         lane_gold: gold,
+                        skills: kept
+                            .and_then(|k| k.get(i))
+                            .and_then(|k| k.as_ref())
+                            .and_then(|k| <crate::history::Skills>::try_from(k.as_slice()).ok()),
                     })
                     .collect()
             });
@@ -180,5 +243,40 @@ mod tests {
         let other_save: Vec<u64> = (5000..5030).collect();
         assert!(!confirms(&file, &other_save), "another save with the same team");
         assert!(!confirms(&file, &same[..10]), "too few matches to tell yet");
+    }
+
+    #[test]
+    fn the_players_abilities_are_kept_with_the_matches() {
+        let mut names = Names::default();
+        let mut skills = [70u8; crate::history::SKILLS];
+        skills[0] = 90;
+        let slot = |c: &str, s: Option<crate::history::Skills>, names: &mut Names| Slot {
+            champ: names.id(c),
+            role: Some(Role::Top),
+            athlete: Some(3),
+            lane_gold: None,
+            skills: s,
+        };
+        let game = Game {
+            record: 1,
+            solo: false,
+            version: "1.1".into(),
+            blue_win: true,
+            teams: [None, None],
+            sides: [vec![slot("a", Some(skills), &mut names)], vec![slot("b", None, &mut names)]],
+            bans: [vec![], vec![]],
+            length: None,
+            tactics: Default::default(),
+        };
+        let text = encode([(&5u64, &game)].into_iter(), &names);
+        assert!(text.contains("\"a\":"), "{text}");
+        let back = decode(&text, &mut Names::default());
+        assert_eq!(back[0].1.sides[0][0].skills, Some(skills));
+        assert_eq!(back[0].1.sides[1][0].skills, None);
+        // a file of 2.10.0: no abilities
+        let old = text.replace(&text[text.find(",\"a\":").unwrap()..text.rfind("}]}").unwrap()], "");
+        let back = decode(&old, &mut Names::default());
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].1.sides[0][0].skills, None);
     }
 }

@@ -24,6 +24,15 @@
 //!   from its stats, standardised within its category, times weights every champion shares;
 //!   so a champion seen in few games is rated by what champions with stats like its own did.
 //!
+//! - **players' abilities** (2.11.0; the user, 2026-11-17: 「最好还要能区分出真实的评级 有的英雄强度只是蹭阵容的强度和
+//!   选手属性达到的S级别 因为现在都不开单排 会污染判断」): a match record gives every player's abilities as they were
+//!   at the match (`history::SKILL_KEYS`) and its rating of the lane it played. Each one standardised over the kept
+//!   matches, one weight each shared by every player ([`Key::Skill`]): a few parameters every match speaks to, so the
+//!   model knows how strong each side's players were before it rates the champions - a champion the best teams play
+//!   is not rated up for their players. What remains of the athletes' own effect is what their abilities miss. Each
+//!   champion also says how much its games leaned on its side's players and champions ([`Champion::pilots`],
+//!   [`Champion::allies`]): what its plain win rate has that its rating does not.
+//!
 //! Every parameter has a Gaussian prior, around 0 or - for the League champions, times
 //! `lol_prior` - around what League says (`knowledge`: the champion's competitive tier, the
 //! known combos and counters, what each composition gap costs), so anything seen in few games
@@ -82,6 +91,11 @@ pub struct Settings {
     /// count alike), and whether the held-out matches choose it (`worker`).
     pub recency: Option<f32>,
     pub recency_auto: bool,
+    /// The players' abilities in the model (2.11.0, `skills`; [`Key::Skill`]), whether the held-out matches choose it
+    /// (`worker`), and the prior spread of what a standard deviation of one ability of one player is worth.
+    pub skills: bool,
+    pub skills_auto: bool,
+    pub skill_sd: f32,
 }
 
 impl Default for Settings {
@@ -111,6 +125,9 @@ impl Default for Settings {
             group_sd: 0.1,
             recency: None,
             recency_auto: false,
+            skills: true,
+            skills_auto: false,
+            skill_sd: 0.1,
         }
     }
 }
@@ -136,6 +153,8 @@ pub enum Key {
     StatW(u8),
     /// A category's offset (`stats::POOL`: champions compared with the whole pool).
     Group(u8),
+    /// What a standard deviation of a player's ability is worth (2.11.0, `history::SKILLS`).
+    Skill(u8),
 }
 
 /// Ordered pair key and the sign for "a with/against b".
@@ -203,6 +222,11 @@ pub struct Champion {
     pub drafted: u32,
     /// Where its stats start its strength (log-odds; `None`: stats not used or not known).
     pub from_stats: Option<f32>,
+    /// What its games leaned on (2.11.0, log-odds, averaged over its kept games): how much stronger its side's
+    /// players were than the other side's by their abilities, and its side's other champions than the other side's.
+    /// None: no game with abilities / none at all.
+    pub pilots: Option<f32>,
+    pub allies: Option<f32>,
 }
 
 impl Champion {
@@ -281,6 +305,13 @@ pub struct Meta {
     pub stat_weights: [Effect; FEATURES],
     pub stat_prior: bool,
     pub stat_prior_chosen: bool,
+    /// What a standard deviation of each of a player's abilities is worth (2.11.0), how they were standardised (the
+    /// kept matches' mean and spread; None: abilities not used), the fit's scale on them, and whether the held-out
+    /// matches chose them.
+    pub skill_weights: [Effect; crate::history::SKILLS],
+    pub skill_norms: Option<SkillNorms>,
+    pub skill_scale: f32,
+    pub skills_chosen: bool,
     /// How much the model's log-odds are scaled for win chances: below 1 when the held-out
     /// matches show it too sure of itself (`None`: not checked, 1).
     pub calibration: Option<f32>,
@@ -486,8 +517,66 @@ fn side_features(slots: &[crate::history::Slot], profiles: &[Option<Profile>], a
     s.features()
 }
 
-fn game_terms(game: &Game, version: u16, comp: Option<(&[Option<Profile>], &Profile)>, out: &mut Vec<(Key, f32)>) {
+/// How each ability is standardised: the kept matches' mean and standard deviation (2.11.0).
+pub type SkillNorms = [(f32, f32); crate::history::SKILLS];
+
+/// The abilities' means and spreads over the players of `games` (None: no player has them).
+fn skill_norms(games: &[&Game]) -> Option<SkillNorms> {
+    let mut sum = [0f64; crate::history::SKILLS];
+    let mut sq = [0f64; crate::history::SKILLS];
+    let mut n = 0f64;
+    for s in games.iter().flat_map(|g| g.sides.iter().flatten()) {
+        let Some(k) = s.skills else { continue };
+        for i in 0..crate::history::SKILLS {
+            let v = f64::from(k[i]);
+            sum[i] += v;
+            sq[i] += v * v;
+        }
+        n += 1.0;
+    }
+    (n > 0.0).then(|| {
+        let mut out = [(0f32, 1f32); crate::history::SKILLS];
+        for i in 0..crate::history::SKILLS {
+            let mean = sum[i] / n;
+            let var = (sq[i] / n - mean * mean).max(0.0);
+            // a spread under one point (everyone alike) is taken as one
+            out[i] = (mean as f32, (var.sqrt() as f32).max(1.0));
+        }
+        out
+    })
+}
+
+/// One side's players' abilities, standardised and summed (players without them count as average).
+fn side_skills(slots: &[crate::history::Slot], norms: &SkillNorms) -> [f32; crate::history::SKILLS] {
+    let mut out = [0f32; crate::history::SKILLS];
+    for s in slots {
+        if let Some(k) = s.skills {
+            for i in 0..crate::history::SKILLS {
+                out[i] += (f32::from(k[i]) - norms[i].0) / norms[i].1;
+            }
+        }
+    }
+    out
+}
+
+/// `skills`: the abilities' norms and the fit's scale on them (2.11.0).
+fn game_terms(
+    game: &Game,
+    version: u16,
+    comp: Option<(&[Option<Profile>], &Profile)>,
+    skills: Option<(&SkillNorms, f32)>,
+    out: &mut Vec<(Key, f32)>,
+) {
     out.push((Key::Side, 1.0));
+    if let Some((norms, scale)) = skills {
+        let (b, r) = (side_skills(&game.sides[0], norms), side_skills(&game.sides[1], norms));
+        for k in 0..crate::history::SKILLS {
+            let d = b[k] - r[k];
+            if d != 0.0 {
+                out.push((Key::Skill(k as u8), d * scale));
+            }
+        }
+    }
     if let Some((profiles, avg)) = comp {
         let (b, r) = (side_features(&game.sides[0], profiles, avg), side_features(&game.sides[1], profiles, avg));
         for f in 0..COMP_FEATURES {
@@ -567,6 +656,14 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         None => vec![None; champ_count as usize],
     };
 
+    // the players' abilities (2.11.0): standardised over the kept matches; each weight is tied to every match with
+    // them, so the fit sees it scaled as the stat weights are
+    let kept: Vec<&Game> = inp.games.iter().filter(|g| version_index.contains_key(g.version.as_str())).collect();
+    let norms = if set.skills { skill_norms(&kept) } else { None };
+    let skill_games = kept.iter().filter(|g| g.sides.iter().flatten().any(|s| s.skills.is_some())).count();
+    let skill_scale = 1.0 / (skill_games.max(1) as f32).sqrt();
+    let skill_inputs = norms.as_ref().map(|n| (n, skill_scale));
+
     let mut reg = Registry { keys: Vec::new(), index: HashMap::new() };
     // the previous fit's numbering first, so the warm start lines up
     if let Some(warm) = inp.warm {
@@ -600,8 +697,14 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     let scale_of = |key: Key| match key {
         Key::StatW(_) => stat_scale,
         Key::Group(g) => group_scale(g),
+        Key::Skill(_) => skill_scale,
         _ => 1.0,
     };
+    if norms.is_some() {
+        for k in 0..crate::history::SKILLS {
+            reg.id(Key::Skill(k as u8));
+        }
+    }
     if features.iter().any(Option::is_some) {
         for k in 0..FEATURES {
             reg.id(Key::StatW(k as u8));
@@ -659,7 +762,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             *drafted.entry(c).or_default() += 1;
         }
         terms.clear();
-        game_terms(game, vi, comp_inputs, &mut terms);
+        game_terms(game, vi, comp_inputs, skill_inputs, &mut terms);
         let row_terms: Vec<(u32, f32)> = terms.iter().map(|(k, a)| (reg.id(*k), *a)).collect();
         rows.push(Row {
             y: if game.blue_win { 1.0 } else { 0.0 },
@@ -798,6 +901,7 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::Side | Key::Champ(..) | Key::Comp(_) => continue,
             Key::StatW(_) => set.stat_sd / stat_scale,
             Key::Group(g) => set.group_sd / group_scale(*g),
+            Key::Skill(_) => set.skill_sd / skill_scale,
             Key::Role(..) => set.role_sd,
             Key::Athlete(_) => set.athlete_sd,
             Key::Mastery(..) => set.mastery_sd,
@@ -829,6 +933,30 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
         let (e, s) = (effect(key), scale_of(key));
         Effect { value: e.value * s, sd: e.sd * s, ..e }
     };
+
+    // what each champion's games leaned on (2.11.0): its side's players over the other side's by their abilities, and
+    // its side's other champions over the other side's (their strength in the patch of the game)
+    let skill_w: Vec<f32> = (0..crate::history::SKILLS).map(|k| scaled(Key::Skill(k as u8)).value).collect();
+    let mut leaning: HashMap<u16, (f64, u32, f64, u32)> = HashMap::new();
+    for game in &kept {
+        let Some(&vi) = version_index.get(game.version.as_str()) else { continue };
+        let players = norms.as_ref().map(|n| {
+            [0, 1].map(|side| side_skills(&game.sides[side], n).iter().zip(&skill_w).map(|(z, w)| z * w).sum::<f32>())
+        });
+        let with_skills = [0, 1].map(|side| game.sides[side].iter().any(|s| s.skills.is_some()));
+        let champs = [0, 1].map(|side| game.sides[side].iter().map(|s| effect(Key::Champ(s.champ, vi)).value).sum::<f32>());
+        for side in 0..2 {
+            for s in &game.sides[side] {
+                let e = leaning.entry(s.champ).or_default();
+                if let (Some(p), true) = (players, with_skills[0] && with_skills[1]) {
+                    e.0 += f64::from(p[side] - p[1 - side]);
+                    e.1 += 1;
+                }
+                e.2 += f64::from(champs[side] - effect(Key::Champ(s.champ, vi)).value - champs[1 - side]);
+                e.3 += 1;
+            }
+        }
+    }
 
     let mut champions = Vec::with_capacity(champ_count as usize);
     let cur = &per_version[cur_index as usize];
@@ -870,6 +998,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             pick_rate: per_match(picks.get(&c).copied().unwrap_or(0)),
             ban_rate: per_match(bans.get(&c).copied().unwrap_or(0)),
             drafted: drafted.get(&c).copied().unwrap_or(0),
+            pilots: leaning.get(&c).filter(|l| l.1 > 0).map(|l| (l.0 / f64::from(l.1)) as f32),
+            allies: leaning.get(&c).filter(|l| l.3 > 0).map(|l| (l.2 / f64::from(l.3)) as f32),
             from_stats: features[c as usize].as_ref().map(|(g, z)| {
                 z.iter().enumerate().map(|(k, v)| v * scaled(Key::StatW(k as u8)).value).sum::<f32>() + scaled(Key::Group(*g)).value
             }),
@@ -920,6 +1050,9 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
             Key::StatW(k) => {
                 out.stat_weights[k as usize] = scaled(*key);
             }
+            Key::Skill(k) => {
+                out.skill_weights[k as usize] = scaled(*key);
+            }
             _ => {}
         }
     }
@@ -927,6 +1060,8 @@ pub fn build(inp: &Inputs<'_>, set: &Settings) -> Meta {
     out.profiles = profiles;
     out.lol_prior = set.lol_prior;
     out.stat_prior = features.iter().any(Option::is_some);
+    out.skill_norms = norms;
+    out.skill_scale = skill_scale;
     out.lane_priors = lane_priors;
     out.open_slot = open_slot;
     out.athlete_lanes = athlete_lanes;
@@ -993,7 +1128,13 @@ pub fn backtest(inp: &Inputs<'_>, set: &Settings, holdout: usize) -> Option<Back
         terms.clear();
         // a patch the training games never saw is rated as the newest one they did
         let vi = version_index.get(game.version.as_str()).copied().unwrap_or(newest);
-        game_terms(game, vi, fitted.open_slot.as_ref().map(|a| (fitted.profiles.as_slice(), a)), &mut terms);
+        game_terms(
+            game,
+            vi,
+            fitted.open_slot.as_ref().map(|a| (fitted.profiles.as_slice(), a)),
+            fitted.skill_norms.as_ref().map(|n| (n, fitted.skill_scale)),
+            &mut terms,
+        );
         let row: Vec<(u32, f32)> =
             terms.iter().filter_map(|(k, a)| index.get(k).map(|i| (*i, *a))).collect();
         let p = glm::predict(&row, &fitted.beta);
@@ -1059,7 +1200,7 @@ pub(crate) mod tests {
                 part.iter()
                     .zip(who)
                     .enumerate()
-                    .map(|(i, (c, a))| Slot { champ: *c, role: Some(Role::ALL[i]), athlete: Some(*a), lane_gold: None })
+                    .map(|(i, (c, a))| Slot { champ: *c, role: Some(Role::ALL[i]), athlete: Some(*a), lane_gold: None, skills: None })
                     .collect()
             };
             let blue = side(&ids[..5], &athletes[..5]);
@@ -1236,7 +1377,7 @@ pub(crate) mod tests {
                 for r in Role::ALL {
                     // each lane draws from its own 30 champions
                     let champ = (r.index() as f32 * 25.0 + rng.next() * 30.0) as u16 % 130;
-                    sides[side].push(Slot { champ, role: Some(r), athlete: Some(t * 5 + r.index() as u32), lane_gold: None });
+                    sides[side].push(Slot { champ, role: Some(r), athlete: Some(t * 5 + r.index() as u32), lane_gold: None, skills: None });
                 }
             }
             // 13 strategy settings per side, three options each
@@ -1442,7 +1583,7 @@ pub(crate) mod tests {
     fn the_pool_is_who_was_picked_or_banned_in_a_kept_game() {
         let mut names = Names::default();
         let ids: Vec<u16> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n"].iter().map(|n| names.id(n)).collect();
-        let slot = |c: u16| Slot { champ: c, role: None, athlete: None, lane_gold: None };
+        let slot = |c: u16| Slot { champ: c, role: None, athlete: None, lane_gold: None, skills: None };
         let game = |version: &str, picks: &[u16], bans: [Vec<u16>; 2], solo: bool| Game {
             version: version.into(),
             solo,
@@ -1465,5 +1606,86 @@ pub(crate) mod tests {
         assert_eq!((drafted(&m, "m"), drafted(&m, "n")), (0, 0), "only in a patch no longer kept; never seen");
         let all = build(&inp, &Settings::default());
         assert_eq!((drafted(&all, "m"), drafted(&all, "b"), drafted(&all, "n")), (1, 3, 0), "the older patch kept again");
+    }
+
+    /// 2.11.0: 3000 matches in which only the players' abilities decide (one side a team of strong players half the
+    /// time), and champion "x" is played only by strong players - it is no stronger than any other.
+    fn ridden(seed: u64) -> (Names, Vec<Game>) {
+        let mut names = Names::default();
+        for n in NAMES.iter().chain(&["x"]) {
+            names.id(n);
+        }
+        let x = names.get("x").unwrap();
+        let mut rng = Lcg(seed);
+        let mut games = Vec::new();
+        for id in 0..3000 {
+            let mut ids: Vec<u16> = (0..12).collect();
+            for i in (1..ids.len()).rev() {
+                let j = ((rng.next() * (i + 1) as f32) as usize).min(i);
+                ids.swap(i, j);
+            }
+            let strong = [rng.next() < 0.5, rng.next() < 0.5];
+            let side = |part: &[u16], good: bool, base: u32| -> Vec<Slot> {
+                let mut champs = part.to_vec();
+                if good {
+                    champs[0] = x;
+                }
+                champs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let level = if good { 85 } else { 55 };
+                        let mut skills = [level; crate::history::SKILLS];
+                        skills[crate::history::SKILLS - 1] = 100;
+                        Slot { champ: *c, role: Some(Role::ALL[i]), athlete: Some(base + i as u32 + 100 * id), lane_gold: None, skills: Some(skills) }
+                    })
+                    .collect()
+            };
+            let blue = side(&ids[..5], strong[0], 0);
+            let red = side(&ids[5..10], strong[1], 50);
+            let edge = 1.2 * (f32::from(u8::from(strong[0])) - f32::from(u8::from(strong[1])));
+            let blue_win = rng.next() < sigmoid(edge);
+            games.push(Game {
+                record: id as usize,
+                solo: false,
+                version: "1.1".into(),
+                blue_win,
+                teams: [None, None],
+                sides: [blue, red],
+                bans: [vec![], vec![]],
+                length: None,
+                tactics: Default::default(),
+            });
+        }
+        (names, games)
+    }
+
+    #[test]
+    fn a_champion_the_strong_players_play_is_not_rated_up_for_them() {
+        let (names, games) = ridden(31);
+        let champions: Vec<String> = NAMES.iter().chain(&["x"]).map(|s| s.to_string()).collect();
+        let inp = Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: "1.1", warm: None, stats: None, balance: &[] };
+        let base = Settings { lol_prior: 0.0, stat_prior: false, ..Settings::default() };
+        // without the abilities: x carries its players' wins
+        let without = build(&inp, &Settings { skills: false, ..base.clone() });
+        let x_without = without.champion("x").unwrap().strength;
+        assert!(without.skill_norms.is_none());
+        assert!(x_without > 0.3, "x rated up for its players: {x_without}");
+        // with them: the players' strength is theirs, x is an average champion
+        let with = build(&inp, &Settings { skills: true, ..base });
+        let x_with = with.champion("x").unwrap();
+        assert!(with.skill_norms.is_some());
+        assert!(x_with.strength.abs() < 0.15 && x_with.strength < x_without - 0.25, "x {} (without the abilities {x_without})", x_with.strength);
+        // the abilities carry the wins: a team of strong players is two standard deviations of every ability above a
+        // team of weak ones, five players - the 1.2 of the simulation
+        let weight: f32 = with.skill_weights.iter().map(|e| e.value).sum();
+        assert!((weight * 10.0 - 1.2).abs() < 0.4, "{weight}: {:?}", with.skill_weights.iter().map(|e| e.value).collect::<Vec<_>>());
+        // what x's games leaned on: its side's players, by far; an ordinary champion's barely
+        let pilots = x_with.pilots.unwrap();
+        assert!(pilots > 0.5, "{pilots}");
+        assert!(with.champion("a").unwrap().pilots.unwrap().abs() < pilots / 2.0);
+        assert!(x_with.allies.is_some());
+        // the held-out check scores the abilities with the fitted model's own norms
+        assert!(backtest(&inp, &Settings { skills: true, lol_prior: 0.0, stat_prior: false, ..Settings::default() }, 300).is_some());
     }
 }
