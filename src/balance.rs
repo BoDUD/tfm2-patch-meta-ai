@@ -768,7 +768,13 @@ pub fn signed_code(v: i32) -> String {
 
 /// The round's item changes as news of their own (2.9.0; None: it changed no item): a title and a line an item - its
 /// builders' win rate, its step and power, and its numbers before and after (`lines`, [`crate::items::lines`]).
-pub fn item_news(round: &Round, chinese: bool, lines: &dyn Fn(&ItemChange) -> Vec<crate::items::Line>) -> Option<(String, String)> {
+/// `icon`: an item's icon as text ([`crate::items::icon_text`]; empty: none), in front of its name.
+pub fn item_news(
+    round: &Round,
+    chinese: bool,
+    lines: &dyn Fn(&ItemChange) -> Vec<crate::items::Line>,
+    icon: &dyn Fn(&ItemChange) -> String,
+) -> Option<(String, String)> {
     if round.items.is_empty() {
         return None;
     }
@@ -787,8 +793,9 @@ pub fn item_news(round: &Round, chinese: bool, lines: &dyn Fn(&ItemChange) -> Ve
         let numbers: Vec<String> = lines(c).into_iter().map(|(label, from, to)| format!("{label} {from} → {to}")).collect();
         out.push(if chinese {
             format!(
-                "【{}】{}：出它的 {} 个英雄平均胜率约 {:.1}% → 装备数值 {:+}%（累计 {:+}%）{}{}",
+                "【{}】{}{}：出它的 {} 个英雄平均胜率约 {:.1}% → 装备数值 {:+}%（累计 {:+}%）{}{}",
                 if c.step < 0 { "削弱" } else { "加强" },
+                icon(c),
                 c.name,
                 c.users,
                 c.win,
@@ -799,8 +806,9 @@ pub fn item_news(round: &Round, chinese: bool, lines: &dyn Fn(&ItemChange) -> Ve
             )
         } else {
             format!(
-                "[{}] {}: its {} builders win about {:.1}% -> item numbers {:+}% ({:+}% in all){}{}",
+                "[{}] {}{}: its {} builders win about {:.1}% -> item numbers {:+}% ({:+}% in all){}{}",
                 if c.step < 0 { "Nerf" } else { "Buff" },
+                icon(c),
                 c.name,
                 c.users,
                 c.win,
@@ -1998,7 +2006,8 @@ mod tests {
     #[test]
     fn the_item_news_names_each_item_its_builders_and_numbers() {
         let mut round = Round { id: 4, version: "2027.5.0".into(), label: "2027.5.0".into(), ..Round::default() };
-        assert_eq!(item_news(&round, true, &|_| Vec::new()), None, "no item changed: no news");
+        let no_icon = |_: &ItemChange| String::new();
+        assert_eq!(item_news(&round, true, &|_| Vec::new(), &no_icon), None, "no item changed: no news");
         round.items = vec![
             ItemChange { item: "staff".into(), name: "大天使之杖".into(), users: 6, win: 43.5, step: 6, total: 6 },
             ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.5, step: -10, total: -20 },
@@ -2010,19 +2019,29 @@ mod tests {
                 Vec::new()
             }
         };
-        let (title, content) = item_news(&round, true, &lines).unwrap();
+        let (title, content) = item_news(&round, true, &lines, &no_icon).unwrap();
         assert_eq!(title, "电竞大脑装备平衡 2027.5.0");
         let rows: Vec<&str> = content.lines().collect();
         assert_eq!(rows.len(), 3);
         assert!(rows[0].contains("特效不变"), "{}", rows[0]);
         assert_eq!(rows[1], "【削弱】疾射火炮：出它的 4 个英雄平均胜率约 64.5% → 装备数值 -10%（累计 -20%）：攻击速度 31 → 28");
         assert!(rows[2].starts_with("【加强】大天使之杖") && !rows[2].ends_with("："), "{}", rows[2]);
-        let (title, content) = item_news(&round, false, &lines).unwrap();
+        let (title, content) = item_news(&round, false, &lines, &no_icon).unwrap();
         assert_eq!(title, "Patch Meta AI item balance 2027.5.0");
         assert!(
             content.contains("[Nerf] 疾射火炮: its 4 builders win about 64.5% -> item numbers -10% (-20% in all): 攻击速度 31 → 28"),
             "{content}"
         );
+        // each item's icon in front of its name (2.11.0)
+        let icon = |c: &ItemChange| crate::items::icon_text(if c.item == "rfc" { "i_t5_rfc" } else { "" });
+        let (_, content) = item_news(&round, true, &lines, &icon).unwrap();
+        let rows: Vec<&str> = content.lines().collect();
+        assert!(
+            rows[1].starts_with("【削弱】<i#asset/base/aseprite_resources/ingame/item_icons_18x18:i_t5_rfc>疾射火炮："),
+            "{}",
+            rows[1]
+        );
+        assert!(rows[2].starts_with("【加强】大天使之杖"), "an item without an icon: just its name: {}", rows[2]);
     }
 
     #[test]

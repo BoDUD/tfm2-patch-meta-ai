@@ -1958,7 +1958,10 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
             .map(|(_, item)| crate::items::lines(item, c.total - c.step, c.total, chinese))
             .unwrap_or_default()
     };
-    let items_news = crate::balance::item_news(round, chinese, &item_lines);
+    let item_icon = |c: &crate::balance::ItemChange| -> String {
+        catalog.as_ref().and_then(|cat| cat.item(&c.item)).map(|(_, item)| crate::items::icon_text(&item.icon)).unwrap_or_default()
+    };
+    let items_news = crate::balance::item_news(round, chinese, &item_lines, &item_icon);
     BalanceRequest {
         team,
         off: true,
