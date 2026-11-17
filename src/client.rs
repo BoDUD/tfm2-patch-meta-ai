@@ -61,6 +61,10 @@ pub trait Game: Source {
         (self.champion_damage(name), self.champion_stats(name))
     }
     /// The champion's display name.
+    /// A champion's numbers as the save has them (2.11.0, `edits`): its stat block and growth.
+    fn champion_numbers(&mut self, _name: &str) -> Option<crate::edits::Numbers> {
+        None
+    }
     fn champion_label(&mut self, _name: &str) -> Option<String> {
         None
     }
@@ -151,6 +155,10 @@ impl Game for ClientGame<'_, '_> {
         };
         let category = brief.category.map(|c| c.code() as u8);
         (Some(damage), Some(crate::stats::Stats::from_game(category, &brief.stat, &brief.growth)))
+    }
+    fn champion_numbers(&mut self, name: &str) -> Option<crate::edits::Numbers> {
+        let brief = self.ctx.champion_brief(name)?;
+        Some(crate::edits::numbers(&brief.stat, &brief.growth))
     }
     fn champion_label(&mut self, name: &str) -> Option<String> {
         let key = format!("#asset/base/text/champion?description.{name}.name");
@@ -251,6 +259,14 @@ struct State {
     damage: HashMap<u16, Damage>,
     /// Every champion's stats (read with the champion list).
     stats: Arc<HashMap<String, crate::stats::Stats>>,
+    /// Every champion's numbers (2.11.0, `edits`), whether they were read since the balance looked at them, and the
+    /// read again under way (the next champion, what was read) and when the next begins (`numbers_at_first`: the first
+    /// is the list's own read).
+    numbers: HashMap<String, crate::edits::Numbers>,
+    numbers_new: bool,
+    numbers_check: Option<(usize, HashMap<String, crate::edits::Numbers>)>,
+    numbers_at: Option<Instant>,
+    numbers_at_first: bool,
     champions: Vec<String>,
     /// The game's champions while they are being read, a little a frame (`read_champions`); since when the save
     /// has had no team name yet; and the file the lists are kept in.
@@ -313,6 +329,11 @@ impl State {
             labels: Labels::default(),
             damage: HashMap::new(),
             stats: Arc::new(HashMap::new()),
+            numbers: HashMap::new(),
+            numbers_new: false,
+            numbers_check: None,
+            numbers_at: None,
+            numbers_at_first: false,
             champions: Vec::new(),
             champion_read: None,
             nameless_since: None,
@@ -357,6 +378,8 @@ struct ChampionRead {
     /// Names the game had no data for.
     lacking: Vec<String>,
     stats: HashMap<String, crate::stats::Stats>,
+    /// Every champion's numbers (2.11.0, `edits`).
+    numbers: HashMap<String, crate::edits::Numbers>,
     /// What the game's answers took: about the list, about the champions.
     list_time: Duration,
     data_time: Duration,
@@ -374,6 +397,7 @@ impl ChampionRead {
             next: 0,
             lacking: Vec::new(),
             stats: HashMap::new(),
+            numbers: HashMap::new(),
             list_time,
             data_time: Duration::ZERO,
         }
@@ -516,6 +540,9 @@ fn read_champions(st: &mut State, game: &mut impl Game, team: usize) -> bool {
         if let Some(s) = stats {
             read.stats.insert(name.clone(), s);
         }
+        if let Some(n) = game.champion_numbers(name) {
+            read.numbers.insert(name.clone(), n);
+        }
         if let Some(label) = label {
             st.labels.champions.insert(name.clone(), label);
         }
@@ -584,8 +611,67 @@ fn use_champions(st: &mut State, game: &mut impl Game, team: usize, mut read: Ch
         }
     }
     st.stats = Arc::new(read.stats);
+    if !read.numbers.is_empty() {
+        st.numbers = read.numbers;
+        st.numbers_new = true;
+    }
     st.champions = read.names;
     st.dirty = true;
+}
+
+/// How often the champions' numbers are read again while a save is open (2.11.0): a change in the database during a
+/// session is seen within this.
+const NUMBERS_EVERY: Duration = Duration::from_secs(120);
+/// A frame's time for reading them again (every champion is one question; ~0.1 ms each).
+const NUMBERS_BUDGET: Duration = Duration::from_millis(2);
+
+/// The champions' numbers read again every [`NUMBERS_EVERY`], a few a frame (the first read comes with the list,
+/// `read_champions`); when all are in, `sync_balance` looks at what changed.
+fn recheck_numbers(st: &mut State, game: &mut impl Game, now: Instant) {
+    if st.champions.is_empty() || st.champion_read.is_some() {
+        return;
+    }
+    let Some((next, mut read)) = st.numbers_check.take() else {
+        if due(st.numbers_at, now) {
+            st.numbers_at = Some(now + NUMBERS_EVERY);
+            if st.numbers_at_first {
+                st.numbers_check = Some((0, HashMap::new()));
+            }
+            st.numbers_at_first = true;
+        }
+        return;
+    };
+    let frame = Instant::now();
+    let mut at = next;
+    while at < st.champions.len() {
+        if let Some(n) = game.champion_numbers(&st.champions[at]) {
+            read.insert(st.champions[at].clone(), n);
+        }
+        at += 1;
+        if frame.elapsed() >= NUMBERS_BUDGET {
+            break;
+        }
+    }
+    if at < st.champions.len() {
+        st.numbers_check = Some((at, read));
+        return;
+    }
+    if !read.is_empty() && read != st.numbers {
+        // the model's stats and the notes' lines from the new numbers too (the same fields, in the same order)
+        let mut stats = (*st.stats).clone();
+        for (name, n) in &read {
+            if let Some(s) = stats.get_mut(name) {
+                for i in 0..crate::stats::STATS {
+                    s.base[i] = n[i] as f32;
+                    s.growth[i] = n[9 + i] as f32;
+                }
+            }
+        }
+        st.stats = Arc::new(stats);
+        st.numbers = read;
+        st.numbers_new = true;
+        st.dirty = true;
+    }
 }
 
 pub fn reset_for_tests() {
@@ -725,6 +811,7 @@ fn run(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Instant) {
     let config_changed = st.rebuilt_with.as_ref().is_none_or(|c| !Arc::ptr_eq(c, cfg));
     // the champions' data first, a few a frame: the model is fitted with their stats
     let reading = read_champions(st, game, team);
+    recheck_numbers(st, game, now);
     if (st.dirty || config_changed) && due(st.next_rebuild, now) && !reading {
         st.next_rebuild = Some(now + REBUILD_EVERY);
         st.dirty = false;
@@ -1633,6 +1720,10 @@ struct BalanceSync {
     book_asked: Option<Instant>,
     book_wanted: bool,
     book: Option<String>,
+    /// The skip lists as ids and keys (2.11.0), for the lists (a hash) and the champion count they were made from; when
+    /// power on them is looked for next.
+    skip: Option<(usize, usize, crate::balance::Skip)>,
+    resets_at: Option<Instant>,
 }
 
 type Date = (i32, u32, u32);
@@ -1675,7 +1766,16 @@ fn next_patch_day(schedule: &str, today: Date) -> Option<Date> {
 /// and handed to the server, which writes it in the management tick the game's patch notes appear in (its changes
 /// made later reach the screens only with a later day: the inbox showed the game's own empty notes first). Withdrawn
 /// when no patch is near.
-fn prepare_next(st: &mut State, game: &mut impl Game, team: usize, snapshot: &Arc<shared::Snapshot>, rules: crate::balance::Rules, patch: Option<&str>) {
+#[allow(clippy::too_many_arguments)]
+fn prepare_next(
+    st: &mut State,
+    game: &mut impl Game,
+    team: usize,
+    snapshot: &Arc<shared::Snapshot>,
+    rules: crate::balance::Rules,
+    patch: Option<&str>,
+    skip: &crate::balance::Skip,
+) {
     let today = game.game_date();
     let next = match (today, st.balance.next_patch) {
         (Some(t), Some((day, next))) if day == t => next,
@@ -1699,7 +1799,7 @@ fn prepare_next(st: &mut State, game: &mut impl Game, team: usize, snapshot: &Ar
         return;
     }
     st.balance.prepared_from = Some(from);
-    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day));
+    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day), skip);
     // the patch it is for: the first newer than every patch known (the book's, the news', the matches')
     let mut after = crate::balance::latest().map(|r| r.version).unwrap_or_default();
     if let Some(p) = patch.filter(|p| compare_versions(p, &after) == std::cmp::Ordering::Greater) {
@@ -1828,11 +1928,15 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         item_count: cfg.item_balance_count,
         item_max: cfg.item_balance_max,
     };
+    let skip = skip_lists(st, cfg);
+    // the champions' numbers against what the book saw (2.11.0): the player's changes take the balance's power off
+    let edited = look_at_numbers(st, cfg.balance);
     if cfg.balance {
         // the 4+6 builds read again in the background when the selector published new ones (2.9.0)
         if cfg.item_balance {
             crate::items::refresh();
         }
+        make_resets(st, game, &skip, &edited, now);
         // the news' end: a new item (the game's patch notes, a round's own) has the list read again
         if due(st.balance.probe_at, now) {
             st.balance.probe_at = Some(now + NEWS_PROBE_EVERY);
@@ -1855,7 +1959,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     (notes, played) => notes.or(played),
                 };
                 if let Some(due) = crate::balance::due_now(patch.as_deref(), today) {
-                    let round = crate::balance::make(&snapshot.meta, rules, &due, today);
+                    let round = crate::balance::make(&snapshot.meta, rules, &due, today, &skip);
                     let list: Vec<String> = round
                         .changes
                         .iter()
@@ -1884,7 +1988,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     st.dirty = true;
                     st.balance.prepared_from = None;
                 }
-                prepare_next(st, game, team, &snapshot, rules, patch.as_deref());
+                prepare_next(st, game, team, &snapshot, rules, patch.as_deref(), &skip);
             }
         }
     } else {
@@ -1921,6 +2025,118 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
     }
 }
 
+/// The skip lists as ids and keys (2.11.0): an entry is a champion's id or the name the game shows, an item's key or
+/// its name in the 4+6 catalog; an entry naming nothing is said once in the log.
+fn skip_lists(st: &mut State, cfg: &Config) -> crate::balance::Skip {
+    // made again when the lists, the champions or the catalog change
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&cfg.balance_skip, &cfg.item_balance_skip, crate::items::catalog().is_some()).hash(&mut h);
+        (h.finish() as usize, st.champions.len())
+    };
+    if let Some((p, n, skip)) = &st.balance.skip {
+        if (*p, *n) == key {
+            return skip.clone();
+        }
+    }
+    let mut skip = crate::balance::Skip::default();
+    for entry in &cfg.balance_skip {
+        let id = if st.champions.iter().any(|c| c == entry) {
+            Some(entry.clone())
+        } else {
+            st.champions.iter().find(|c| st.labels.champions.get(*c).is_some_and(|l| l.trim() == entry.as_str())).cloned()
+        };
+        match id {
+            Some(id) => {
+                skip.champions.insert(id);
+            }
+            None if !st.champions.is_empty() => diag::log_once(&format!("skip-{entry}"), &format!("[balance] balance_skip: no champion is {entry}")),
+            None => {}
+        }
+    }
+    let catalog = crate::items::catalog();
+    for entry in &cfg.item_balance_skip {
+        let key = catalog.as_ref().and_then(|cat| cat.items.iter().find(|i| i.key == *entry || i.name == *entry).map(|i| i.key.clone()));
+        match key {
+            Some(key) => {
+                skip.items.insert(key);
+            }
+            None if catalog.is_some() => diag::log_once(&format!("skip-item-{entry}"), &format!("[balance] item_balance_skip: no 4+6 item is {entry}")),
+            None => {}
+        }
+    }
+    if !st.champions.is_empty() {
+        st.balance.skip = Some((key.0, key.1, skip.clone()));
+    }
+    skip
+}
+
+/// The champions' numbers, read again, against what the book saw (2.11.0, `edits`), once the mods' definitions are
+/// read: the champions whose numbers the player changed (judged only with the balance on - the game's own champion
+/// patches are off then; numbers changed with it off are taken as they are).
+fn look_at_numbers(st: &mut State, judging: bool) -> Vec<String> {
+    if !st.numbers_new || crate::balance::book().is_none() {
+        return Vec::new();
+    }
+    let Some(definitions) = crate::edits::session_definitions() else { return Vec::new() };
+    st.numbers_new = false;
+    let verdicts = crate::balance::observe(&st.numbers, &definitions, judging);
+    let (mut player, mut updates) = (Vec::new(), Vec::new());
+    for (champion, verdict) in verdicts {
+        match verdict {
+            crate::edits::Verdict::Player => player.push(champion),
+            _ => updates.push(champion),
+        }
+    }
+    if !updates.is_empty() {
+        diag::log(&format!("[edits] numbers changed with their mods' files (mod updates, the balance carries on): {}", updates.join(", ")));
+    }
+    if !player.is_empty() {
+        diag::log(&format!("[edits] numbers the player changed (database): {}", player.join(", ")));
+    }
+    player
+}
+
+/// A round of resets at once (2.11.0, `balance::make_reset`): the champions whose numbers the player changed, and
+/// the champions and items the skip lists name that still have power (looked for every few seconds).
+fn make_resets(st: &mut State, game: &mut impl Game, skip: &crate::balance::Skip, edited: &[String], now: Instant) {
+    let look = due(st.balance.resets_at, now);
+    if edited.is_empty() && !look {
+        return;
+    }
+    if look {
+        st.balance.resets_at = Some(now + Duration::from_secs(5));
+    }
+    let (skipped, skipped_items) = crate::balance::with_power(&skip.champions, &skip.items);
+    if edited.is_empty() && skipped.is_empty() && skipped_items.is_empty() {
+        return;
+    }
+    let mut champions: Vec<(String, crate::balance::Reset)> =
+        edited.iter().filter(|c| !skip.champions.contains(*c)).map(|c| (c.clone(), crate::balance::Reset::Edit)).collect();
+    champions.extend(skipped.into_iter().map(|c| (c, crate::balance::Reset::Skip)));
+    let catalog = crate::items::catalog();
+    let items: Vec<(String, String, crate::balance::Reset)> = skipped_items
+        .into_iter()
+        .map(|k| {
+            let name = catalog.as_ref().and_then(|cat| cat.item(&k).map(|(_, i)| i.name.clone())).unwrap_or_else(|| k.clone());
+            (k, name, crate::balance::Reset::Skip)
+        })
+        .collect();
+    let Some(round) = crate::balance::reset_now(&champions, &items, game.game_date()) else { return };
+    let list: Vec<String> = round
+        .changes
+        .iter()
+        .map(|c| format!("{} {:+} ({:?})", c.champion, c.step, c.reset.unwrap_or(crate::balance::Reset::Edit)))
+        .chain(round.items.iter().map(|c| format!("{} {:+} (item, skip)", c.name, c.step)))
+        .collect();
+    diag::log(&format!("[balance] round {} {} (resets): {}", round.id, round.label, list.join(", ")));
+    crate::balance::publish(round);
+    st.dirty = true;
+    // a round made ahead was made with the old power: made again
+    st.balance.prepared_from = None;
+}
+
 /// The champions a round left for later (outside the band, too few games with their new numbers), in the log.
 fn log_held(round: &crate::balance::Round) {
     if !round.held.is_empty() {
@@ -1936,11 +2152,15 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
     let mut lines = BTreeMap::new();
     let mut champions = Vec::new();
     for c in &round.changes {
-        let Some(stats) = st.stats.get(&c.champion) else {
-            diag::log_once(&format!("balance-no-stats-{}", c.champion), &format!("[balance] no stats for {}: no lines in the notes", c.champion));
-            continue;
+        let rows = match st.stats.get(&c.champion) {
+            Some(stats) => crate::balance::rows(stats, c.total - c.step, c.total),
+            // power taken off (2.11.0): its reason is what the notes are for, lines or not
+            None if c.reset.is_some() => Vec::new(),
+            None => {
+                diag::log_once(&format!("balance-no-stats-{}", c.champion), &format!("[balance] no stats for {}: no lines in the notes", c.champion));
+                continue;
+            }
         };
-        let rows = crate::balance::rows(stats, c.total - c.step, c.total);
         let why = crate::balance::reason(c, rules);
         champions.push((c.champion.clone(), rows.clone(), why.clone()));
         lines.insert(c.champion.clone(), (rows, why));
@@ -2011,6 +2231,8 @@ mod tests {
     struct FakeGame {
         team: usize,
         team_name: String,
+        /// Every champion's numbers as the save has them (2.11.0, `edits`).
+        numbers: HashMap<String, crate::edits::Numbers>,
         replays: Map<usize, String>,
         solo: Map<usize, String>,
         news: String,
@@ -2145,6 +2367,9 @@ mod tests {
             // (data only where a test looks at it: for the champions the game lists)
             let known = self.counts && self.champions.iter().any(|c| c == name);
             (known.then_some(Damage::Mixed), None)
+        }
+        fn champion_numbers(&mut self, name: &str) -> Option<crate::edits::Numbers> {
+            self.numbers.get(name).copied()
         }
         fn champion_count(&mut self) -> Option<usize> {
             self.counts.then_some(self.champions.len())
@@ -2703,6 +2928,92 @@ mod tests {
         assert_eq!(st.balance.book.as_deref(), Some(""));
         assert!(crate::balance::book().is_none() && g.events.is_empty());
         crate::balance::reset_for_tests();
+    }
+
+    #[test]
+    fn the_players_numbers_take_the_balances_power_off_and_so_does_balance_skip() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        crate::balance::reset_for_tests();
+        // a game of mods without these champions: every change in their numbers is the player's
+        crate::edits::set_definitions_for_tests(HashMap::new());
+        let file = std::env::temp_dir().join(format!("pma_edits_flow_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        crate::balance::open_for_tests(file.clone());
+        let power: BTreeMap<String, i32> = [("a".to_string(), -20), ("b".to_string(), 10)].into();
+        crate::balance::publish(crate::balance::Round {
+            id: 1,
+            version: "1.3".into(),
+            label: "1.3".into(),
+            merged: true,
+            rules: crate::balance::RULES_VERSION,
+            power,
+            ..Default::default()
+        });
+        let num = |x: u32| {
+            let mut n = [0u32; 18];
+            n[0] = x;
+            n[2] = 900;
+            n
+        };
+        let mut g = save();
+        g.answer_balance = true;
+        g.numbers = [("a".to_string(), num(70)), ("b".to_string(), num(60)), ("c".to_string(), num(50))].into();
+        let mut st = State::new();
+        st.save = Some((4, "Mods FC".into()));
+        st.balance.book = Some("book".into());
+        st.champions = vec!["a".into(), "b".into(), "c".into()];
+        st.labels.champions.insert("c".into(), "某英雄".into());
+        let cfg = Config { balance: true, ..Config::default() };
+        let t0 = Instant::now();
+        // the numbers as first read: kept, nothing to say
+        st.numbers = g.numbers.clone();
+        st.numbers_new = true;
+        sync_balance(&mut st, &mut g, &cfg, 4, t0, &[]);
+        assert_eq!(crate::balance::latest().map(|r| r.id), Some(1));
+        assert!(!st.numbers_new, "looked at");
+        // the player changes a's numbers in the database: read again two minutes later, its power comes off at once
+        g.numbers.insert("a".into(), num(90));
+        st.numbers_at = Some(t0);
+        st.numbers_at_first = true;
+        let mut t = t0;
+        for _ in 0..4 {
+            recheck_numbers(&mut st, &mut g, t);
+            t += Duration::from_millis(16);
+        }
+        assert!(st.numbers_new && st.numbers["a"][0] == 90, "the new numbers read");
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t, &events);
+        let reset = crate::balance::latest().unwrap();
+        assert!(reset.reset && reset.id == 2, "{reset:?}");
+        assert_eq!(reset.changes.iter().map(|c| (c.champion.as_str(), c.step)).collect::<Vec<_>>(), [("a", 20)]);
+        assert_eq!(reset.power.get("a"), None);
+        assert_eq!(reset.power.get("b"), Some(&10), "b keeps its power");
+        // its notes go to the server like any round's: a hotfix whose reason says the player's numbers are kept
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &cfg, 4, t + Duration::from_secs(1), &events);
+        let req = g.balance_requests.last().expect("the round's request");
+        assert_eq!(req.round, 2);
+        let note = req.note.as_ref().unwrap();
+        assert!(!note.merge && note.label == "1.3b", "{note:?}");
+        assert!(note.champions.iter().any(|(c, _, why)| c == "a" && why.starts_with("pma_custom")), "{:?}", note.champions);
+        // balance_skip by the name the game shows: c has no power - nothing to take off
+        let named = Config { balance_skip: vec!["某英雄".into()], ..cfg.clone() };
+        assert!(skip_lists(&mut st, &named).champions.contains("c"));
+        // b listed: its power off within seconds, and no round changes it any more
+        let skipping = Config { balance_skip: vec!["b".into()], ..cfg.clone() };
+        let later = t + Duration::from_secs(10);
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &skipping, 4, later, &events);
+        let off = crate::balance::latest().unwrap();
+        assert!(off.reset && off.id == 3 && off.power.is_empty(), "{off:?}");
+        assert_eq!(off.changes[0].reset, Some(crate::balance::Reset::Skip));
+        // nothing more to do: no round more
+        let events = g.take_events();
+        sync_balance(&mut st, &mut g, &skipping, 4, later + Duration::from_secs(10), &events);
+        assert_eq!(crate::balance::latest().map(|r| r.id), Some(3));
+        crate::balance::reset_for_tests();
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

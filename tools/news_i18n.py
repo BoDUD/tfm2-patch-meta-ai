@@ -5,7 +5,8 @@ The game's patch notes give each champion a reason as codes of `patch.reason.*` 
 (`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100), the change's power this patch and in all
 (`pma_power_<m|p><n>`, `pma_sum_<m|p><n>`, 2.9.0: -11 is `m11`, n up to CAP) and the limits that held a change
 (`pma_cap`, `pma_total_<CAP>`: 2.10.0's limit of 80; `pma_total` stays 2.9.0's 50 for the notes written then); an
-unpicked buff (2.10.0, `balance::UNPICKED_STEP`) gives `pma_unpicked` instead of a win rate. A text
+unpicked buff (2.10.0, `balance::UNPICKED_STEP`) gives `pma_unpicked` instead of a win rate, power taken off at once
+(2.11.0, `balance::Reset`) `pma_custom` (the player changed the champion's numbers) or `pma_skip` (`balance_skip`). A text
 cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what patch notes without a
 champion change say (`server::UNCHANGED_TEXT`).
 
@@ -239,6 +240,45 @@ UNPICKED = {
     "vi": "Ít được chọn trong vài bản cập nhật gần đây (dưới 30 trận): tạm thời tăng sức mạnh nhẹ; khi có đủ dữ liệu trận đấu sẽ điều chỉnh theo tỷ lệ thắng.",
     "th": "แทบไม่มีใครเลือกในช่วงหลายแพตช์ล่าสุด (ไม่ถึง 30 เกม) จึงเพิ่มพลังเล็กน้อยก่อน เมื่อมีข้อมูลการแข่งขันแล้วจะปรับตามอัตราชนะ",
 }
+# a champion whose numbers the player changed in the database (2.11.0, `balance::Reset::Edit`: `pma_custom`, before
+# its power code): this mod's changes come off, it plays the player's numbers and is judged again from its games
+CUSTOM = {
+    "zh-hans": "玩家在数据库里改了它的数值：电竞大脑之前的调整取消，完全按玩家的数值来；之后按新数值打出来的比赛重新判断，正常加强削弱。",
+    "zh-hant": "玩家在資料庫裡改了它的數值：電競大腦之前的調整取消，完全按玩家的數值來；之後按新數值打出來的比賽重新判斷，正常加強削弱。",
+    "en": "The player changed its numbers in the database: this mod's earlier changes are taken off and it plays exactly the player's numbers; the games it plays with them decide its next changes.",
+    "ko": "플레이어가 데이터베이스에서 수치를 바꿨습니다. 이 모드의 이전 조정은 취소되고 플레이어의 수치 그대로 적용되며, 새 수치로 치른 경기에 따라 다시 조정합니다.",
+    "ja": "プレイヤーがデータベースで数値を変更しました。このModのこれまでの調整は取り消され、プレイヤーの数値どおりになります。新しい数値での試合をもとに改めて調整します。",
+    "de": "Der Spieler hat seine Werte in der Datenbank geändert: Die bisherigen Anpassungen dieses Mods entfallen, es gelten genau die Werte des Spielers; die Spiele damit entscheiden über die nächsten Änderungen.",
+    "fr": "Le joueur a modifié ses valeurs dans la base de données : les ajustements précédents de ce mod sont retirés et ses valeurs s'appliquent telles quelles ; les parties jouées avec elles décideront des prochains changements.",
+    "es-ES": "El jugador cambió sus valores en la base de datos: se retiran los ajustes anteriores de este mod y se usan exactamente sus valores; las partidas con ellos decidirán los próximos cambios.",
+    "pt-BR": "O jogador alterou os valores no banco de dados: os ajustes anteriores deste mod foram retirados e valem exatamente os valores do jogador; as partidas com eles decidem as próximas mudanças.",
+    "it": "Il giocatore ha cambiato i suoi valori nel database: gli aggiustamenti precedenti di questa mod sono annullati e valgono esattamente i valori del giocatore; le partite giocate con essi decideranno le prossime modifiche.",
+    "ru": "Игрок изменил его характеристики в базе данных: прежние правки этого мода сняты, действуют ровно значения игрока; дальнейшие изменения решат игры с ними.",
+    "pl": "Gracz zmienił jego wartości w bazie danych: wcześniejsze zmiany tego moda zostały cofnięte i obowiązują dokładnie wartości gracza; o kolejnych zmianach zdecydują gry z nimi.",
+    "tr": "Oyuncu veritabanında değerlerini değiştirdi: bu modun önceki ayarları kaldırıldı, tam olarak oyuncunun değerleri geçerli; sonraki değişikliklere bu değerlerle oynanan maçlar karar verecek.",
+    "nl": "De speler heeft de waarden in de database aangepast: de eerdere aanpassingen van deze mod vervallen en precies de waarden van de speler gelden; de wedstrijden daarmee bepalen de volgende wijzigingen.",
+    "vi": "Người chơi đã sửa chỉ số trong cơ sở dữ liệu: các điều chỉnh trước của mod này bị hủy, dùng đúng chỉ số của người chơi; các trận đấu với chỉ số mới sẽ quyết định lần điều chỉnh tiếp theo.",
+    "th": "ผู้เล่นแก้ค่าสถานะในฐานข้อมูล: การปรับก่อนหน้านี้ของม็อดนี้ถูกยกเลิก และใช้ค่าของผู้เล่นตามเดิมทุกประการ การแข่งขันด้วยค่าใหม่จะเป็นตัวตัดสินการปรับครั้งต่อไป",
+}
+# a champion `balance_skip` lists (2.11.0, `balance::Reset::Skip`: `pma_skip`): never changed, this mod's changes off
+SKIP = {
+    "zh-hans": "设置里列为不调整（balance_skip）：电竞大脑之前的调整取消，以后也不再调整它。",
+    "zh-hant": "設定裡列為不調整（balance_skip）：電競大腦之前的調整取消，以後也不再調整它。",
+    "en": "Listed as not to be changed (balance_skip): this mod's earlier changes are taken off, and it changes it no more.",
+    "ko": "설정에서 조정하지 않도록 지정됨(balance_skip): 이 모드의 이전 조정은 취소되고 앞으로도 조정하지 않습니다.",
+    "ja": "設定で調整しないよう指定されています（balance_skip）：このModのこれまでの調整は取り消され、今後も調整しません。",
+    "de": "Als nicht zu ändern eingetragen (balance_skip): Die bisherigen Anpassungen dieses Mods entfallen, und er ändert ihn nicht mehr.",
+    "fr": "Indiqué comme à ne pas modifier (balance_skip) : les ajustements précédents de ce mod sont retirés et il ne le modifiera plus.",
+    "es-ES": "Marcado para no cambiarse (balance_skip): se retiran los ajustes anteriores de este mod y ya no lo cambiará.",
+    "pt-BR": "Marcado para não ser alterado (balance_skip): os ajustes anteriores deste mod foram retirados e ele não será mais alterado.",
+    "it": "Indicato come da non modificare (balance_skip): gli aggiustamenti precedenti di questa mod sono annullati e non verrà più modificato.",
+    "ru": "Отмечен как неизменяемый (balance_skip): прежние правки этого мода сняты, больше он его не меняет.",
+    "pl": "Oznaczony jako niezmieniany (balance_skip): wcześniejsze zmiany tego moda zostały cofnięte i nie będzie go już zmieniał.",
+    "tr": "Değiştirilmeyecekler listesinde (balance_skip): bu modun önceki ayarları kaldırıldı ve artık değiştirilmeyecek.",
+    "nl": "Aangemerkt als niet aan te passen (balance_skip): de eerdere aanpassingen van deze mod vervallen en hij wordt niet meer aangepast.",
+    "vi": "Được đặt là không điều chỉnh (balance_skip): các điều chỉnh trước của mod này bị hủy và sẽ không điều chỉnh nữa.",
+    "th": "ตั้งไว้ว่าไม่ต้องปรับ (balance_skip): การปรับก่อนหน้านี้ของม็อดนี้ถูกยกเลิก และจะไม่ปรับอีก",
+}
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
 
@@ -253,6 +293,8 @@ def reasons(lang):
     out["pma_total"] = total.format(cap=LEGACY_CAP)
     out[f"pma_total_{CAP}"] = total.format(cap=CAP)
     out["pma_unpicked"] = UNPICKED.get(lang, UNPICKED["en"])
+    out["pma_custom"] = CUSTOM.get(lang, CUSTOM["en"])
+    out["pma_skip"] = SKIP.get(lang, SKIP["en"])
     power, power_hp, in_all = POWER.get(lang, POWER["en"])
     signed = lambda v: f"{v:+d}"
     for v in range(-CAP, CAP + 1):

@@ -47,6 +47,12 @@
 //!   items' notes are news of their own ([`item_news`]).
 //! - **The game's own champion patches off**: the server half sets the save's auto-patcher counts to zero while this
 //!   is on, keeping the save's own values to put back when it is turned off (`server::balance`).
+//! - **The player's numbers** (2.11.0, [`crate::edits`]; the user: 「不覆盖玩家数据库里改的，完全按玩家的数值来，后面轮次进行
+//!   正常削弱加强」): a champion's power is a buff on the numbers the save has, never a number written over them. When
+//!   the player changes a champion's numbers in the database, its power comes off at once - a hotfix of its own
+//!   ([`make_reset`], [`Reset::Edit`]) - so it plays exactly the player's numbers, and the rounds judge it again from
+//!   the games it plays with them. Champions `balance_skip` lists (and items `item_balance_skip` lists) are never
+//!   changed, their power taken off the same way ([`Reset::Skip`], [`Skip`]).
 //!
 //! The book is one file a save in the mod folder (`balance-<id>.json`, the id kept in the save since 2.8.2 - named by
 //! the team before, a new career with the same team took the old one's book): every round (its changes and every
@@ -160,6 +166,27 @@ pub struct Change {
     /// guess), buffed to be played. Its reason in the notes says so ([`reason`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unpicked: bool,
+    /// Its power taken off at once, and why (2.11.0): the player changed its numbers, or `balance_skip` lists it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<Reset>,
+}
+
+/// Why a champion's or an item's power was taken off at once (2.11.0, [`make_reset`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reset {
+    /// The player changed its numbers in the database ([`crate::edits`]): it plays theirs.
+    Edit,
+    /// `balance_skip` / `item_balance_skip` lists it: the balance leaves it alone.
+    Skip,
+}
+
+/// Champions and items the balance leaves alone (2.11.0, `balance_skip` / `item_balance_skip`, as ids and keys):
+/// no round changes them, and their power comes off.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Skip {
+    pub champions: std::collections::HashSet<String>,
+    pub items: std::collections::HashSet<String>,
 }
 
 /// One item's change in a round (2.9.0, `item_balance`): the 4+6 pack's key and the item's name, how many champions
@@ -173,6 +200,9 @@ pub struct ItemChange {
     pub win: f32,
     pub step: i32,
     pub total: i32,
+    /// Its power taken off at once (2.11.0, `item_balance_skip`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset: Option<Reset>,
 }
 
 /// One balance patch.
@@ -210,6 +240,10 @@ pub struct Round {
     /// The balance rules it was made under ([`RULES_VERSION`]; 0: a round of 2.8.0 - 2.9.0, which wrote none).
     #[serde(default)]
     pub rules: u32,
+    /// A round that only takes power off (2.11.0, [`make_reset`]): made at once, between the balance's own rounds -
+    /// a hotfix in the notes, but not a round the late hotfix's timer or the rules' check counts ([`due`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset: bool,
 }
 
 /// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
@@ -325,7 +359,7 @@ fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
             let total = (was + want).clamp(-CAP, CAP);
             let step = total - was;
             (step != 0).then(|| {
-                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total, unpicked: false })
+                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total, unpicked: false, reset: None })
             })
         })
         .collect();
@@ -357,7 +391,7 @@ pub fn unpicked(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, ru
         .take(rules.unpicked)
         .map(|(c, was)| {
             let total = (was + step).min(UNPICKED_CAP);
-            Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step: total - was, total, unpicked: true }
+            Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step: total - was, total, unpicked: true, reset: None }
         })
         .collect();
     (out, n)
@@ -415,7 +449,7 @@ pub fn decide_items(
         if step == 0 || !settled(item) {
             continue;
         }
-        out.push((gap.abs(), ItemChange { item: item.clone(), name: name.clone(), users: n as u32, win, step, total }));
+        out.push((gap.abs(), ItemChange { item: item.clone(), name: name.clone(), users: n as u32, win, step, total, reset: None }));
     }
     out.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.item.cmp(&b.1.item)));
     out.truncate(rules.item_count);
@@ -464,6 +498,9 @@ pub fn due(rounds: &[Round], patch: Option<&str>, today: Option<(i32, u32, u32)>
     if !rounds.iter().any(|r| r.version == patch) && compare_versions(patch, &last.version) == std::cmp::Ordering::Greater {
         return Some(Due::Patch(patch.to_string()));
     }
+    // the rounds that only took power off (2.11.0) are not the balance's: the rules and the date are the newest
+    // balance round's
+    let last = rounds.iter().rev().find(|r| !r.reset).unwrap_or(last);
     // the newest round made under older rules (a book of 2.9.0 or before): a hotfix now, under the new ones. A game
     // patch due at the same time came first above - its round is made under the new rules and puts them to work too.
     if last.rules < RULES_VERSION {
@@ -485,11 +522,12 @@ pub fn hotfix_label(rounds: &[Round], version: &str) -> String {
 /// The round `due` asks for, after `rounds`, from the model's `meta`. A round that changes nobody is still a round
 /// (it marks the patch as looked at).
 pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
-    make_round_with(meta, rounds, rules, due, today, None)
+    make_round_with(meta, rounds, rules, due, today, None, &Skip::default())
 }
 
 /// [`make_round`] with the 4+6 pack's builds and item names (2.9.0): with `rules.items` the round changes items too;
-/// without, it carries the item power of the round before unchanged.
+/// without, it carries the item power of the round before unchanged. `skip` (2.11.0): champions and items no round
+/// changes; any power they still have comes off in this round ([`Reset::Skip`]).
 pub fn make_round_with(
     meta: &Meta,
     rounds: &[Round],
@@ -497,6 +535,7 @@ pub fn make_round_with(
     due: &Due,
     today: Option<(i32, u32, u32)>,
     items: Option<&crate::items::Inputs>,
+    skip: &Skip,
 ) -> Round {
     let last = rounds.last();
     let version = due.version().to_string();
@@ -507,6 +546,7 @@ pub fn make_round_with(
     let candidates: Vec<Candidate<'_>> = meta
         .champions
         .iter()
+        .filter(|c| !skip.champions.contains(&c.name))
         .map(|c| Candidate {
             name: &c.name,
             win: field_win(c, centre),
@@ -534,6 +574,12 @@ pub fn make_round_with(
         crate::glm::sigmoid(centre) * 100.0
     );
     changes.extend(fresh);
+    // the champions `balance_skip` lists: their power off (2.11.0)
+    let mut skipped: Vec<(&String, &i32)> = before.iter().filter(|(c, p)| **p != 0 && skip.champions.contains(*c)).collect();
+    skipped.sort();
+    for (c, was) in skipped {
+        changes.push(Change { champion: c.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(Reset::Skip) });
+    }
     let mut power = before;
     for c in &changes {
         if c.total == 0 {
@@ -549,7 +595,7 @@ pub fn make_round_with(
                 .champions
                 .iter()
                 .filter_map(|c| {
-                    let items = inputs.builds.get(&c.name)?.clone();
+                    let items: Vec<String> = inputs.builds.get(&c.name)?.iter().filter(|k| !skip.items.contains(*k)).cloned().collect();
                     let win = field_win(c, centre);
                     let step = changes.iter().find(|x| x.champion == c.name).map_or(0, |x| x.step);
                     Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / rules.per_point, evidence: c.evidence, items })
@@ -570,6 +616,14 @@ pub fn make_round_with(
         }
         None => Vec::new(),
     };
+    // the items `item_balance_skip` lists: their power off (2.11.0)
+    let mut item_changes = item_changes;
+    let mut skipped: Vec<(&String, &i32)> = item_power.iter().filter(|(k, p)| **p != 0 && skip.items.contains(*k)).collect();
+    skipped.sort();
+    for (key, was) in skipped {
+        let name = items.and_then(|i| i.names.get(key)).cloned().unwrap_or_else(|| key.clone());
+        item_changes.push(ItemChange { item: key.clone(), name, users: 0, win: 0.0, step: -was, total: 0, reset: Some(Reset::Skip) });
+    }
     for c in &item_changes {
         if c.total == 0 {
             item_power.remove(&c.item);
@@ -591,7 +645,56 @@ pub fn make_round_with(
         item_power,
         summary,
         rules: RULES_VERSION,
+        reset: false,
     }
+}
+
+/// A round that only takes power off (2.11.0), at once: the champions whose numbers the player changed
+/// ([`Reset::Edit`] - listed even without power, so that the notes say the change was seen and the rounds count its
+/// games from here) and the champions and items `balance_skip` / `item_balance_skip` list that still have power
+/// ([`Reset::Skip`]). A hotfix of the newest round's patch. None: nothing to take off or say.
+pub fn make_reset(
+    rounds: &[Round],
+    champions: &[(String, Reset)],
+    items: &[(String, String, Reset)],
+    today: Option<(i32, u32, u32)>,
+) -> Option<Round> {
+    let last = rounds.last()?;
+    let mut power = last.power.clone();
+    let mut changes = Vec::new();
+    for (champion, why) in champions {
+        let was = power.get(champion).copied().unwrap_or(0);
+        if was == 0 && *why == Reset::Skip {
+            continue;
+        }
+        power.remove(champion);
+        changes.push(Change { champion: champion.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(*why) });
+    }
+    let mut item_power = last.item_power.clone();
+    let mut item_changes = Vec::new();
+    for (key, name, why) in items {
+        let Some(was) = item_power.remove(key).filter(|p| *p != 0) else { continue };
+        item_changes.push(ItemChange { item: key.clone(), name: name.clone(), users: 0, win: 0.0, step: -was, total: 0, reset: Some(*why) });
+    }
+    if changes.is_empty() && item_changes.is_empty() {
+        return None;
+    }
+    Some(Round {
+        id: last.id + 1,
+        version: last.version.clone(),
+        label: hotfix_label(rounds, &last.version),
+        merged: false,
+        date: today,
+        matches: last.matches,
+        changes,
+        power,
+        held: Vec::new(),
+        items: item_changes,
+        item_power,
+        summary: String::new(),
+        rules: last.rules,
+        reset: true,
+    })
 }
 
 /// Why a round changed these champions and no more, for the log (the user, 2026-11-13, a player's 「我设置50个就砍了
@@ -736,6 +839,17 @@ pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
 /// win rate (`pma_wr_<n>`, rounded away from the band), the power this round and in all, and whether the round's or
 /// the overall limit held it (`pma_cap`, `pma_total_<CAP>`).
 pub fn reason(c: &Change, rules: Rules) -> String {
+    // power taken off (2.11.0): why, and how much
+    if let Some(why) = c.reset {
+        let mut codes = vec![match why {
+            Reset::Edit => "pma_custom".to_string(),
+            Reset::Skip => "pma_skip".to_string(),
+        }];
+        if c.step != 0 {
+            codes.push(format!("pma_power_{}", signed_code(c.step)));
+        }
+        return codes.join(",");
+    }
     let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
     // an unpicked buff (2.10.0) says why instead of a win rate too few games stand behind, and no limit held it
     let mut codes = vec![if c.unpicked { "pma_unpicked".to_string() } else { format!("pma_wr_{n}") }];
@@ -791,6 +905,29 @@ pub fn item_news(
     items.sort_by_key(|c| (c.step > 0, c.step));
     for c in items {
         let numbers: Vec<String> = lines(c).into_iter().map(|(label, from, to)| format!("{label} {from} → {to}")).collect();
+        // power taken off (2.11.0): why, not its builders
+        if c.reset.is_some() {
+            out.push(if chinese {
+                format!(
+                    "【恢复】{}{}：设置里列为不调整（item_balance_skip），取消电竞大脑之前的 {:+}%{}{}",
+                    icon(c),
+                    c.name,
+                    -c.step,
+                    if numbers.is_empty() { "" } else { "：" },
+                    numbers.join("，")
+                )
+            } else {
+                format!(
+                    "[Reset] {}{}: item_balance_skip lists it; this mod's earlier {:+}% taken off{}{}",
+                    icon(c),
+                    c.name,
+                    -c.step,
+                    if numbers.is_empty() { "" } else { ": " },
+                    numbers.join(", ")
+                )
+            });
+            continue;
+        }
         out.push(if chinese {
             format!(
                 "【{}】{}{}：出它的 {} 个英雄平均胜率约 {:.1}% → 装备数值 {:+}%（累计 {:+}%）{}{}",
@@ -854,6 +991,10 @@ pub fn articles(
     signatures: &[Signature],
     label: &dyn Fn(&str) -> String,
 ) -> Vec<Article> {
+    // a round that only took power off (2.11.0) is no patch to write about
+    if round.reset {
+        return Vec::new();
+    }
     let date = round.date.map(|(y, m, d)| format!("{y:04}-{m:02}-{d:02}")).unwrap_or_default();
     let chinese = round.changes.iter().any(|c| label(&c.champion).chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
     let changes_of = |champion: &str| -> Option<(String, String)> {
@@ -998,6 +1139,9 @@ struct Book {
     /// Kept matches whose server run had the item balance off (2.9.0): every run of them plays no item change.
     #[serde(default)]
     items_off: Vec<String>,
+    /// Every champion's numbers when last read, and its definition then (2.11.0, [`crate::edits`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    seen: BTreeMap<String, crate::edits::Seen>,
 }
 
 #[derive(Default)]
@@ -1024,6 +1168,8 @@ struct Store {
     written_at: Option<std::time::Instant>,
     /// The newest round as the screens show it.
     view: Option<Arc<View>>,
+    /// The champions' numbers when last read ([`Book::seen`]).
+    seen: BTreeMap<String, crate::edits::Seen>,
 }
 
 /// The newest round as the screens show it: every champion's power, and this round's steps.
@@ -1120,6 +1266,7 @@ fn load(st: &mut Store, book: Book) {
         }
     }
     st.items_off = book.items_off.into_iter().filter(|k| st.kept.contains_key(k)).collect();
+    st.seen = book.seen;
 }
 
 /// The save is closed (its kept matches written first).
@@ -1135,7 +1282,7 @@ fn write(st: &mut Store) {
     let Some(file) = &st.file else { return };
     let kept = st.order.iter().filter_map(|k| Some((k.clone(), *st.kept.get(k)?))).collect();
     let items_off = st.order.iter().filter(|k| st.items_off.contains(*k)).cloned().collect();
-    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept, items_off };
+    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept, items_off, seen: st.seen.clone() };
     if let Ok(text) = serde_json::to_string(&book) {
         let _ = std::fs::write(file, text);
     }
@@ -1166,15 +1313,70 @@ pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Du
 }
 
 /// The round `due` asks for on this save ([`make_round`]); not in the book until [`publish`]ed.
-pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>) -> Round {
+pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>, skip: &Skip) -> Round {
     let items = if rules.items { crate::items::inputs() } else { None };
     if rules.items && items.is_none() {
         diag::log_once("items-no-inputs", "[items] item_balance is on but the 4+6 builds or catalog are not read (yet): this round changes no item");
     }
     let st = store();
-    let mut round = make_round_with(meta, &st.rounds, rules, due, today, items.as_ref());
+    let mut round = make_round_with(meta, &st.rounds, rules, due, today, items.as_ref(), skip);
     round.id = round.id.max(st.done + 1);
     round
+}
+
+/// The round of resets due on this save now ([`make_reset`]); not in the book until [`publish`]ed.
+pub fn reset_now(champions: &[(String, Reset)], items: &[(String, String, Reset)], today: Option<(i32, u32, u32)>) -> Option<Round> {
+    let st = store();
+    st.file.as_ref()?;
+    let mut round = make_reset(&st.rounds, champions, items, today)?;
+    round.id = round.id.max(st.done + 1);
+    Some(round)
+}
+
+/// The champions and items with power in the newest round of this save, among `champions` / `items` (2.11.0: those a
+/// skip list names and that a reset should take power off).
+pub fn with_power(champions: &std::collections::HashSet<String>, items: &std::collections::HashSet<String>) -> (Vec<String>, Vec<String>) {
+    let st = store();
+    let Some(last) = st.rounds.last() else { return (Vec::new(), Vec::new()) };
+    let mut c: Vec<String> = last.power.iter().filter(|(k, p)| **p != 0 && champions.contains(*k)).map(|(k, _)| k.clone()).collect();
+    let mut i: Vec<String> = last.item_power.iter().filter(|(k, p)| **p != 0 && items.contains(*k)).map(|(k, _)| k.clone()).collect();
+    c.sort();
+    i.sort();
+    (c, i)
+}
+
+/// Every champion's numbers as read now (2.11.0, [`crate::edits`]) against what this save's book saw last: the book
+/// keeps them from now on, and the champions whose numbers the player changed are returned (only when `judging` -
+/// the balance on; numbers changed with it off are taken as they are). Empty without a book.
+pub fn observe(
+    now: &HashMap<String, crate::edits::Numbers>,
+    definitions: &HashMap<String, crate::edits::Numbers>,
+    judging: bool,
+) -> Vec<(String, crate::edits::Verdict)> {
+    let mut st = store();
+    if st.file.is_none() {
+        return Vec::new();
+    }
+    let mut names: Vec<&String> = now.keys().collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let numbers = &now[name];
+        let def = definitions.get(name);
+        let verdict = crate::edits::judge(st.seen.get(name), numbers, def);
+        if verdict == crate::edits::Verdict::Same {
+            continue;
+        }
+        st.seen.insert(name.clone(), crate::edits::Seen::new(numbers, def));
+        st.unwritten = true;
+        if judging && matches!(verdict, crate::edits::Verdict::Player | crate::edits::Verdict::ModUpdate) {
+            out.push((name.clone(), verdict));
+        }
+    }
+    if st.unwritten {
+        write(&mut st);
+    }
+    out
 }
 
 /// A new round: in the book from now on (new matches play it).
@@ -1633,7 +1835,7 @@ mod tests {
 
     #[test]
     fn the_reason_is_the_win_rate_and_the_limits() {
-        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false };
+        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false, reset: None };
         assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
         assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
         assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
@@ -1655,9 +1857,9 @@ mod tests {
             merged: true,
             date: Some((2027, 10, 1)),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false },
-                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20, unpicked: false },
-                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10, unpicked: false },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None },
+                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20, unpicked: false, reset: None },
+                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10, unpicked: false, reset: None },
             ],
             ..Round::default()
         };
@@ -1729,7 +1931,7 @@ mod tests {
             id: 2,
             version: "1.2".into(),
             power: power2.clone(),
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20, unpicked: false }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20, unpicked: false, reset: None }],
             ..Round::default()
         });
         assert_eq!(view().map(|v| v.steps.get("maddie").copied()), Some(Some(-10)));
@@ -1798,13 +2000,13 @@ mod tests {
         open_book_file(career.clone(), legacy.clone(), 0);
         assert!(rounds().is_empty() && view().is_none() && !career.exists());
         assert_eq!(due_now(Some("1.1"), None), Some(Due::First("1.1".into())));
-        assert_eq!(make(&meta(), RULES, &Due::First("1.1".into()), None).id, 1);
+        assert_eq!(make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default()).id, 1);
         close();
         // a save whose book was lost (its news has two rounds, no file anywhere): the ids go on after them
         let _ = std::fs::remove_file(&legacy);
         open_book_file(career.clone(), legacy.clone(), 2);
         assert!(rounds().is_empty());
-        let next = make(&meta(), RULES, &Due::First("1.1".into()), None);
+        let next = make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default());
         assert_eq!(next.id, 3);
         assert_eq!(publish_prepared(next, &book().unwrap()), Ok(()));
         assert_eq!(rounds().iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
@@ -1848,7 +2050,7 @@ mod tests {
             version: version.into(),
             changes: changes
                 .into_iter()
-                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s, unpicked: false })
+                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s, unpicked: false, reset: None })
                 .collect(),
             ..Round::default()
         };
@@ -1866,8 +2068,8 @@ mod tests {
             version: "2027.4.1".into(),
             label: "2027.4.1b".into(),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false },
-                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6, unpicked: false },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None },
+                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6, unpicked: false, reset: None },
             ],
             ..Round::default()
         };
@@ -1959,17 +2161,17 @@ mod tests {
         ];
         let inp = inputs(&builds);
         let today = Some((2027, 10, 1));
-        let round = make_round_with(&m, &[], ITEM_RULES, &Due::First("2027.4.1".into()), today, Some(&inp));
+        let round = make_round_with(&m, &[], ITEM_RULES, &Due::First("2027.4.1".into()), today, Some(&inp), &Skip::default());
         assert!(round.changes.iter().any(|c| c.champion == "maddie"), "the champions as before");
         assert_eq!(round.items.len(), 1, "{:?}", round.items);
         assert_eq!(round.items[0].item, "rfc");
         assert_eq!(round.item_power.get("rfc"), Some(&round.items[0].total));
         // the item balance off: no item change, the power so far carried on
-        let next = make_round_with(&m, std::slice::from_ref(&round), RULES, &Due::Late("2027.4.1".into()), today, Some(&inp));
+        let next = make_round_with(&m, std::slice::from_ref(&round), RULES, &Due::Late("2027.4.1".into()), today, Some(&inp), &Skip::default());
         assert!(next.items.is_empty());
         assert_eq!(next.item_power, round.item_power);
         // the item just changed waits for its builders' games
-        let again = make_round_with(&m, std::slice::from_ref(&round), ITEM_RULES, &Due::Late("2027.4.1".into()), today, Some(&inp));
+        let again = make_round_with(&m, std::slice::from_ref(&round), ITEM_RULES, &Due::Late("2027.4.1".into()), today, Some(&inp), &Skip::default());
         assert!(again.items.is_empty(), "no games since: {:?}", again.items);
         // the log says why these champions and no more
         assert!(round.summary.starts_with("10 champions rated"), "{}", round.summary);
@@ -1978,7 +2180,7 @@ mod tests {
         // builders are expected nearer the band than at 2.5, and the item is cut less
         let item = |per_point: f32| {
             let rules = Rules { per_point, item_max: 20, ..ITEM_RULES };
-            make_round_with(&m, &[], rules, &Due::First("2027.4.1".into()), today, Some(&inp)).items[0].step
+            make_round_with(&m, &[], rules, &Due::First("2027.4.1".into()), today, Some(&inp), &Skip::default()).items[0].step
         };
         assert_eq!((item(1.5), item(2.5)), (-7, -10));
     }
@@ -2009,8 +2211,8 @@ mod tests {
         let no_icon = |_: &ItemChange| String::new();
         assert_eq!(item_news(&round, true, &|_| Vec::new(), &no_icon), None, "no item changed: no news");
         round.items = vec![
-            ItemChange { item: "staff".into(), name: "大天使之杖".into(), users: 6, win: 43.5, step: 6, total: 6 },
-            ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.5, step: -10, total: -20 },
+            ItemChange { item: "staff".into(), name: "大天使之杖".into(), users: 6, win: 43.5, step: 6, total: 6, reset: None },
+            ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.5, step: -10, total: -20, reset: None },
         ];
         let lines = |c: &ItemChange| {
             if c.item == "rfc" {
@@ -2078,7 +2280,7 @@ mod tests {
             version: "2027.4.1".into(),
             merged: false,
             matches: 586,
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10, unpicked: false }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10, unpicked: false, reset: None }],
             ..Round::default()
         };
         let got = model_rounds_of(&[round]);
@@ -2269,5 +2471,132 @@ mod tests {
         // no patch known: nothing yet; an empty book: the first round, as before
         assert_eq!(due(old_only, None, today), None);
         assert_eq!(due(&[], Some("2028.2.0"), today), Some(Due::First("2028.2.0".into())));
+    }
+
+    // ===================== 2.11.0: the player's numbers and the skip lists =====================
+
+    fn powered(power: &[(&str, i32)], items: &[(&str, i32)]) -> Round {
+        Round {
+            id: 4,
+            version: "2028.2.0".into(),
+            label: "2028.2.0".into(),
+            merged: true,
+            date: Some((2028, 3, 1)),
+            rules: RULES_VERSION,
+            power: power.iter().map(|(c, p)| (c.to_string(), *p)).collect(),
+            item_power: items.iter().map(|(c, p)| (c.to_string(), *p)).collect(),
+            ..Round::default()
+        }
+    }
+
+    #[test]
+    fn a_reset_takes_the_power_off_at_once_as_a_hotfix() {
+        let today = Some((2028, 3, 20));
+        let rounds = vec![powered(&[("jinx", -20), ("zeri", 10)], &[("ie", -10)])];
+        // jinx: the player changed her numbers; ezreal too (no power: listed, step 0); zeri: balance_skip; one skipped
+        // without power (nothing to say); an item skipped
+        let champions = [
+            ("jinx".to_string(), Reset::Edit),
+            ("ezreal".to_string(), Reset::Edit),
+            ("zeri".to_string(), Reset::Skip),
+            ("nopower".to_string(), Reset::Skip),
+        ];
+        let reset = make_reset(&rounds, &champions, &[("ie".into(), "无尽之刃".into(), Reset::Skip)], today).unwrap();
+        assert!(reset.reset && !reset.merged);
+        assert_eq!((reset.id, reset.label.as_str(), reset.version.as_str(), reset.date), (5, "2028.2.0b", "2028.2.0", today));
+        assert!(reset.power.is_empty() && reset.item_power.is_empty(), "{:?} {:?}", reset.power, reset.item_power);
+        let got: Vec<(&str, i32, i32, Option<Reset>)> = reset.changes.iter().map(|c| (c.champion.as_str(), c.step, c.total, c.reset)).collect();
+        assert_eq!(got, [("jinx", 20, 0, Some(Reset::Edit)), ("ezreal", 0, 0, Some(Reset::Edit)), ("zeri", -10, 0, Some(Reset::Skip))]);
+        assert_eq!((reset.items[0].step, reset.items[0].total, reset.items[0].reset), (10, 0, Some(Reset::Skip)));
+        // the notes' reasons: why and how much, no win rate
+        assert_eq!(reason(&reset.changes[0], RULES), "pma_custom,pma_power_p20");
+        assert_eq!(reason(&reset.changes[1], RULES), "pma_custom");
+        assert_eq!(reason(&reset.changes[2], RULES), "pma_skip,pma_power_m10");
+        // the notes' lines: the numbers with this mod's power, then the save's own (the player's)
+        let stats = Stats { category: None, base: [70.0, 0.0, 720.0, 16.0, 12.0, 810.0], growth: [20.0, 0.0, 90.0, 0.0, 0.0, 0.0] };
+        let lines = rows(&stats, reset.changes[0].total - reset.changes[0].step, reset.changes[0].total);
+        let attack = lines.iter().find(|r| r.key.ends_with("stat.attack")).unwrap();
+        assert_eq!((attack.pre_value.as_str(), attack.after_value.as_str(), attack.is_buff), ("63", "70", true));
+        // no news cards; the item news says why
+        assert!(articles(&reset, &BTreeMap::new(), "T1", &[], &|n: &str| n.to_string()).is_empty());
+        let (_, body) = item_news(&reset, true, &|_| Vec::new(), &|_| String::new()).unwrap();
+        assert!(body.contains("【恢复】无尽之刃：设置里列为不调整（item_balance_skip），取消电竞大脑之前的 -10%"), "{body}");
+        // nothing to take off or say: no round; no round yet: no power at all
+        assert!(make_reset(&rounds, &[("nopower".into(), Reset::Skip)], &[], today).is_none());
+        assert!(make_reset(&[], &[("jinx".into(), Reset::Edit)], &[], today).is_none());
+        // a round of resets is not the balance's: the late hotfix's timer and the rules' check look past it
+        let mut book = rounds.clone();
+        book.push(reset.clone());
+        assert_eq!(due(&book, Some("2028.2.0"), Some((2028, 4, 29))), None, "59 days after the balance round");
+        assert_eq!(due(&book, Some("2028.2.0"), Some((2028, 4, 30))), Some(Due::Late("2028.2.0".into())));
+        assert_eq!(due(&book, Some("2028.3.0"), today), Some(Due::Patch("2028.3.0".into())));
+        // the next balance round starts from the reset's power, and the champion waits for games with its new numbers
+        let mut m = meta();
+        m.champions.push(champ("jinx", 65.0, 300.0));
+        let next = make_round(&m, &book, RULES, &Due::Patch("2028.3.0".into()), today);
+        assert!(!next.reset && next.id == 6);
+        assert!(!next.changes.iter().any(|c| c.champion == "jinx"), "jinx waits for games after the reset: {:?}", next.changes);
+        // kept in the book as such; a round without resets writes nothing new
+        let json = serde_json::to_string(&book).unwrap();
+        let back: Vec<Round> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, book);
+        let plain = serde_json::to_string(&rounds).unwrap();
+        assert!(!plain.contains("reset") && json.contains(r#""reset":"edit""#) && json.contains(r#""reset":true"#), "{json}");
+    }
+
+    #[test]
+    fn balance_skip_leaves_a_champion_alone_and_takes_its_power_off() {
+        let m = meta();
+        let rounds = vec![Round { version: "2027.4.1".into(), ..powered(&[("maddie", -10)], &[]) }];
+        let skip = Skip { champions: ["maddie".to_string()].into(), items: Default::default() };
+        let round = make_round_with(&m, &rounds, RULES, &Due::Patch("2027.4.2".into()), None, None, &skip);
+        // maddie (73%) would be cut again; she is listed: her power comes off instead, nothing else changes her
+        let maddie: Vec<&Change> = round.changes.iter().filter(|c| c.champion == "maddie").collect();
+        assert_eq!(maddie.len(), 1, "{:?}", round.changes);
+        assert_eq!((maddie[0].step, maddie[0].total, maddie[0].reset), (10, 0, Some(Reset::Skip)));
+        assert!(!round.power.contains_key("maddie") && round.changes.iter().any(|c| c.champion == "weak"));
+        // without the list she is cut as before
+        let plain = make_round_with(&m, &rounds, RULES, &Due::Patch("2027.4.2".into()), None, None, &Skip::default());
+        assert!(plain.changes.iter().any(|c| c.champion == "maddie" && c.step < 0 && c.reset.is_none()));
+        // listed without power: just left alone
+        let fresh = make_round_with(&m, &[], RULES, &Due::First("2027.4.1".into()), None, None, &skip);
+        assert!(!fresh.changes.iter().any(|c| c.champion == "maddie"));
+    }
+
+    #[test]
+    fn the_book_keeps_every_champions_numbers_and_tells_the_players_changes() {
+        use crate::edits::Verdict;
+        let _serial = crate::tests::serial();
+        reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_seen_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        let n = |a: u32| {
+            let mut x = [0u32; 18];
+            x[0] = a;
+            x
+        };
+        let mut now: HashMap<String, crate::edits::Numbers> = [("jinx".to_string(), n(70)), ("fighter".to_string(), n(50))].into();
+        let defs: HashMap<String, crate::edits::Numbers> = [("jinx".to_string(), n(100))].into();
+        assert!(observe(&now, &defs, true).is_empty(), "no book: nothing kept");
+        open_for_tests(file.clone());
+        assert!(observe(&now, &defs, true).is_empty(), "the first read: nothing to tell");
+        now.insert("jinx".into(), n(90));
+        now.insert("fighter".into(), n(55));
+        assert_eq!(observe(&now, &defs, true), vec![("fighter".to_string(), Verdict::Player), ("jinx".to_string(), Verdict::Player)]);
+        assert!(observe(&now, &defs, true).is_empty(), "seen now");
+        // a mod's update: its file changed with the numbers
+        now.insert("jinx".into(), n(110));
+        let defs2: HashMap<String, crate::edits::Numbers> = [("jinx".to_string(), n(140))].into();
+        assert_eq!(observe(&now, &defs2, true), vec![("jinx".to_string(), Verdict::ModUpdate)]);
+        // with the balance off: taken as they are
+        now.insert("fighter".into(), n(60));
+        assert!(observe(&now, &defs2, false).is_empty());
+        // kept in the book's file: the next session compares with them
+        close();
+        open_for_tests(file.clone());
+        now.insert("fighter".into(), n(61));
+        assert_eq!(observe(&now, &defs2, true), vec![("fighter".to_string(), Verdict::Player)]);
+        close();
+        let _ = std::fs::remove_file(&file);
     }
 }

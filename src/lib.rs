@@ -27,6 +27,7 @@ pub mod compat;
 pub mod config;
 mod diag;
 pub mod draft;
+pub mod edits;
 pub mod glm;
 pub mod hell;
 pub mod items;
