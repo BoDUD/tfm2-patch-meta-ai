@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
@@ -103,11 +104,58 @@ pub fn encode<'a>(games: impl Iterator<Item = (&'a u64, &'a Game)>, names: &Name
 
 /// The matches in a file (record ids 0: they are older than anything the save lists now).
 pub fn decode(text: &str, names: &mut Names) -> Vec<(u64, Game)> {
-    let Ok(file) = serde_json::from_str::<File>(text) else { return Vec::new() };
-    if file.v != 1 {
-        return Vec::new();
+    parse(text).map(|p| build(p, names)).unwrap_or_default()
+}
+
+/// A history file parsed (its champions still names: [`build`] gives them the save's ids).
+pub struct Parsed(File);
+
+/// A history file's text parsed (None: not a history file of this format).
+pub fn parse(text: &str) -> Option<Parsed> {
+    let file = serde_json::from_str::<File>(text).ok()?;
+    (file.v == 1).then_some(Parsed(file))
+}
+
+/// A history file read and parsed on a thread of its own (2.11.0; the user, 2026-11-17: 「主界面读取数据的时候卡顿
+/// 优化了吧？」): the files are on the game's disk - on the user's a hard disk, where the 8.6 MB file of a long
+/// career held the frame it was read in for about half a second. Tests read it at once.
+pub struct Loading {
+    slot: Arc<Mutex<Option<Option<Parsed>>>>,
+}
+
+impl Loading {
+    pub fn start(path: PathBuf) -> Self {
+        let slot = Arc::new(Mutex::new(None));
+        let out = Arc::clone(&slot);
+        let work = move || {
+            let parsed = std::fs::read_to_string(&path).ok().and_then(|text| parse(&text));
+            *out.lock().unwrap_or_else(PoisonError::into_inner) = Some(parsed);
+        };
+        if cfg!(test) {
+            work();
+        } else if let Err(err) = std::thread::Builder::new().name(format!("{}-history-read", crate::MOD_ID)).spawn(work) {
+            crate::diag::log(&format!("[cache] could not start the thread that reads the history file: {err}"));
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(None);
+        }
+        Loading { slot }
     }
-    file.games
+
+    /// One whose read never ends (tests).
+    pub fn pending() -> Self {
+        Loading { slot: Arc::new(Mutex::new(None)) }
+    }
+
+    /// The file once read (`Some(None)`: missing, or not a history file); None while it is being read.
+    pub fn take(&self) -> Option<Option<Parsed>> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+/// A parsed file's matches, their champions given the save's ids.
+pub fn build(parsed: Parsed, names: &mut Names) -> Vec<(u64, Game)> {
+    parsed
+        .0
+        .games
         .into_iter()
         .map(|s| {
             let sides = s.p.map(|side| {
