@@ -67,6 +67,12 @@ pub struct Config {
     /// Champions a round changes at most, and its step at most (percent of power).
     pub balance_count: usize,
     pub balance_max: i32,
+    /// Percent of power a round changes a champion by for every win-rate point outside the band, and the move the
+    /// model expects of such a step (2.10.0, 1.0-5.0; 1.5 fixed before).
+    pub balance_per_point: f32,
+    /// Champions with too few games for their win rate a round buffs at most (2.10.0, `balance::UNPICKED_STEP`; 0 =
+    /// none, up to 60), besides `balance_count`.
+    pub balance_unpicked: usize,
     /// The 4+6 item pack's items in the balance patches too (`item_balance`, 2.9.0), at most `item_balance_count` a
     /// round, each a step of at most `item_balance_max` (percent of the item's numbers).
     pub item_balance: bool,
@@ -152,8 +158,10 @@ impl Default for Config {
             ai_variety: 1.0,
             ai_tactics: false,
             balance: false,
-            balance_count: 10,
-            balance_max: 10,
+            balance_count: 30,
+            balance_max: 20,
+            balance_per_point: crate::balance::DEFAULT_PER_POINT,
+            balance_unpicked: 20,
             item_balance: false,
             item_balance_count: 5,
             item_balance_max: 10,
@@ -208,6 +216,7 @@ impl Config {
             drift_sd: self.drift,
             change_sd: self.change,
             patch_shift: self.patch_shift,
+            balance_per_point: self.balance_per_point,
             reworked: self.reworked.clone(),
             role_sd: self.roles,
             athlete_sd: self.players,
@@ -289,12 +298,16 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
         "balance" => cfg.balance = flag(value)?,
-        // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」)
+        // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」); balance_max up to the
+        // champions' CAP, 80 since 2.10.0
         "balance_count" => cfg.balance_count = number(value)?.round().clamp(1.0, 60.0) as usize,
         "balance_max" => cfg.balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
+        // 2.10.0 (the user: 「你要所有英雄达到整体平衡啊 不能只找超模吧」; `balance::DEFAULT_PER_POINT`)
+        "balance_per_point" => cfg.balance_per_point = number(value)?.clamp(1.0, 5.0),
+        "balance_unpicked" => cfg.balance_unpicked = number(value)?.round().clamp(0.0, 60.0) as usize,
         "item_balance" => cfg.item_balance = flag(value)?,
         "item_balance_count" => cfg.item_balance_count = number(value)?.round().clamp(1.0, 30.0) as usize,
-        "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::CAP as f32) as i32,
+        "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::ITEM_CAP as f32) as i32,
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
             cfg.recency = None;
@@ -533,7 +546,7 @@ pub fn summary(c: &Config) -> String {
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
-         balance={} balance_count={} balance_max={} item_balance={} item_balance_count={} item_balance_max={}",
+         balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -581,6 +594,8 @@ pub fn summary(c: &Config) -> String {
         if c.balance { "on" } else { "off" },
         c.balance_count,
         c.balance_max,
+        c.balance_per_point,
+        c.balance_unpicked,
         if c.item_balance { "on" } else { "off" },
         c.item_balance_count,
         c.item_balance_max
@@ -635,27 +650,50 @@ ai_tactics=off
 ; balance : this mod makes the balance patches instead of the game. On every patch the game
 ;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
 ;           furthest outside a 48-52% win rate (with enough games, at most balance_count, up to
-;           60) get 1.5% of power stronger or weaker for every point outside (at most balance_max
-;           a patch, up to 50; 50% in all; half on attack / magic power, half on health), in every
-;           match. balance_count is a ceiling: a champion also needs 30 recent games, a win rate
-;           outside 48-52% and room under the limit, so a patch may change fewer.
+;           60) get balance_per_point % of power stronger or weaker for every point outside (at
+;           most balance_max a patch, up to 80; 80% in all; half on attack / magic power, half on
+;           health), in every match. balance_count is a ceiling: a champion also needs 30 recent
+;           games, a win rate outside 48-52% and room under the limit, so a patch may change fewer.
 ;           A champion changed waits for 30 games with its new numbers before the next change.
+;           2.10.0 makes one hotfix right away on a save whose newest patch was made by an older
+;           version, so that its rules (balance_per_point, 80%, balance_unpicked) work at once.
 ;           The changes are the game's own patch notes (inbox, patch history), with the patch's
 ;           news cards, and the ban/pick and encyclopedia stat panels show the new numbers.
 ;           While this is on the game's own champion patches are off (its settings are put back
 ;           when this is turned off).
 ; balance : 由本 Mod 出版本平衡补丁，代替游戏自带的。游戏每出一个版本（打开时先出一次热修复，
 ;           如 2027.4.1b），模型认为胜率离 48%–52% 最远的英雄（场次够的，最多 balance_count 个，
-;           最多可填 60）每偏 1 个点调 1.5% 的强度（单版最多 balance_max，最多可填 50；累计最多
-;           50%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
+;           最多可填 60）每偏 1 个点调 balance_per_point % 的强度（单版最多 balance_max，最多可填 80；
+;           累计最多 80%；一半在攻击/法强，一半在生命），所有比赛生效。改过的英雄要在新数值下打满 30 场
 ;           才会再改。balance_count 只是上限：英雄还要近期场次够 30、胜率在 48%–52% 之外、
 ;           没到累计上限才会被改，所以一版改的可能比它少。
+;           2.10.0 装上后，存档最新一轮是旧版本做的，读档时马上出一次热修复，按新规则
+;           （balance_per_point、80%、balance_unpicked）重新校准，只出这一次。
 ;           改动就写在游戏自己的补丁公告里（收件箱、百科的补丁历史），
 ;           也发补丁新闻；BP 和百科的英雄属性显示改动后的数值。开着时游戏自带的英雄补丁关掉
 ;           （关掉本项时恢复游戏原来的设置）。
 balance=off
-balance_count=10
-balance_max=10
+; 2.10.0 defaults: 30 champions and 20% a patch (10 and 10 before)
+; 2.10.0 起的默认值：每版最多 30 个英雄、单版最多 20%（以前 10 和 10）
+balance_count=30
+balance_max=20
+; balance_per_point : percent of power for each win-rate point outside 48-52%, 1-5 (2.10.0;
+;           1.5 before). The model expects a step to move its champion by as much. Measured on a
+;           save's 4+6 games, 10% of power moved a champion about 2.5 points (1.5 assumed 6.7):
+;           2.5 is a cautious middle.
+; balance_per_point : 胜率每偏 1 个点调多少强度（百分比，1～5；2.10.0 起，以前固定 1.5），模型也按它
+;           预期一刀的效果。按一个存档 4+6 环境下的比赛实测，强度改 10% 胜率约变 2.5 个点（1.5 以为会变
+;           6.7 个点），所以取偏保守的 2.5。
+balance_per_point=2.5
+; balance_unpicked : champions with fewer than 30 recent games are never judged by their win rate.
+;           Each patch also buffs up to this many of them by 10% of power (0 = off, up to 60; not
+;           counted in balance_count): those this save's careers drafted (picked or banned at least
+;           once in the kept matches), at most 50% against the field, the fewest games first, never
+;           above +30% through this rule. Once one has 30 games its win rate decides again.
+; balance_unpicked : 近期场次不到 30 场的英雄没法按胜率判断。每个版本另外给其中最多这么多个先加强 10%
+;           （0 = 关，最多 60；不占 balance_count）：只看这个存档里被选过或被禁过的、和场上比胜率不高于 50%
+;           的，场次最少的先加，这条规则最多加到 +30%。打满 30 场后照常按胜率调整。
+balance_unpicked=20
 ; item_balance : with alele's "4+6" item pack (alele_runes_and_items + alele_equipment_selection)
 ;                the balance patches change its finished items too: an item whose builders (the
 ;                heroes whose published build names it, 4 or more with games) still win too much or
@@ -680,8 +718,8 @@ tier_list=auto
 ; rank counted as solo_weight of a match). It rates at the same time
 ;   - each champion's strength in each patch: from one patch to the next it may move about
 ;     `drift` (untouched) or `change` (buffed / nerfed in the patch notes, moved by patch_shift
-;     in that direction; a balance patch of this mod's by its size, about a point for each 1.5% of
-;     power) - so games from before a balance change still count, just less;
+;     in that direction; a balance patch of this mod's by its size, a point for each
+;     balance_per_point % of power) - so games from before a balance change still count, just less;
 ;   - each champion's strength in each lane (`roles`);
 ;   - each player's own strength and their mastery of each champion (`players`, `mastery`):
 ;     a champion is not rated up just because the best team plays it;
@@ -689,8 +727,8 @@ tier_list=auto
 ; Larger values let the data move an effect further from "no effect" (log-odds).
 ; 用最近 patches 个版本的全部比赛（大会 + 单排×solo_weight）拟合一个模型，同时估计：
 ;   - 每个英雄在每个版本的强度：相邻版本间未改动的英雄最多变化约 drift，被加强/削弱的
-;     最多约 change（并按 patch_shift 朝改动方向预移；本 Mod 自己的平衡补丁按改动幅度预移，每 1.5%
-;     强度约 1 个胜率点）——改动前的比赛仍然计入，只是权重变小；
+;     最多约 change（并按 patch_shift 朝改动方向预移；本 Mod 自己的平衡补丁按改动幅度预移，每
+;     balance_per_point % 强度 1 个胜率点）——改动前的比赛仍然计入，只是权重变小；
 ;   - 英雄在每个位置的强度（roles）；
 ;   - 选手本人的实力和对每个英雄的熟练度（players、mastery）：不会因为强队爱用就高估某英雄；
 ;   - 队友配合与对位克制（pairs）。
@@ -855,6 +893,45 @@ ban_pick=yes
         assert!(warnings.is_empty());
         assert_eq!((cfg.tier_list, cfg.ban_pick), (Switch::Auto, Switch::On));
         assert_eq!(parse("tier_list=maybe").1.len(), 1);
+    }
+
+    #[test]
+    fn the_balance_limits_and_their_defaults() {
+        let d = Config::default();
+        // 2.10.0: 30 champions and 20% a patch by default (10 / 10 before); the items' as they were
+        assert_eq!((d.balance_count, d.balance_max, d.item_balance_count, d.item_balance_max), (30, 20, 5, 10));
+        let cfg = parse("balance_count=70\nbalance_max=100\nitem_balance_count=40\nitem_balance_max=100\n").0;
+        // a champion's step up to its CAP (80), an item's up to ITEM_CAP (50)
+        assert_eq!((cfg.balance_count, cfg.balance_max, cfg.item_balance_count, cfg.item_balance_max), (60, 80, 30, 50));
+        assert_eq!((crate::balance::CAP, crate::balance::ITEM_CAP), (80, 50));
+        let cfg = parse("balance_count=0\nbalance_max=-3\nitem_balance_max=0\n").0;
+        assert_eq!((cfg.balance_count, cfg.balance_max, cfg.item_balance_max), (1, 1, 1));
+        // a settings.ini that names them keeps its own numbers
+        let cfg = parse("balance_count=20\nbalance_max=10\n").0;
+        assert_eq!((cfg.balance_count, cfg.balance_max), (20, 10));
+    }
+
+    #[test]
+    fn balance_unpicked_is_read_and_clamped() {
+        let unpicked = |text: &str| parse(text).0.balance_unpicked;
+        assert_eq!(Config::default().balance_unpicked, 20);
+        assert_eq!((unpicked("balance_unpicked=0"), unpicked("balance_unpicked=7.6")), (0, 8), "0 = off");
+        assert_eq!((unpicked("balance_unpicked=70"), unpicked("balance_unpicked=-5")), (60, 0), "kept within 0-60");
+        assert_eq!(parse("balance_unpicked=many").1.len(), 1);
+        assert!(summary(&Config::default()).contains("balance_unpicked=20"));
+    }
+
+    #[test]
+    fn balance_per_point_is_read_clamped_and_given_to_the_model() {
+        let per_point = |text: &str| parse(text).0.balance_per_point;
+        assert_eq!(Config::default().balance_per_point, 2.5);
+        assert_eq!((per_point("balance_per_point=3"), per_point("balance_per_point=1,5")), (3.0, 1.5));
+        assert_eq!((per_point("balance_per_point=0.2"), per_point("balance_per_point=9")), (1.0, 5.0), "kept within 1-5");
+        let (cfg, warnings) = parse("balance_per_point=lots");
+        assert_eq!((cfg.balance_per_point, warnings.len()), (2.5, 1), "a bad value keeps the default");
+        // the model expects a step by the same number
+        assert_eq!(parse("balance_per_point=4").0.model().balance_per_point, 4.0);
+        assert!(summary(&parse("balance_per_point=4").0).contains("balance_per_point=4"));
     }
 
     #[test]

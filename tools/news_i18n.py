@@ -4,15 +4,18 @@
 The game's patch notes give each champion a reason as codes of `patch.reason.*` texts; the balance patches' codes
 (`balance::reason`) are the model's win rate (`pma_wr_<n>`, n 0..100), the change's power this patch and in all
 (`pma_power_<m|p><n>`, `pma_sum_<m|p><n>`, 2.9.0: -11 is `m11`, n up to CAP) and the limits that held a change
-(`pma_cap`, `pma_total`). A text cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what
-patch notes without a champion change say (`server::UNCHANGED_TEXT`).
+(`pma_cap`, `pma_total_<CAP>`: 2.10.0's limit of 80; `pma_total` stays 2.9.0's 50 for the notes written then); an
+unpicked buff (2.10.0, `balance::UNPICKED_STEP`) gives `pma_unpicked` instead of a win rate. A text
+cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what patch notes without a
+champion change say (`server::UNCHANGED_TEXT`).
 
     python tools/news_i18n.py
 """
 import json
 import os
 
-CAP = 50  # balance::CAP
+CAP = 80  # balance::CAP (2.10.0)
+LEGACY_CAP = 50  # 2.9.0's, in `pma_total`: the notes it wrote at its limit keep saying 50
 
 # (above the band, below it, near it, the round's limit, the overall limit); {n} is the win rate
 TEXTS = {
@@ -216,6 +219,26 @@ POWER = {
         "ความแข็งแกร่งรวม {t}%",
     ),
 }
+# an unpicked buff's reason (2.10.0, `balance::reason`: `pma_unpicked`, before its power codes): too few games (fewer
+# than balance::MIN_EVIDENCE) for its win rate to count, a small buff to bring it into play
+UNPICKED = {
+    "zh-hans": "近几个版本很少有人选（场次不到 30 场），先小幅加强，等有了比赛数据再按胜率调整。",
+    "zh-hant": "近幾個版本很少有人選（場次不到 30 場），先小幅加強，等有了比賽數據再按勝率調整。",
+    "en": "Rarely picked in recent patches (fewer than 30 games): a small buff for now; once it has games, its win rate decides.",
+    "ko": "최근 몇 패치 동안 거의 선택되지 않았습니다(30경기 미만). 우선 소폭 상향하고, 경기 데이터가 쌓이면 승률에 따라 조정합니다.",
+    "ja": "ここ数パッチほとんど選ばれていません（30試合未満）。まず小幅に強化し、試合データが集まったら勝率に応じて調整します。",
+    "de": "In den letzten Patches kaum gewählt (weniger als 30 Spiele): vorerst eine kleine Verstärkung; sobald Spiele vorliegen, entscheidet die Siegquote.",
+    "fr": "Rarement choisi lors des derniers patchs (moins de 30 parties) : un petit renforcement pour l'instant ; une fois les parties jouées, son taux de victoire décidera.",
+    "es-ES": "Apenas elegido en los últimos parches (menos de 30 partidas): por ahora una pequeña mejora; cuando tenga partidas, decidirá su tasa de victorias.",
+    "pt-BR": "Pouco escolhido nos últimos patches (menos de 30 partidas): por enquanto um pequeno buff; quando tiver partidas, a taxa de vitória decide.",
+    "it": "Scelto raramente nelle ultime patch (meno di 30 partite): per ora un piccolo potenziamento; quando avrà partite, deciderà il suo tasso di vittoria.",
+    "ru": "В последних патчах его почти не выбирали (меньше 30 игр): пока небольшое усиление; когда наберутся игры, всё решит процент побед.",
+    "pl": "Rzadko wybierany w ostatnich łatkach (mniej niż 30 gier): na razie małe wzmocnienie; gdy zbierze gry, zdecyduje współczynnik zwycięstw.",
+    "tr": "Son yamalarda nadiren seçildi (30 maçtan az): şimdilik küçük bir güçlendirme; maç verisi biriktiğinde kazanma oranına göre ayarlanacak.",
+    "nl": "De laatste patches zelden gekozen (minder dan 30 wedstrijden): voorlopig een kleine buff; zodra er wedstrijden zijn, beslist het winpercentage.",
+    "vi": "Ít được chọn trong vài bản cập nhật gần đây (dưới 30 trận): tạm thời tăng sức mạnh nhẹ; khi có đủ dữ liệu trận đấu sẽ điều chỉnh theo tỷ lệ thắng.",
+    "th": "แทบไม่มีใครเลือกในช่วงหลายแพตช์ล่าสุด (ไม่ถึง 30 เกม) จึงเพิ่มพลังเล็กน้อยก่อน เมื่อมีข้อมูลการแข่งขันแล้วจะปรับตามอัตราชนะ",
+}
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
 
@@ -227,7 +250,9 @@ def reasons(lang):
         text = above if n > 52 else below if n < 48 else near
         out[f"pma_wr_{n}"] = text.format(n=n)
     out["pma_cap"] = cap
-    out["pma_total"] = total.format(cap=CAP)
+    out["pma_total"] = total.format(cap=LEGACY_CAP)
+    out[f"pma_total_{CAP}"] = total.format(cap=CAP)
+    out["pma_unpicked"] = UNPICKED.get(lang, UNPICKED["en"])
     power, power_hp, in_all = POWER.get(lang, POWER["en"])
     signed = lambda v: f"{v:+d}"
     for v in range(-CAP, CAP + 1):

@@ -48,7 +48,10 @@ fn balance_line(labels: &Labels) -> String {
     let list: Vec<String> = r
         .changes
         .iter()
-        .map(|c| format!("{} {:+}% ({:+}% in all)", labels.champion(&c.champion), c.step, c.total))
+        .map(|c| {
+            let unpicked = if c.unpicked { ", unpicked" } else { "" };
+            format!("{} {:+}% ({:+}% in all{unpicked})", labels.champion(&c.champion), c.step, c.total)
+        })
         .collect();
     format!(
         "\nbalance round {} ({}{}): {}",

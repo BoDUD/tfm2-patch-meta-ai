@@ -1383,7 +1383,7 @@ mod tests {
                 version: NEXT_PATCH.into(),
                 label: NEXT_PATCH.into(),
                 merged: true,
-                changes: vec![Change { champion: "tft_maddie".into(), win: 74.0, evidence: 99.0, step: -10, total: -20 }],
+                changes: vec![Change { champion: "tft_maddie".into(), win: 74.0, evidence: 99.0, step: -10, total: -20, unpicked: false }],
                 power: [("tft_maddie".to_string(), -20)].into_iter().collect(),
                 ..Round::default()
             };

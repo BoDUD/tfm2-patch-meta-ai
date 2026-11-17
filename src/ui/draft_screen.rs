@@ -1329,6 +1329,8 @@ mod tests {
 
     #[test]
     fn coach_features_ban_phase_scouting_breakdown_review() {
+        // the screen marks the draft live and takes the AI's noted choices: not while draft::tests use them
+        let _serial = crate::tests::serial();
         let snapshot = snapshot(2000);
         let book = NameBook::default();
         let mut ui = screen();
@@ -1431,6 +1433,7 @@ mod tests {
 
     #[test]
     fn reads_the_draft_and_draws_the_overlay() {
+        let _serial = crate::tests::serial();
         let snapshot = snapshot(2000);
         let book = NameBook::default();
         let mut ui = screen();
@@ -1512,6 +1515,7 @@ mod tests {
 
     #[test]
     fn the_swap_phase_shows_the_best_seating() {
+        let _serial = crate::tests::serial();
         let snapshot = snapshot(1500);
         let book = NameBook::default();
         let rosters = HashMap::new();
@@ -1552,6 +1556,7 @@ mod tests {
 
     #[test]
     fn says_so_when_there_is_too_little_data() {
+        let _serial = crate::tests::serial();
         let book = NameBook::default();
         let rosters = HashMap::new();
         let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
