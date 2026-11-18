@@ -133,4 +133,26 @@ mod tests {
         assert_eq!(feature_name(0), "攻击");
         assert_eq!(feature_name(STATS + 2), "生命成长");
     }
+
+    /// Game 0.7.3's Tank role (`ChampionCategoryV1::Tank`, code 5, ABI 11) is a group of its own, apart from the
+    /// fighters (code 0) and from the whole pool (`POOL`).
+    #[test]
+    fn tanks_are_a_group_of_their_own() {
+        assert_eq!(mod_api_stable::ChampionCategoryV1::from_code(5), Some(mod_api_stable::ChampionCategoryV1::Tank));
+        assert_ne!(mod_api_stable::ChampionCategoryV1::Tank.code() as u8, POOL);
+        let mut names = Names::default();
+        let mut stats = HashMap::new();
+        for (k, cat) in [(0..5u16, 0u8), (5..10, 5)] {
+            for i in k {
+                let n = format!("c{i}");
+                names.id(&n);
+                let hp = if cat == 5 { 1200.0 + 10.0 * i as f32 } else { 900.0 + 10.0 * i as f32 };
+                stats.insert(n, Stats { category: Some(cat), base: [90.0, 0.0, hp, 30.0, 25.0, 1000.0], growth: [0.0; STATS] });
+            }
+        }
+        let f = features(&names, names.len() as u16, &stats);
+        assert!(f[..5].iter().all(|x| x.unwrap().0 == 0) && f[5..].iter().all(|x| x.unwrap().0 == 5));
+        // each tank's health is compared with the tanks': the middle one is average there
+        assert!(f[7].unwrap().1[2].abs() < 1e-3, "{:?}", f[7]);
+    }
 }

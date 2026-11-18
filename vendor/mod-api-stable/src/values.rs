@@ -63,12 +63,14 @@ macro_rules! stable_code_enum {
 
 stable_code_enum!(
     /// Mirror of game-core `ChampionCategory`.
+    /// `Tank` is supported starting at ABI level 11.
     ChampionCategoryV1 {
         Melee = 0,
         Range = 1,
         Magician = 2,
         Util = 3,
         Assassin = 4,
+        Tank = 5,
     }
 );
 
