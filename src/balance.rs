@@ -1347,6 +1347,18 @@ pub fn view() -> Option<Arc<View>> {
     store().view.clone()
 }
 
+/// The item changes of the round a patch shows as `label` (its version, or a hotfix's label such as 2028.2.0b; 2.12.2,
+/// the patch history's item section `ui::patch_items`). Empty: no such round, or it changed no item.
+pub fn items_of(label: &str) -> Vec<ItemChange> {
+    let st = store();
+    st.rounds
+        .iter()
+        .rev()
+        .find(|r| if r.label.is_empty() { r.version == label } else { r.label == label })
+        .map(|r| r.items.clone())
+        .unwrap_or_default()
+}
+
 /// The newest round's item power as the item pages show it (2.12.1, `ui::item_view`; a pointer, no copy).
 pub fn item_view() -> Option<Arc<BTreeMap<String, i32>>> {
     let st = store();
