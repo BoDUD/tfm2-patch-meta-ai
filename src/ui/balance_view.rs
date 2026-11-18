@@ -60,7 +60,7 @@ fn panels() -> Vec<Panel> {
 }
 
 /// The champion a name label shows: its text is the game's reference to the champion's name (or the name itself).
-fn champion_of(text: &str, names: &NameBook) -> Option<String> {
+pub(crate) fn champion_of(text: &str, names: &NameBook) -> Option<String> {
     let text = text.trim();
     if let Some(rest) = text.strip_prefix("#asset/base/text/champion?description.") {
         if let Some(id) = rest.strip_suffix(".name") {

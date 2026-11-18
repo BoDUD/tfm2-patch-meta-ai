@@ -1347,16 +1347,30 @@ pub fn view() -> Option<Arc<View>> {
     store().view.clone()
 }
 
-/// The item changes of the round a patch shows as `label` (its version, or a hotfix's label such as 2028.2.0b; 2.12.2,
-/// the patch history's item section `ui::patch_items`). Empty: no such round, or it changed no item.
-pub fn items_of(label: &str) -> Vec<ItemChange> {
+/// The round a patch note shows, found by its champions (2.12.2, the patch history's item block `ui::patch_items`: the
+/// page's titles are a text reference whose version the mod cannot read, its entries name their champions): of the
+/// rounds that changed champions, the one whose (champion, buff) set is the most alike the shown one - alike enough
+/// (Jaccard 0.8 or more; the newest of equals). Its label and its item changes.
+pub fn round_of_champions(shown: &std::collections::BTreeSet<(String, bool)>) -> Option<(String, Vec<ItemChange>)> {
+    if shown.is_empty() {
+        return None;
+    }
     let st = store();
-    st.rounds
-        .iter()
-        .rev()
-        .find(|r| if r.label.is_empty() { r.version == label } else { r.label == label })
-        .map(|r| r.items.clone())
-        .unwrap_or_default()
+    let mut best: Option<(f32, &Round)> = None;
+    for r in &st.rounds {
+        let set: std::collections::BTreeSet<(String, bool)> = r.changes.iter().filter(|c| c.step != 0).map(|c| (c.champion.clone(), c.step > 0)).collect();
+        if set.is_empty() {
+            continue;
+        }
+        let common = shown.intersection(&set).count() as f32;
+        let all = shown.union(&set).count() as f32;
+        let alike = common / all;
+        if best.is_none_or(|(b, _)| alike >= b) {
+            best = Some((alike, r));
+        }
+    }
+    let (alike, r) = best?;
+    (alike >= 0.8).then(|| (if r.label.is_empty() { r.version.clone() } else { r.label.clone() }, r.items.clone()))
 }
 
 /// The newest round's item power as the item pages show it (2.12.1, `ui::item_view`; a pointer, no copy).
