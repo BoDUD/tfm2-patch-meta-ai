@@ -1,7 +1,9 @@
 //! The UI explorer: writes the live node tree of a screen to `ui_dump_<n>.txt` in the mod folder:
 //! every node's path, kind, visibility, rectangle, text and runner state. It runs when a screen
-//! the session has not seen appears (`explore=on` in settings.ini) and whenever F9 is pressed,
-//! and walks a few hundred nodes per frame so a big screen costs no visible hitch.
+//! the session has not seen appears (`explore=on` in settings.ini) and whenever Insert or F9 is
+//! pressed, and walks a few hundred nodes per frame so a big screen costs no visible hitch. Insert
+//! since 2.12.1: the game made F9 its key for the facilities (设施) on the main screen, so F9 there
+//! dumps the facilities' page the game has just opened.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -12,7 +14,8 @@ const NODES_PER_FRAME: usize = 250;
 const MAX_NODES: usize = 6000;
 const MAX_DUMPS: u32 = 20;
 const LOOK_EVERY: u64 = 30;
-pub const HOTKEY: &str = "F9";
+/// The keys that write a dump (engine key names): Insert, and F9 where the game has no use for it.
+pub const HOTKEYS: [&str; 2] = ["Insert", "F9"];
 
 #[derive(Default)]
 pub struct Explorer {
@@ -50,7 +53,8 @@ fn clip(text: &str, max: usize) -> String {
 impl Explorer {
     /// One frame. `auto` = dump screens not seen before; `scene` labels the dump.
     pub fn tick(&mut self, ui: &impl Ui, frame: u64, auto: bool, scene: &str, keys: &[String]) {
-        let manual = keys.iter().any(|k| k.eq_ignore_ascii_case(HOTKEY));
+        let pressed = keys.iter().find(|k| HOTKEYS.iter().any(|h| k.eq_ignore_ascii_case(h)));
+        let manual = pressed.is_some();
         if self.running.is_none() && (manual || (auto && frame >= self.next_look)) {
             self.next_look = frame + LOOK_EVERY;
             let sig = signature(ui);
@@ -58,7 +62,10 @@ impl Explorer {
             if (manual || new) && self.dumps < MAX_DUMPS {
                 self.dumps += 1;
                 let file = format!("ui_dump_{:02}.txt", self.dumps);
-                let reason = if manual { format!("{HOTKEY} pressed") } else { "new screen".to_string() };
+                let reason = match pressed {
+                    Some(key) => format!("{key} pressed"),
+                    None => "new screen".to_string(),
+                };
                 let mut queue = VecDeque::new();
                 for root in ui.children("") {
                     queue.push_back((root, 0));

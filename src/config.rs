@@ -158,7 +158,7 @@ pub struct Config {
     pub report: bool,
     // [debug]
     pub verbose: bool,
-    /// Write the UI tree of every new screen to `ui_dump_*.txt` (F9 always does).
+    /// Write the UI tree of every new screen to `ui_dump_*.txt` (Insert, or F9 off the main screen, always does).
     pub explore: bool,
 }
 
@@ -921,8 +921,10 @@ meta_page=on
 report=on
 
 [debug]
-; explore : write the UI tree of every new screen to ui_dump_*.txt (F9 writes one any time)
-;           把每个新界面的 UI 结构写入 ui_dump_*.txt（任何时候按 F9 也会写一份）
+; explore : write the UI tree of every new screen to ui_dump_*.txt (Insert writes one any time; F9
+;           too, but on the main screen the game takes F9 for its facilities)
+;           把每个新界面的 UI 结构写入 ui_dump_*.txt（任何时候按 Insert 也会写一份；F9 也行，但主界面
+;           的 F9 是游戏打开「设施」的键）
 explore=off
 ; more detail in diag.log / diag.log 写更多细节
 verbose=off
