@@ -13,6 +13,7 @@ pub mod lineup_screen;
 pub mod explore;
 pub mod item_spec;
 pub mod item_view;
+pub mod patch_items;
 pub mod names;
 pub mod page;
 pub mod panel;
@@ -222,6 +223,7 @@ struct State {
     lineup: lineup_screen::LineupScreen,
     balance: balance_view::BalanceView,
     items: item_view::ItemView,
+    patch_items: patch_items::PatchItems,
     context: Context,
 }
 
@@ -318,6 +320,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     if cfg.balance && cfg.item_balance {
         let (catalog, power) = (crate::items::catalog(), crate::balance::item_view());
         time(Part::Page, || st.items.tick(ui, catalog.as_deref(), power.as_deref()));
+        // and the item changes in the patch history (2.12.2)
+        time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_patch));
     }
 }
 

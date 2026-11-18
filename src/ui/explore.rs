@@ -90,6 +90,22 @@ impl Explorer {
     }
 }
 
+/// Writes the tree under `root` to `file` at once (2.12.2: a page a feature watches, when no key reaches the game -
+/// the patch history's item section): the same lines as a dump, at most [`MAX_NODES`].
+pub fn write_tree(ui: &impl Ui, root: &str, file: &str, reason: &str) {
+    let mut dump = Dump { file: file.to_string(), reason: reason.to_string(), queue: VecDeque::from([(root.to_string(), 0)]), lines: Vec::new(), nodes: 0 };
+    while !step(ui, &mut dump) {}
+    let header = format!(
+        "{} {} - UI tree under {root} ({}), {} nodes\npath [kind] visible rect(x,y,w,h) text=... state=...\n\n",
+        crate::MOD_ID,
+        crate::VERSION,
+        dump.reason,
+        dump.nodes
+    );
+    diag::write_file(&dump.file, &(header + &dump.lines.join("\n")));
+    diag::log(&format!("[ui] wrote {file}: {} nodes under {root}", dump.nodes));
+}
+
 /// Walks some nodes; true when the dump is complete.
 fn step(ui: &impl Ui, dump: &mut Dump) -> bool {
     for _ in 0..NODES_PER_FRAME {
