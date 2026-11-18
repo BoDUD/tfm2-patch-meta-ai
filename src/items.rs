@@ -508,17 +508,21 @@ pub fn corrections(catalog: &Catalog, owned: &[(String, BuffV1)], power: &BTreeM
 /// One of an item's numbers in the notes: (label, before, after).
 pub type Line = (String, String, String);
 
+/// One of an item's numbers `v` as its holders play with it at `p` percent of power: the correction buff's rule
+/// ([`correction`]: `p` percent of it, rounded; an unsigned number only up). The notes ([`lines`]) and the item pages
+/// (`ui::item_view`, 2.12.1) show it.
+pub fn at(v: f64, p: i32, signed: bool) -> f64 {
+    let d = (v * f64::from(p) / 100.0).round();
+    if !signed && d < 0.0 {
+        v
+    } else {
+        v + d
+    }
+}
+
 /// An item's numbers before and after a change (`before` -> `after` percent of power), as the notes give them:
 /// (label, from, to) for each number that moves - an unsigned one only while it is above the item's own.
 pub fn lines(item: &Item, before: i32, after: i32, chinese: bool) -> Vec<Line> {
-    let at = |v: f64, p: i32, signed: bool| {
-        let d = (v * f64::from(p) / 100.0).round();
-        if !signed && d < 0.0 {
-            v
-        } else {
-            v + d
-        }
-    };
     let mut out = Vec::new();
     for (i, v) in &item.stats {
         let (_, signed, zh, en) = STATS[*i];

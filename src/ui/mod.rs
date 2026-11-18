@@ -11,6 +11,8 @@ pub mod balance_view;
 pub mod draft_screen;
 pub mod lineup_screen;
 pub mod explore;
+pub mod item_spec;
+pub mod item_view;
 pub mod names;
 pub mod page;
 pub mod panel;
@@ -219,6 +221,7 @@ struct State {
     tactics: tactics_screen::TacticsScreen,
     lineup: lineup_screen::LineupScreen,
     balance: balance_view::BalanceView,
+    items: item_view::ItemView,
     context: Context,
 }
 
@@ -310,6 +313,11 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     if cfg.balance {
         let view = crate::balance::view();
         time(Part::Page, || st.balance.tick(ui, &st.names, view.as_deref()));
+    }
+    // the 4+6 item pages with the item balance on (2.12.1)
+    if cfg.balance && cfg.item_balance {
+        let (catalog, power) = (crate::items::catalog(), crate::balance::item_view());
+        time(Part::Page, || st.items.tick(ui, catalog.as_deref(), power.as_deref()));
     }
 }
 

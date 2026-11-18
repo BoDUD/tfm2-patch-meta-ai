@@ -120,7 +120,7 @@ pub fn scale(text: &str, factor: f64) -> Option<String> {
 }
 
 /// A label's text without its rich-text tags.
-fn plain(text: &str) -> String {
+pub fn plain(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_tag = false;
     for c in text.chars() {

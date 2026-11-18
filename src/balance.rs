@@ -1347,6 +1347,13 @@ pub fn view() -> Option<Arc<View>> {
     store().view.clone()
 }
 
+/// The newest round's item power as the item pages show it (2.12.1, `ui::item_view`; a pointer, no copy).
+pub fn item_view() -> Option<Arc<BTreeMap<String, i32>>> {
+    let st = store();
+    let newest = st.rounds.last()?;
+    st.item_powers.get(&newest.id).cloned()
+}
+
 /// Whether a round is due on this save ([`due`]).
 pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Due> {
     let st = store();

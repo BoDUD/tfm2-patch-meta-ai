@@ -54,6 +54,17 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.12.1：装备说明显示补丁后的数值；界面快照改按 Insert
+
+用户：「能真正的改游戏内装备属性的文本吗 不能是吗」，查清楚以后说「做」。
+
+- **装备说明是游戏画的**：4+6 用游戏的稳定接口把装备注册给游戏（452 件），游戏自己的装备页——游戏百科 → 装备信息、战术界面的装备弹窗——显示它们：`data.item_detail.name` 是名字，`data.item_detail.desc` 一项数值一行，用游戏的模板（`asset/base/text/item` 的 `spec`，如「攻击力 +{Value}」）配上 4+6 注册的数值，下面接 4+6 自己的效果说明。4+6 的文件不归我们改，它的数值不动。
+- **改的是这两个页面上的那几行**（`ui::item_view`）：一件被平衡补丁改过的装备，说明里显示它自己数值的那几行换成持有者在比赛里实际拿到的数值，规则和比赛里的修正效果一样（`items::at`：本版强度乘每项数值，四舍五入；穿透、韧性这类只能加不能减），颜色同 BP 图例（加强绿、削弱橙）。没改过的装备、对不上自己数值的行（别的语言的游戏也按 17 种语言的模板认）都不动。和英雄属性面板一样在游戏画完界面之后每帧做，游戏重写说明（换一件、同一件再选）也会马上换回来。
+- **模板表**：`src/ui/item_spec.rs` 是 `tools/item_spec.py` 从游戏的 `bundle.game_data` 生成的（26 种数值、17 种语言），游戏改了模板就重新生成。
+- **百科的装备页**在 `main.top.right` 下面某个子节点的 `data.item_detail`，电竞大脑自己找；战术弹窗是 `main.item_info_popup.popup.content.item_info.data.item_detail`。第一次看到这两个页面时 `diag.log` 记一行 `[ui] item page ...`（名字和说明的原文），改了的话再记一行改前改后。
+- **管不到的**：4+6 的「启动选择器.exe」在游戏外面，还是原数值；比赛里装备格的悬停说明还没找到对应的界面，没改。
+- **界面快照改按 Insert**：游戏后来把 F9 当成主界面的「设施」快捷键，在主界面按 F9 会先跳到设施页，写下来的就成了设施页（用户 11-18 按了三次都是这样）。现在 Insert 和 F9 都写快照，主界面请按 Insert。
+
 ## 2.12.0：装备平衡放宽（装备先判、门槛降低、步子放大）
 
 用户：「装备的削弱补丁有点弱啊 需要调整 每次只有那一件？」，看了分析后选「放宽规则」。
@@ -262,13 +273,13 @@
 | | `balance_skip` | （空） | 平衡补丁永远不调整的英雄（id 或游戏里显示的名字，逗号分隔）；已有调整马上取消（2.11.0） |
 | | `item_balance_skip` | （空） | 同上，4+6 装备（key 或名字） |
 | `[report]` | `report` | on | 写 `meta_report.html` |
-| `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 F9 随时写一份） |
+| `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 Insert 随时写一份；F9 在主界面是游戏的「设施」键） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
 
 ## 快捷键
 
 - **F8**：打开 Meta 面板 / 下一页 / 最后一页后关闭。
-- **F9**：把当前界面的 UI 结构写进 `ui_dump_*.txt`（反馈界面问题时用）。
+- **Insert**（2.12.1 起；F9 也行，但主界面的 F9 是游戏的「设施」键）：把当前界面的 UI 结构写进 `ui_dump_*.txt`（反馈界面问题时用）。
 
 ## 出问题时看这些文件
 
@@ -312,6 +323,6 @@ The game prunes old match records; each save's matches are also kept in `history
 
 - `ban_pick` defaults to `off` (2.7.10), `tier_list` to `auto`; `auto` steps aside for Drafter's Toolbox (tiers) and Terminator Draft AI (AI draft), read from the game's `mods.json`.
 - Game 0.6.4 adds a lane-assignment step after an AI team's picks; this mod stays out of it (when several mods decide, the last one wins), so the game or Smart Position Lock assigns the lanes.
-- Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; F9 dumps the UI tree for bug reports.
+- Settings in `settings.ini` are hot-reloaded; `diag.log` shows what the mod sees; Insert (or F9 off the main screen, where the game took F9 for its facilities) dumps the UI tree for bug reports.
 - Build with `cargo build --release` on Windows, or `tools/build.sh` from Linux.
 - MIT licensed. `vendor/mod-api-stable` is TeamSamoyed's SDK as shipped with game 0.6.5 (ABI level 10, 0.6.4's plus the frozen abi_level_10.txt; game 0.7.0 ships it unchanged); the DLL asks for level 1 only, so it still loads on 0.6.0-0.6.3.
