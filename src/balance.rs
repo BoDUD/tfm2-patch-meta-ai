@@ -1348,29 +1348,33 @@ pub fn view() -> Option<Arc<View>> {
 }
 
 /// The round a patch note shows, found by its champions (2.12.2, the patch history's item block `ui::patch_items`: the
-/// page's titles are a text reference whose version the mod cannot read, its entries name their champions): of the
-/// rounds that changed champions, the one whose (champion, buff) set is the most alike the shown one - alike enough
-/// (Jaccard 0.8 or more; the newest of equals). Its label and its item changes.
-pub fn round_of_champions(shown: &std::collections::BTreeSet<(String, bool)>) -> Option<(String, Vec<ItemChange>)> {
+/// page's titles are a text reference whose version the mod cannot read, and its entries share one name, so only each
+/// column's count and first champion can be read): the rounds whose buffs and nerfs (steps other than 0, in the
+/// round's order - the order the game lists them) are as many as shown and hold the shown first ones; of those the one
+/// whose first ones are the shown first ones, the newest of equals. Its label and its item changes.
+pub fn round_of_patch(shown: &crate::ui::patch_items::Shown) -> Option<(String, Vec<ItemChange>)> {
     if shown.is_empty() {
         return None;
     }
     let st = store();
-    let mut best: Option<(f32, &Round)> = None;
+    let mut best: Option<(u8, &Round)> = None;
     for r in &st.rounds {
-        let set: std::collections::BTreeSet<(String, bool)> = r.changes.iter().filter(|c| c.step != 0).map(|c| (c.champion.clone(), c.step > 0)).collect();
-        if set.is_empty() {
+        let side = |buff: bool| -> Vec<&str> { r.changes.iter().filter(|c| c.step != 0 && (c.step > 0) == buff).map(|c| c.champion.as_str()).collect() };
+        let (buffs, nerfs) = (side(true), side(false));
+        if buffs.len() != shown.buffs || nerfs.len() != shown.nerfs {
             continue;
         }
-        let common = shown.intersection(&set).count() as f32;
-        let all = shown.union(&set).count() as f32;
-        let alike = common / all;
-        if best.is_none_or(|(b, _)| alike >= b) {
-            best = Some((alike, r));
+        let holds = |list: &[&str], first: &Option<String>| first.as_deref().is_none_or(|f| list.contains(&f));
+        if !holds(&buffs, &shown.first_buff) || !holds(&nerfs, &shown.first_nerf) {
+            continue;
+        }
+        let score = u8::from(buffs.first().copied() == shown.first_buff.as_deref()) + u8::from(nerfs.first().copied() == shown.first_nerf.as_deref());
+        if best.is_none_or(|(b, _)| score >= b) {
+            best = Some((score, r));
         }
     }
-    let (alike, r) = best?;
-    (alike >= 0.8).then(|| (if r.label.is_empty() { r.version.clone() } else { r.label.clone() }, r.items.clone()))
+    let (_, r) = best?;
+    Some((if r.label.is_empty() { r.version.clone() } else { r.label.clone() }, r.items.clone()))
 }
 
 /// The newest round's item power as the item pages show it (2.12.1, `ui::item_view`; a pointer, no copy).

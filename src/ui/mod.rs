@@ -321,7 +321,7 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         let (catalog, power) = (crate::items::catalog(), crate::balance::item_view());
         time(Part::Page, || st.items.tick(ui, catalog.as_deref(), power.as_deref()));
         // and the item changes in the patch history (2.12.2)
-        time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_champions));
+        time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_patch));
     }
 }
 

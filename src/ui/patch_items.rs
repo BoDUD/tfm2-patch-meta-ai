@@ -7,12 +7,13 @@
 //! (`scroll`) gives up the room and our block ([`SECTION`]) sits below it, always in sight - one line an item: its
 //! icon and name, the step and the total, its numbers before and after with the stat icons, its builders' win rate.
 //! Which patch it is comes from its champions: the page's titles are a text reference whose version is bound where the
-//! mod cannot read it (`#asset/base/text/news?patch.title`, seen in game 2026-11-18), but each entry's name is the
-//! game's reference to its champion, so the champions shown with their side (buff, nerf) find the round
-//! (`balance::round_of_champions`). The game makes the content again for another patch; the block follows it. Once a
-//! session the right panel's tree goes to `ui_patch_history.txt`, so a game update that moves the page can be seen.
-
-use std::collections::BTreeSet;
+//! mod cannot read it (`#asset/base/text/news?patch.title`, seen in game 2026-11-18), and the game names every entry
+//! of a column `champion_entry`, so a path reaches the first one only (`ui_patch_history.txt` of 2026-11-18: 40 buff
+//! entries, one path). But a column's children are listed one by one, and the first entry's name is the game's
+//! reference to its champion: each column's count and first champion find the round (`balance::round_of_patch`; the
+//! game lists a round's champions in the round's order). The game makes the content again for another patch; the
+//! block follows it. Once a session the right panel's tree goes to `ui_patch_history.txt`, so a game update that moves
+//! the page can be seen.
 
 use super::names::NameBook;
 use super::{color, quote, Ui};
@@ -42,8 +43,20 @@ const LOOK_EVERY: u32 = 10;
 /// Frames after the page's content first appears before its tree is written (laid out by then).
 const DUMP_AFTER: u32 = 30;
 
-/// A patch's champions as the page shows them: (id, buff).
-pub type Shown = BTreeSet<(String, bool)>;
+/// A patch as the page shows it: each column's count of entries and its first champion (buffs, nerfs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Shown {
+    pub buffs: usize,
+    pub first_buff: Option<String>,
+    pub nerfs: usize,
+    pub first_nerf: Option<String>,
+}
+
+impl Shown {
+    pub fn is_empty(&self) -> bool {
+        self.buffs + self.nerfs == 0
+    }
+}
 /// The round a patch's champions belong to: its label and its item changes.
 pub type Found = Option<(String, Vec<ItemChange>)>;
 
@@ -86,7 +99,7 @@ impl PatchItems {
         if !fresh && !self.frame.is_multiple_of(LOOK_EVERY) {
             return;
         }
-        let shown = shown_champions(ui, &format!("{content}.scroll.contents"), names);
+        let shown = shown_patch(ui, &format!("{content}.scroll.contents"), names);
         if !fresh && self.seen.as_ref().is_some_and(|(_, s)| *s == shown) {
             return;
         }
@@ -107,46 +120,50 @@ impl PatchItems {
             return;
         }
         let (source, height) = block(&lines, true);
-        ui.set_properties(&scroll, &format!("height: {}px;", (SCROLL_H - height).max(SCROLL_MIN)));
+        // the list ends where the block fits in the panel's sight (the game's list runs 57 px past the panel's bottom)
+        let room = match (ui.rect(&panel), ui.rect(&scroll)) {
+            (Some((_, py, _, ph)), Some((_, sy, _, _))) if ph > 0.0 && sy > py => (py + ph - sy).round() as i32 - 8,
+            _ => SCROLL_H,
+        };
+        ui.set_properties(&scroll, &format!("height: {}px;", (room - height).max(SCROLL_MIN)));
         if ui.spawn(&content, &source) {
             self.placed = true;
             let label = found.as_ref().map_or("", |(l, _)| l.as_str());
             crate::diag::log_once(
                 &format!("patch-items-{label}"),
-                &format!("[ui] patch history {content}: {} champions shown = round {label}, {} item lines under the list ({height} px)", shown.len(), lines.len()),
+                &format!("[ui] patch history {content}: {shown:?} = round {label}, {} item lines under the list ({height} px)", lines.len()),
             );
         }
     }
 }
 
-/// The champions the patch content lists with their side: each entry's name in the buff and nerf columns, a reference
-/// to the champion (or its name). The columns are found under the content (two levels down at most).
-pub fn shown_champions(ui: &impl Ui, contents: &str, names: &NameBook) -> Shown {
-    let mut out = Shown::new();
+/// The patch the content lists: each column's count of entries (the game names them all `champion_entry`) and the
+/// champion of its first (its name a reference to the champion, or the name). The columns are found under the
+/// content, two levels down at most.
+pub fn shown_patch(ui: &impl Ui, contents: &str, names: &NameBook) -> Shown {
     let mut level = vec![contents.to_string()];
     for _ in 0..3 {
         let mut next = Vec::new();
         for node in &level {
-            if ui.exists(&format!("{node}.buff_column")) || ui.exists(&format!("{node}.nerf_column")) {
-                for (column, buff) in [("buff_column", true), ("nerf_column", false)] {
-                    let column = format!("{node}.{column}");
-                    for entry in ui.children(&column) {
-                        let Some(text) = ui.text(&format!("{column}.{entry}.name")) else { continue };
-                        if let Some(id) = super::balance_view::champion_of(&text, names) {
-                            out.insert((id, buff));
-                        }
-                    }
-                }
-            } else {
+            if !(ui.exists(&format!("{node}.buff_column")) || ui.exists(&format!("{node}.nerf_column"))) {
                 next.extend(ui.children(node).into_iter().map(|c| format!("{node}.{c}")));
+                continue;
             }
+            let column = |side: &str| -> (usize, Option<String>) {
+                let column = format!("{node}.{side}");
+                let entries: Vec<String> = ui.children(&column).into_iter().filter(|c| c.starts_with("champion_entry")).collect();
+                let first = entries.first().and_then(|e| ui.text(&format!("{column}.{e}.name"))).and_then(|t| super::balance_view::champion_of(&t, names));
+                (entries.len(), first)
+            };
+            let ((buffs, first_buff), (nerfs, first_nerf)) = (column("buff_column"), column("nerf_column"));
+            return Shown { buffs, first_buff, nerfs, first_nerf };
         }
-        if !out.is_empty() || next.is_empty() {
+        if next.is_empty() {
             break;
         }
         level = next;
     }
-    out
+    Shown::default()
 }
 
 /// The stat icon of an item number field (4+6's sheet), if it has one.
@@ -265,13 +282,14 @@ mod tests {
         n
     }
 
-    /// The round of 2028.2.1 by its champions; any other set: none.
+    /// 2028.2.1 as the page shows it: two buffs from Diana, two nerfs from Tristana.
+    fn shown_221() -> Shown {
+        Shown { buffs: 2, first_buff: Some("league_diana".into()), nerfs: 2, first_nerf: Some("league_tristana".into()) }
+    }
+
+    /// The round of 2028.2.1 by its champions; any other patch: none.
     fn find(shown: &Shown) -> Found {
-        let want: Shown = [("league_diana", true), ("league_tryndamere", true), ("league_tristana", false), ("league_gnar", false)]
-            .into_iter()
-            .map(|(c, b)| (c.to_string(), b))
-            .collect();
-        (*shown == want).then(|| ("2028.2.1".to_string(), vec![change("item_storm", "风暴狂涌", 2, 2), change("item_heart", "心之钢", 1, 1), change("item_rod", "虚空之杖", -6, -6)]))
+        (*shown == shown_221()).then(|| ("2028.2.1".to_string(), vec![change("item_storm", "风暴狂涌", 2, 2), change("item_heart", "心之钢", 1, 1), change("item_rod", "虚空之杖", -6, -6)]))
     }
 
     /// The patch history as the game lays it out: the page, its right panel, the patch content with the champions'
@@ -305,8 +323,8 @@ mod tests {
         let n = names();
         let mut ui = FakeUi::default();
         let content = page(&mut ui, &["league_diana", "league_tryndamere"], &["league_tristana", "league_gnar"]);
-        let shown = shown_champions(&ui, &format!("{content}.scroll.contents"), &n);
-        assert_eq!(shown.len(), 4, "{shown:?}");
+        let shown = shown_patch(&ui, &format!("{content}.scroll.contents"), &n);
+        assert_eq!(shown, shown_221());
         let mut view = PatchItems::default();
         view.tick(&mut ui, Some(&cat), &n, &find);
         let ours = format!("{content}.{SECTION}");
@@ -319,7 +337,7 @@ mod tests {
             view.tick(&mut ui, Some(&cat), &n, &find);
         }
         assert_eq!(ui.spawned.len(), spawned);
-        // another patch in the same content: the block goes, the list has its room again
+        // another patch in the same content (another first buff): the block goes, the list has its room again
         let col = format!("{content}.scroll.contents.columns.buff_column");
         ui.add(&format!("{col}.champion_entry0.name"), "label").text = Some(crate::ui::names::name_ref("league_ahri"));
         for _ in 0..LOOK_EVERY {
@@ -332,11 +350,7 @@ mod tests {
     #[test]
     fn a_line_an_item() {
         let cat = Catalog::parse(CATALOG).unwrap();
-        let (_, items) = find(&[("league_diana", true), ("league_tryndamere", true), ("league_tristana", false), ("league_gnar", false)]
-            .into_iter()
-            .map(|(c, b)| (c.to_string(), b))
-            .collect())
-        .unwrap();
+        let (_, items) = find(&shown_221()).unwrap();
         let lines = lines_of(&items, &cat, true);
         assert_eq!(lines.len(), 3);
         let green = color(UP);
