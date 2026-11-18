@@ -40,11 +40,13 @@
 //!   and the stat panels of the ban/pick screen and the encyclopedia show the numbers with the power on
 //!   (`ui::balance_view`).
 //! - **Items** (2.9.0, `item_balance`, [`crate::items`]): with alele's "4+6" item pack, a round also changes the
-//!   finished items whose builders - the champions whose published build names them - stay outside the band once
-//!   this round's own champion changes are counted ([`decide_items`]): so the items catch what the champions' own
-//!   changes leave (a champion at the limit, a whole family of builders) rather than cutting a champion twice. An
-//!   item's power is a share of its numbers, put on its holders by a second buff in every match ([`on_tick`]); the
-//!   items' notes are news of their own ([`item_news`]).
+//!   finished items whose builders - the champions whose published build names them - win too much or too little
+//!   against the field ([`decide_items`]). Since 2.12.0 the items come first, on their builders' win rates before the
+//!   round's champion changes, and the champions' steps count what the item steps are expected to do
+//!   ([`item_effects`]), so a champion is not cut twice for the same points (2.9.0 - 2.11.x judged the items after the
+//!   champions' steps, and the champions' steps had taken nearly everything). An item's power is a share of its
+//!   numbers, put on its holders by a second buff in every match ([`on_tick`]); the items' notes are news of their own
+//!   ([`item_news`]).
 //! - **The game's own champion patches off**: the server half sets the save's auto-patcher counts to zero while this
 //!   is on, keeping the save's own values to put back when it is turned off (`server::balance`).
 //! - **The player's numbers** (2.11.0, [`crate::edits`]; the user: 「不覆盖玩家数据库里改的，完全按玩家的数值来，后面轮次进行
@@ -96,17 +98,28 @@ pub const MIN_EVIDENCE: f32 = 30.0;
 /// Picks this patch (ten a match) before they set the middle of the field ([`field_centre`]); fewer (a patch just
 /// begun): the champions' recent games ([`MIN_EVIDENCE`]'s evidence) do.
 pub const CENTRE_MIN_PICKS: f32 = 300.0;
-/// Items (2.9.0): builders with games enough ([`MIN_EVIDENCE`]) an item needs before it is judged; each builder
-/// weighs its games, at most [`ITEM_WEIGHT`]; their win rate is drawn toward 50 by n / (n + [`ITEM_SHRINK`]) (a few
-/// builders say little about the item); within [`ITEM_BAND`] points of 50 it is left alone, beyond it a step of
-/// [`ITEM_PER_POINT`] percent of its numbers a point; an item changed waits for [`ITEM_MIN_GAMES`] games of its
-/// builders since.
-pub const ITEM_MIN_USERS: usize = 4;
+/// Items (2.9.0): builders with games enough ([`MIN_EVIDENCE`]) an item needs before it is judged, at least
+/// `item_balance_users` of them ([`DEFAULT_ITEM_USERS`]); each builder weighs its games, at most [`ITEM_WEIGHT`];
+/// their win rate is drawn toward 50 by n / (n + [`ITEM_SHRINK`]) (a few builders say little about the item); within
+/// `item_balance_band` points of 50 ([`DEFAULT_ITEM_BAND`]) it is left alone, beyond it a step of
+/// `item_balance_per_point` percent of its numbers a point ([`DEFAULT_ITEM_PER_POINT`]); an item changed waits for
+/// [`ITEM_MIN_GAMES`] games of its builders since.
+///
+/// 2.12.0 (the user, 2026-11-18: 「装备的削弱补丁有点弱啊 需要调整 每次只有那一件？」, then 「放宽规则」): 2.9.0 - 2.11.x
+/// judged an item after the round's champion changes, with 4 builders, a band of 48-52 and 2% a point; on their save
+/// 14 rounds changed 5 items by 1-3%, all buffs, and none from 2028.2.2 on. An item's numbers are one part of its
+/// builders' power (six items, the champion's own numbers), so 2% a point hardly moved them: 3 builders, 50 +- 1 and
+/// 10% a point now, the items first ([`make_round_with`]).
+pub const DEFAULT_ITEM_USERS: usize = 3;
 pub const ITEM_WEIGHT: f32 = 200.0;
 pub const ITEM_SHRINK: f32 = 4.0;
-pub const ITEM_BAND: f32 = 2.0;
-pub const ITEM_PER_POINT: f32 = 2.0;
+pub const DEFAULT_ITEM_BAND: f32 = 1.0;
+pub const DEFAULT_ITEM_PER_POINT: f32 = 10.0;
 pub const ITEM_MIN_GAMES: f32 = 60.0;
+/// Items a round changes at most and an item's step at most (percent of its numbers) unless the settings say otherwise
+/// (`item_balance_count`, `item_balance_max`; 5 and 10 before 2.12.0).
+pub const DEFAULT_ITEM_COUNT: usize = 8;
+pub const DEFAULT_ITEM_MAX: i32 = 20;
 /// A match looks at its champions' items every this many ticks (an item is bought now and then).
 pub const ITEM_EVERY: usize = 10;
 /// "Unpicked" buffs (2.10.0, `balance_unpicked`; the user: 「你要所有英雄达到整体平衡啊 不能只找超模吧」): a champion with
@@ -149,6 +162,11 @@ pub struct Rules {
     pub items: bool,
     pub item_count: usize,
     pub item_max: i32,
+    /// The builders an item needs, the band around 50 it is left alone in, and its step for each point beyond it
+    /// (2.12.0, `item_balance_users`, `item_balance_band`, `item_balance_per_point`; 4, 2 and 2 fixed before).
+    pub item_users: usize,
+    pub item_band: f32,
+    pub item_per_point: f32,
 }
 
 /// One champion's change in a round.
@@ -397,23 +415,23 @@ pub fn unpicked(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, ru
     (out, n)
 }
 
-/// A champion as the items see it (2.9.0): its win rate, the win rate once this round's own change to it works (a
-/// step closes step / [`Rules::per_point`] points), its games, and the finished items its published build names.
+/// A champion as the items see it (2.9.0): its win rate against the field before this round's changes (2.12.0; the
+/// rounds of 2.9.0 - 2.11.x took it once the round's own step to the champion worked), its games, and the finished
+/// items its published build names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Builder {
     pub champion: String,
     pub win: f32,
-    /// The win rate once this round's step works: `win + step / per_point`.
-    pub after: f32,
     pub evidence: f32,
     pub items: Vec<String>,
 }
 
-/// The item changes of a round (2.9.0): for each item named by [`ITEM_MIN_USERS`] builders or more with games, their
-/// win rate after this round's champion changes, weighted by games (at most [`ITEM_WEIGHT`] each) and drawn toward 50
-/// by n / (n + [`ITEM_SHRINK`]); beyond [`ITEM_BAND`] points of 50 a step of [`ITEM_PER_POINT`] a point (at most
-/// `rules.item_max`), the power kept within [`ITEM_CAP`]; an item `settled` says not yet waits. Furthest first, at most
-/// `rules.item_count`. `names`: the items that can change (finished ones), with their names.
+/// The item changes of a round (2.9.0; first in the round since 2.12.0): for each item named by `rules.item_users`
+/// builders or more with games, their win rate against the field as it is, weighted by games (at most
+/// [`ITEM_WEIGHT`] each) and drawn toward 50 by n / (n + [`ITEM_SHRINK`]); beyond `rules.item_band` points of 50 a step
+/// of `rules.item_per_point` a point (at most `rules.item_max`), the power kept within [`ITEM_CAP`]; an item `settled`
+/// says not yet waits. Furthest first, at most `rules.item_count`. `names`: the items that can change (finished ones),
+/// with their names.
 pub fn decide_items(
     builders: &[Builder],
     names: &BTreeMap<String, String>,
@@ -425,24 +443,23 @@ pub fn decide_items(
     for (item, name) in names {
         let users: Vec<&Builder> = builders.iter().filter(|b| b.evidence >= MIN_EVIDENCE && b.items.contains(item)).collect();
         let n = users.len();
-        if n < ITEM_MIN_USERS {
+        if n < rules.item_users.max(1) {
             continue;
         }
         let weight: f32 = users.iter().map(|b| b.evidence.min(ITEM_WEIGHT)).sum();
         if weight <= 0.0 {
             continue;
         }
-        let mean = |f: &dyn Fn(&Builder) -> f32| users.iter().map(|b| b.evidence.min(ITEM_WEIGHT) * f(b)).sum::<f32>() / weight;
-        let (win, after) = (mean(&|b| b.win), mean(&|b| b.after));
-        let shrunk = (after - 50.0) * n as f32 / (n as f32 + ITEM_SHRINK);
-        let gap = if shrunk > ITEM_BAND {
-            shrunk - ITEM_BAND
-        } else if shrunk < -ITEM_BAND {
-            shrunk + ITEM_BAND
+        let win = users.iter().map(|b| b.evidence.min(ITEM_WEIGHT) * b.win).sum::<f32>() / weight;
+        let shrunk = (win - 50.0) * n as f32 / (n as f32 + ITEM_SHRINK);
+        let gap = if shrunk > rules.item_band {
+            shrunk - rules.item_band
+        } else if shrunk < -rules.item_band {
+            shrunk + rules.item_band
         } else {
             continue;
         };
-        let want = ((-(gap * ITEM_PER_POINT)).round() as i32).clamp(-rules.item_max, rules.item_max);
+        let want = ((-(gap * rules.item_per_point)).round() as i32).clamp(-rules.item_max, rules.item_max);
         let was = before.get(item).copied().unwrap_or(0);
         let total = (was + want).clamp(-ITEM_CAP, ITEM_CAP);
         let step = total - was;
@@ -454,6 +471,29 @@ pub fn decide_items(
     out.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.item.cmp(&b.1.item)));
     out.truncate(rules.item_count);
     out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// What a round's item steps are expected to do to the champions that build them (2.12.0), in win-rate points: an
+/// item's step is chosen to close step / `rules.item_per_point` points of its builders' win rate, and a champion gets
+/// that of every changed item its build names. The champions' own steps are decided on their win rate plus this
+/// ([`make_round_with`]), so an item cut and its builders' cuts do not take the same points twice. Power taken off at
+/// once ([`Reset`]) is no step the win rates asked for: left out.
+pub fn item_effects(changes: &[ItemChange], builds: &crate::items::Builds, rules: Rules) -> BTreeMap<String, f32> {
+    let mut out = BTreeMap::new();
+    if rules.item_per_point <= 0.0 {
+        return out;
+    }
+    for (champion, items) in builds {
+        let effect: f32 = changes
+            .iter()
+            .filter(|c| c.reset.is_none() && items.contains(&c.item))
+            .map(|c| c.step as f32 / rules.item_per_point)
+            .sum();
+        if effect != 0.0 {
+            out.insert(champion.clone(), effect);
+        }
+    }
+    out
 }
 
 /// Why a round is due (each with the game's patch it belongs to).
@@ -525,8 +565,9 @@ pub fn make_round(meta: &Meta, rounds: &[Round], rules: Rules, due: &Due, today:
     make_round_with(meta, rounds, rules, due, today, None, &Skip::default())
 }
 
-/// [`make_round`] with the 4+6 pack's builds and item names (2.9.0): with `rules.items` the round changes items too;
-/// without, it carries the item power of the round before unchanged. `skip` (2.11.0): champions and items no round
+/// [`make_round`] with the 4+6 pack's builds and item names (2.9.0): with `rules.items` the round changes items too
+/// (first since 2.12.0, [`decide_items`]; the champions then count them, [`item_effects`]); without, it carries the
+/// item power of the round before unchanged. `skip` (2.11.0): champions and items no round
 /// changes; any power they still have comes off in this round ([`Reset::Skip`]).
 pub fn make_round_with(
     meta: &Meta,
@@ -543,13 +584,42 @@ pub fn make_round_with(
     let label = if merged { version.clone() } else { hotfix_label(rounds, &version) };
     let before = last.map(|r| r.power.clone()).unwrap_or_default();
     let centre = field_centre(meta);
+    // the items first (2.12.0): judged on their builders' win rates as they are, before any champion's step; the
+    // champions' steps then count what the items' are expected to do ([`item_effects`])
+    let mut item_power = last.map(|r| r.item_power.clone()).unwrap_or_default();
+    let item_changes = match items.filter(|_| rules.items) {
+        Some(inputs) => {
+            let builders: Vec<Builder> = meta
+                .champions
+                .iter()
+                .filter_map(|c| {
+                    let items: Vec<String> = inputs.builds.get(&c.name)?.iter().filter(|k| !skip.items.contains(*k)).cloned().collect();
+                    Some(Builder { champion: c.name.clone(), win: field_win(c, centre), evidence: c.evidence, items })
+                })
+                .collect();
+            // an item a round changed waits for its builders' games since
+            let settled = |item: &str| -> bool {
+                let Some(r) = rounds.iter().rev().find(|r| r.items.iter().any(|c| c.item == item)) else { return true };
+                let games: f32 = meta
+                    .champions
+                    .iter()
+                    .filter(|c| inputs.builds.get(&c.name).is_some_and(|b| b.iter().any(|k| k == item)))
+                    .map(|c| games_since_round(r, &meta.versions, c))
+                    .sum();
+                games >= ITEM_MIN_GAMES
+            };
+            decide_items(&builders, &inputs.names, &item_power, &settled, rules)
+        }
+        None => Vec::new(),
+    };
+    let effects = items.filter(|_| rules.items).map(|inputs| item_effects(&item_changes, &inputs.builds, rules)).unwrap_or_default();
     let candidates: Vec<Candidate<'_>> = meta
         .champions
         .iter()
         .filter(|c| !skip.champions.contains(&c.name))
         .map(|c| Candidate {
             name: &c.name,
-            win: field_win(c, centre),
+            win: field_win(c, centre) + effects.get(&c.name).copied().unwrap_or(0.0),
             evidence: c.evidence,
             since_change: games_since_change(rounds, &meta.versions, c),
             pooled: c.drafted > 0,
@@ -588,34 +658,6 @@ pub fn make_round_with(
             power.insert(c.champion.clone(), c.total);
         }
     }
-    let mut item_power = last.map(|r| r.item_power.clone()).unwrap_or_default();
-    let item_changes = match items.filter(|_| rules.items) {
-        Some(inputs) => {
-            let builders: Vec<Builder> = meta
-                .champions
-                .iter()
-                .filter_map(|c| {
-                    let items: Vec<String> = inputs.builds.get(&c.name)?.iter().filter(|k| !skip.items.contains(*k)).cloned().collect();
-                    let win = field_win(c, centre);
-                    let step = changes.iter().find(|x| x.champion == c.name).map_or(0, |x| x.step);
-                    Some(Builder { champion: c.name.clone(), win, after: win + step as f32 / rules.per_point, evidence: c.evidence, items })
-                })
-                .collect();
-            // an item a round changed waits for its builders' games since
-            let settled = |item: &str| -> bool {
-                let Some(r) = rounds.iter().rev().find(|r| r.items.iter().any(|c| c.item == item)) else { return true };
-                let games: f32 = meta
-                    .champions
-                    .iter()
-                    .filter(|c| inputs.builds.get(&c.name).is_some_and(|b| b.iter().any(|k| k == item)))
-                    .map(|c| games_since_round(r, &meta.versions, c))
-                    .sum();
-                games >= ITEM_MIN_GAMES
-            };
-            decide_items(&builders, &inputs.names, &item_power, &settled, rules)
-        }
-        None => Vec::new(),
-    };
     // the items `item_balance_skip` lists: their power off (2.11.0)
     let mut item_changes = item_changes;
     let mut skipped: Vec<(&String, &i32)> = item_power.iter().filter(|(k, p)| **p != 0 && skip.items.contains(*k)).collect();
@@ -1647,7 +1689,18 @@ mod tests {
         round_for(key, first_run, on, true).map(|p| p.champions)
     }
 
-    const RULES: Rules = Rules { count: 10, max_step: 10, per_point: DEFAULT_PER_POINT, unpicked: 0, items: false, item_count: 5, item_max: 10 };
+    const RULES: Rules = Rules {
+        count: 10,
+        max_step: 10,
+        per_point: DEFAULT_PER_POINT,
+        unpicked: 0,
+        items: false,
+        item_count: DEFAULT_ITEM_COUNT,
+        item_max: DEFAULT_ITEM_MAX,
+        item_users: DEFAULT_ITEM_USERS,
+        item_band: DEFAULT_ITEM_BAND,
+        item_per_point: DEFAULT_ITEM_PER_POINT,
+    };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
         Candidate { name, win, evidence, since_change: None, pooled: true }
@@ -2086,8 +2139,8 @@ mod tests {
 
     const ITEM_RULES: Rules = Rules { items: true, ..RULES };
 
-    fn builder(name: &str, win: f32, after: f32, evidence: f32, items: &[&str]) -> Builder {
-        Builder { champion: name.into(), win, after, evidence, items: items.iter().map(|s| s.to_string()).collect() }
+    fn builder(name: &str, win: f32, evidence: f32, items: &[&str]) -> Builder {
+        Builder { champion: name.into(), win, evidence, items: items.iter().map(|s| s.to_string()).collect() }
     }
 
     fn names(keys: &[&str]) -> BTreeMap<String, String> {
@@ -2095,42 +2148,60 @@ mod tests {
     }
 
     #[test]
-    fn an_item_whose_builders_still_win_too_much_is_cut() {
+    fn an_item_whose_builders_win_too_much_is_cut() {
         let always = |_: &str| true;
         let before = BTreeMap::new();
-        // five builders at 62% after this round's own champion changes: 12 over 50, drawn to 12 x 5/9 = 6.7,
-        // 4.7 beyond the band, a step of -9
-        let five: Vec<Builder> = (0..5).map(|i| builder(&format!("c{i}"), 64.0, 62.0, 100.0, &["rfc"])).collect();
+        // 2.12.0: five builders at 54% against the field: 4 over 50, drawn to 4 x 5/9 = 2.2, 1.2 beyond the band of 1,
+        // 10% a point: a step of -12
+        let five: Vec<Builder> = (0..5).map(|i| builder(&format!("c{i}"), 54.0, 100.0, &["rfc"])).collect();
         let out = decide_items(&five, &names(&["rfc"]), &before, &always, ITEM_RULES);
         assert_eq!(out.len(), 1);
-        assert_eq!((out[0].item.as_str(), out[0].users, out[0].step, out[0].total), ("rfc", 5, -9, -9));
-        assert!((out[0].win - 64.0).abs() < 1e-4, "the notes give the builders' win rate as it is");
-        // three builders are too few to judge an item; builders with few games do not count
-        let three: Vec<Builder> = (0..3).map(|i| builder(&format!("c{i}"), 70.0, 70.0, 100.0, &["rfc"])).collect();
-        assert!(decide_items(&three, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
-        let mut thin = three.clone();
-        thin.push(builder("new", 70.0, 70.0, MIN_EVIDENCE - 1.0, &["rfc"]));
+        assert_eq!((out[0].item.as_str(), out[0].users, out[0].step, out[0].total), ("rfc", 5, -12, -12));
+        assert!((out[0].win - 54.0).abs() < 1e-4, "the notes give the builders' win rate as it is");
+        // 2.9.0's numbers (4 builders, 48-52, 2% a point) left it alone: 0.2 beyond their band, -0.4 rounds to 0
+        let old = Rules { item_users: 4, item_band: 2.0, item_per_point: 2.0, item_count: 5, item_max: 10, ..ITEM_RULES };
+        assert!(decide_items(&five, &names(&["rfc"]), &before, &always, old).is_empty());
+        // three builders are enough now (4 before): 4 x 3/7 = 1.7, a step of -7; two are too few, and builders with few
+        // games do not count
+        let three: Vec<Builder> = (0..3).map(|i| builder(&format!("c{i}"), 54.0, 100.0, &["rfc"])).collect();
+        assert_eq!(decide_items(&three, &names(&["rfc"]), &before, &always, ITEM_RULES)[0].step, -7);
+        let two: Vec<Builder> = (0..2).map(|i| builder(&format!("c{i}"), 70.0, 100.0, &["rfc"])).collect();
+        assert!(decide_items(&two, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
+        let mut thin = two.clone();
+        thin.push(builder("new", 70.0, MIN_EVIDENCE - 1.0, &["rfc"]));
         assert!(decide_items(&thin, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
-        // the builders' win rate once their own nerfs work is what counts: fine after them, no item change
-        let fixed: Vec<Builder> = (0..6).map(|i| builder(&format!("c{i}"), 60.0, 51.0, 100.0, &["rfc"])).collect();
-        assert!(decide_items(&fixed, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
-        // far off: held to item_max a round, ITEM_CAP in all (still 50 where the champions' CAP is 80); weak builders
-        // get the item buffed
-        let far: Vec<Builder> = (0..20).map(|i| builder(&format!("c{i}"), 80.0, 80.0, 500.0, &["rfc", "weak"])).collect();
+        // within the band of 1 once drawn toward 50: left alone
+        let near: Vec<Builder> = (0..5).map(|i| builder(&format!("c{i}"), 51.5, 100.0, &["rfc"])).collect();
+        assert!(decide_items(&near, &names(&["rfc"]), &before, &always, ITEM_RULES).is_empty());
+        // far off: held to item_max a round (20 by default since 2.12.0), ITEM_CAP in all (still 50 where the
+        // champions' CAP is 80); weak builders get the item buffed
+        let far: Vec<Builder> = (0..20).map(|i| builder(&format!("c{i}"), 80.0, 500.0, &["rfc", "weak"])).collect();
         let out = decide_items(&far, &names(&["rfc"]), &before, &always, ITEM_RULES);
-        assert_eq!((out[0].step, out[0].total), (-10, -10));
+        assert_eq!((out[0].step, out[0].total), (-DEFAULT_ITEM_MAX, -DEFAULT_ITEM_MAX));
         let was: BTreeMap<String, i32> = [("rfc".to_string(), -(ITEM_CAP - 4))].into_iter().collect();
         let out = decide_items(&far, &names(&["rfc"]), &was, &always, ITEM_RULES);
         assert_eq!((out[0].step, out[0].total), (-4, -50));
-        let weak: Vec<Builder> = (0..8).map(|i| builder(&format!("c{i}"), 40.0, 40.0, 100.0, &["staff"])).collect();
+        let weak: Vec<Builder> = (0..8).map(|i| builder(&format!("c{i}"), 40.0, 100.0, &["staff"])).collect();
         assert!(decide_items(&weak, &names(&["staff"]), &before, &always, ITEM_RULES)[0].step > 0);
         // an item that has to wait, and the round's count keeps the furthest
         let wait = |item: &str| item != "rfc";
         assert!(decide_items(&five, &names(&["rfc"]), &before, &wait, ITEM_RULES).is_empty());
         let mut mixed = five.clone();
-        mixed.extend((0..5).map(|i| builder(&format!("d{i}"), 70.0, 70.0, 100.0, &["bc"])));
+        mixed.extend((0..5).map(|i| builder(&format!("d{i}"), 70.0, 100.0, &["bc"])));
         let out = decide_items(&mixed, &names(&["rfc", "bc"]), &before, &always, Rules { item_count: 1, ..ITEM_RULES });
         assert_eq!(out.iter().map(|c| c.item.as_str()).collect::<Vec<_>>(), ["bc"]);
+    }
+
+    #[test]
+    fn the_champions_count_what_the_item_steps_do() {
+        // 2.12.0: an item cut by 20 at 10% a point is expected to close 2 points of each builder's win rate, a buff of
+        // 5 to open half a point; power taken off at once is no such step
+        let builds: crate::items::Builds =
+            [("a".to_string(), vec!["rfc".to_string(), "bc".to_string()]), ("b".to_string(), vec!["staff".to_string()])].into_iter().collect();
+        let change = |item: &str, step: i32, reset: Option<Reset>| ItemChange { item: item.into(), name: item.into(), users: 3, win: 60.0, step, total: step, reset };
+        let effects = item_effects(&[change("rfc", -20, None), change("bc", 5, None), change("staff", -10, Some(Reset::Skip))], &builds, ITEM_RULES);
+        assert_eq!(effects.get("a").copied(), Some(-1.5));
+        assert_eq!(effects.get("b"), None);
     }
 
     fn inputs(builds: &[(&str, &[&str])]) -> crate::items::Inputs {
@@ -2176,13 +2247,25 @@ mod tests {
         // the log says why these champions and no more
         assert!(round.summary.starts_with("10 champions rated"), "{}", round.summary);
         assert!(round.summary.contains("changed (balance_count 10)"), "{}", round.summary);
-        // the items expect a champion's own step to close step / balance_per_point points (2.10.0): at 1.5 the cut
-        // builders are expected nearer the band than at 2.5, and the item is cut less
+        // the items come first (2.12.0), on their builders' win rates as they are: the champions' balance_per_point
+        // (2.10.0 - 2.11.x: the step a builder's own cut was expected to close) leaves the item's step alone
         let item = |per_point: f32| {
-            let rules = Rules { per_point, item_max: 20, ..ITEM_RULES };
+            let rules = Rules { per_point, ..ITEM_RULES };
             make_round_with(&m, &[], rules, &Due::First("2027.4.1".into()), today, Some(&inp), &Skip::default()).items[0].step
         };
-        assert_eq!((item(1.5), item(2.5)), (-7, -10));
+        assert_eq!(item(1.5), item(2.5));
+        // and the champions count the item's step: a builder's cut is smaller by the points the item is expected to
+        // close (its step / item_balance_per_point), at balance_per_point a point
+        let open = Rules { max_step: 50, ..ITEM_RULES };
+        let step_of = |rules: Rules, who: &str| {
+            let r = make_round_with(&m, &[], rules, &Due::First("2027.4.1".into()), today, Some(&inp), &Skip::default());
+            (r.changes.iter().find(|c| c.champion == who).map_or(0, |c| c.step), r.items.first().map_or(0, |c| c.step))
+        };
+        let (with_item, item_step) = step_of(open, "adc0");
+        let (without, _) = step_of(Rules { items: false, ..open }, "adc0");
+        let expected = (item_step as f32 / DEFAULT_ITEM_PER_POINT * DEFAULT_PER_POINT).round() as i32;
+        assert!(item_step < 0 && without < 0, "{item_step} {without}");
+        assert_eq!(with_item - without, -expected, "the item {item_step}: adc0 {with_item} against {without} without it");
     }
 
     #[test]

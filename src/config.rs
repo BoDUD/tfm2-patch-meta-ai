@@ -78,6 +78,11 @@ pub struct Config {
     pub item_balance: bool,
     pub item_balance_count: usize,
     pub item_balance_max: i32,
+    /// The builders an item needs, the band around 50 its builders' win rate is left alone in, and the step (percent of
+    /// its numbers) for each point beyond it (2.12.0; the user: 「放宽规则」; 4, 2 and 2 fixed before).
+    pub item_balance_users: usize,
+    pub item_balance_band: f32,
+    pub item_balance_per_point: f32,
     /// Champions and items the balance leaves alone (2.11.0; the user: 「另加一个设置可以手动列出不要调的英雄」): ids /
     /// item keys or the names the game shows, as written (`edits::list`); their power comes off.
     pub balance_skip: Vec<String>,
@@ -171,8 +176,11 @@ impl Default for Config {
             balance_per_point: crate::balance::DEFAULT_PER_POINT,
             balance_unpicked: 20,
             item_balance: false,
-            item_balance_count: 5,
-            item_balance_max: 10,
+            item_balance_count: crate::balance::DEFAULT_ITEM_COUNT,
+            item_balance_max: crate::balance::DEFAULT_ITEM_MAX,
+            item_balance_users: crate::balance::DEFAULT_ITEM_USERS,
+            item_balance_band: crate::balance::DEFAULT_ITEM_BAND,
+            item_balance_per_point: crate::balance::DEFAULT_ITEM_PER_POINT,
             balance_skip: Vec::new(),
             item_balance_skip: Vec::new(),
             tier_list: Switch::Auto,
@@ -322,6 +330,10 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "item_balance" => cfg.item_balance = flag(value)?,
         "item_balance_count" => cfg.item_balance_count = number(value)?.round().clamp(1.0, 30.0) as usize,
         "item_balance_max" => cfg.item_balance_max = number(value)?.round().clamp(1.0, crate::balance::ITEM_CAP as f32) as i32,
+        // 2.12.0 (the user: 「装备的削弱补丁有点弱啊」 -> 「放宽规则」)
+        "item_balance_users" => cfg.item_balance_users = number(value)?.round().clamp(2.0, 10.0) as usize,
+        "item_balance_band" => cfg.item_balance_band = number(value)?.clamp(0.0, 5.0),
+        "item_balance_per_point" => cfg.item_balance_per_point = number(value)?.clamp(1.0, 50.0),
         "balance_skip" => cfg.balance_skip = crate::edits::list(value),
         "item_balance_skip" => cfg.item_balance_skip = crate::edits::list(value),
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
@@ -571,7 +583,7 @@ pub fn summary(c: &Config) -> String {
          lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
-         balance_skip=[{}] item_balance_skip=[{}]",
+         item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}]",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -629,6 +641,9 @@ pub fn summary(c: &Config) -> String {
         if c.item_balance { "on" } else { "off" },
         c.item_balance_count,
         c.item_balance_max,
+        c.item_balance_users,
+        c.item_balance_band,
+        c.item_balance_per_point,
         c.balance_skip.join(","),
         c.item_balance_skip.join(",")
     )
@@ -728,21 +743,34 @@ balance_per_point=2.5
 balance_unpicked=20
 ; item_balance : with alele's "4+6" item pack (alele_runes_and_items + alele_equipment_selection)
 ;                the balance patches change its finished items too: an item whose builders (the
-;                heroes whose published build names it, 4 or more with games) still win too much or
-;                too little once that patch's champion changes are counted gets 2% of its numbers
-;                weaker or stronger for every point beyond 48-52% (at most item_balance_max a patch,
-;                50% in all; at most item_balance_count items a patch), in every match. Numbers only:
-;                an item's own effects stay, and penetration / tenacity can go up but never down. The
-;                changes come as news of their own; the item tooltips still show the old numbers.
-;                Needs balance=on.
+;                heroes whose published build names it with 30 recent games, at least
+;                item_balance_users of them) win too much or too little against the field gets
+;                item_balance_per_point % of its numbers weaker or stronger for every point beyond
+;                50% +- item_balance_band (at most item_balance_max a patch, 50% in all; at most
+;                item_balance_count items a patch), in every match. The items come first (2.12.0): on
+;                their builders' win rates before that patch's champion changes, and the champion
+;                changes count what the item changes are expected to do. Numbers only: an item's own
+;                effects stay, and penetration / tenacity can go up but never down. The changes come
+;                as news of their own; the item tooltips still show the old numbers. Needs balance=on.
 ; item_balance : 装了 alele 的 4+6 装备包时，平衡补丁也改它的成品装备：出这件装备的英雄（发布的出装里
-;                写着它的，场次够的 4 个以上）在算上本版英雄改动之后仍然赢得太多或太少，胜率每超出
-;                48%–52% 一个点，装备数值调 2%（单版最多 item_balance_max，累计最多 50%；每版最多
-;                item_balance_count 件），所有比赛生效。只改数值：装备特效不变，穿透、韧性这类只能加
-;                不能减。改动单独发一条新闻；装备说明里显示的仍是原来的数值。要先开 balance。
+;                写着它的、近期场次够 30 的，至少 item_balance_users 个）和场上比赢得太多或太少，胜率每超出
+;                50% ± item_balance_band 一个点，装备数值调 item_balance_per_point %（单版最多
+;                item_balance_max，累计最多 50%；每版最多 item_balance_count 件），所有比赛生效。
+;                2.12.0 起装备先判：看本版英雄改动之前的胜率，英雄的改动再扣掉装备改动预计带来的变化。
+;                只改数值：装备特效不变，穿透、韧性这类只能加不能减。改动单独发一条新闻；装备说明里
+;                显示的仍是原来的数值。要先开 balance。
 item_balance=off
-item_balance_count=5
-item_balance_max=10
+; 2.12.0 defaults: 8 items and 20% a patch (5 and 10 before); 3 builders, 50% +- 1, 10% a point
+;           (4, 48-52% and 2% fixed before). item_balance_users 2-10, item_balance_band 0-5,
+;           item_balance_per_point 1-50.
+; 2.12.0 起的默认值：每版最多 8 件、单件单版最多 20%（以前 5 和 10）；至少 3 个出装英雄、50% ± 1、
+;           每点 10%（以前固定 4 个、48%–52%、2%）。item_balance_users 2～10，item_balance_band 0～5，
+;           item_balance_per_point 1～50。
+item_balance_count=8
+item_balance_max=20
+item_balance_users=3
+item_balance_band=1
+item_balance_per_point=10
 ; balance_skip : champions the balance never changes, comma separated - their ids or the names
 ;                the game shows (e.g. balance_skip=league_jinx, 德莱厄斯). Their earlier changes come
 ;                off at once (a hotfix says so); they play the numbers the save has.
@@ -953,8 +981,9 @@ ban_pick=yes
     #[test]
     fn the_balance_limits_and_their_defaults() {
         let d = Config::default();
-        // 2.10.0: 30 champions and 20% a patch by default (10 / 10 before); the items' as they were
-        assert_eq!((d.balance_count, d.balance_max, d.item_balance_count, d.item_balance_max), (30, 20, 5, 10));
+        // 2.10.0: 30 champions and 20% a patch by default (10 / 10 before); 2.12.0: 8 items and 20% (5 / 10 before)
+        assert_eq!((d.balance_count, d.balance_max, d.item_balance_count, d.item_balance_max), (30, 20, 8, 20));
+        assert_eq!((d.item_balance_users, d.item_balance_band, d.item_balance_per_point), (3, 1.0, 10.0));
         let cfg = parse("balance_count=70\nbalance_max=100\nitem_balance_count=40\nitem_balance_max=100\n").0;
         // a champion's step up to its CAP (80), an item's up to ITEM_CAP (50)
         assert_eq!((cfg.balance_count, cfg.balance_max, cfg.item_balance_count, cfg.item_balance_max), (60, 80, 30, 50));
@@ -964,6 +993,26 @@ ban_pick=yes
         // a settings.ini that names them keeps its own numbers
         let cfg = parse("balance_count=20\nbalance_max=10\n").0;
         assert_eq!((cfg.balance_count, cfg.balance_max), (20, 10));
+    }
+
+    #[test]
+    fn the_item_rules_are_read_and_clamped() {
+        // 2.12.0 (the user: 「装备的削弱补丁有点弱啊」 -> 「放宽规则」): builders 2-10, band 0-5, 1-50% a point
+        let (cfg, warnings) = parse("item_balance_users=1
+item_balance_band=9
+item_balance_per_point=0.5
+");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!((cfg.item_balance_users, cfg.item_balance_band, cfg.item_balance_per_point), (2, 5.0, 1.0));
+        // 2.9.0's numbers can be had back
+        let cfg = parse("item_balance_users=4
+item_balance_band=2
+item_balance_per_point=2
+item_balance_count=5
+item_balance_max=10
+").0;
+        assert_eq!((cfg.item_balance_users, cfg.item_balance_band, cfg.item_balance_per_point), (4, 2.0, 2.0));
+        assert_eq!((cfg.item_balance_count, cfg.item_balance_max), (5, 10));
     }
 
     #[test]
