@@ -125,7 +125,7 @@ pub use values::{SimOriginKindV1, SimOriginV1};
 pub use values::{CooldownV1, EntityKindV1, SkillSlotV1};
 
 /// Current ABI level of this crate. Bumped (+1) every time the host appends
-/// slots/fields/types to the contract. Level 1 is the initial contract.
+/// slots, fields, types, or enum codes to the contract. Level 1 is the initial contract.
 ///
 /// Level 2 appends the Support item category and
 /// `ClientSceneKindV1::ChampionshipCelebration`, shield/attack-speed/raw-damage
@@ -190,4 +190,7 @@ pub use values::{CooldownV1, EntityKindV1, SkillSlotV1};
 ///   and `DraftCtxV1` lineups (athlete ids, team ids) and lane slots;
 /// - `SettingTargetV1::AutoPatch`, the save's balance auto-patcher
 ///   parameters as a setting document.
-pub const ABI_LEVEL: u32 = 10;
+///
+/// Level 11 adds `ChampionCategoryV1::Tank` (code 5). Mods that require the
+/// Tank category can declare ABI level 11 as their minimum.
+pub const ABI_LEVEL: u32 = 11;

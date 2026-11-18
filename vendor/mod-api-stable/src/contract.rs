@@ -5,6 +5,7 @@
 //!   snapshot line must reappear verbatim in every future dump.
 //! - `layout T align=N` — immutable once published.
 //! - `const NAME = N` / `symbol NAME` — immutable once published (append-only).
+//! - `enumcode T.Variant = N` — immutable once published (append-only).
 //! - `size T = N` / `abi_level = N` — may grow when fields/slots are appended
 //!   together with an ABI_LEVEL bump; excluded from the frozen-line rule.
 

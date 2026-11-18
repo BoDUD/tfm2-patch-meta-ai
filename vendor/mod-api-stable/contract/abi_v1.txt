@@ -1,4 +1,4 @@
-abi_level = 10
+abi_level = 11
 symbol tfm2_mod_required_abi_level
 symbol tfm2_mod_entry_stable
 const LOG_LEVEL_ERROR = 1
@@ -10,6 +10,7 @@ enumcode ChampionCategoryV1.Range = 1
 enumcode ChampionCategoryV1.Magician = 2
 enumcode ChampionCategoryV1.Util = 3
 enumcode ChampionCategoryV1.Assassin = 4
+enumcode ChampionCategoryV1.Tank = 5
 enumcode ChampionTagV1.Ad = 0
 enumcode ChampionTagV1.Ap = 1
 enumcode ChampionTagV1.Heal = 2
