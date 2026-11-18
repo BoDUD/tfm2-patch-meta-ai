@@ -284,3 +284,115 @@ fn tactics_on_a_save() {
         }
     }
 }
+
+/// The next balance round on a real save (2.12.0, the item rules looser): the items it would change and the
+/// champions, from the save's history, its balance book and the installed 4+6 pack. A game patch after the newest one
+/// is assumed; the settings are the defaults but the champion limits given.
+///
+/// `PMA_HISTORY=<mod folder>/history/save-xxxx.json PMA_BOOK=<mod folder>/balance-xxxx.json PMA_MODS=<game>/mods
+/// [PMA_COUNT=60 PMA_MAX=25 PMA_UNPICKED=20 PMA_LOL_PRIOR=2 PMA_RECENCY=1200 PMA_SKILLS=on] cargo test --release --test save_board -- --ignored --nocapture next_round`
+#[test]
+#[ignore]
+fn next_round_on_a_save() {
+    use patch_meta_ai::balance::{make_round_with, Due, Round, Rules, Skip};
+    let (Ok(path), Ok(book), Ok(mods)) = (std::env::var("PMA_HISTORY"), std::env::var("PMA_BOOK"), std::env::var("PMA_MODS")) else {
+        eprintln!("PMA_HISTORY / PMA_BOOK / PMA_MODS not set");
+        return;
+    };
+    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(d);
+    let text = std::fs::read_to_string(&path).expect("history file");
+    let mut names = Names::default();
+    let games: Vec<_> = patch_meta_ai::cache::decode(&text, &mut names).into_iter().map(|(_, g)| g).collect();
+    let book: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&book).expect("book")).expect("book json");
+    let rounds: Vec<Round> = serde_json::from_value(book["rounds"].clone()).expect("rounds");
+    let mut champions: Vec<String> = (0..names.len() as u16).map(|c| names.name(c).to_string()).collect();
+    champions.sort();
+    let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
+    let model_rounds = patch_meta_ai::balance::model_rounds_of(&rounds);
+    // the model's choices the game logged (diag.log `[model] held-out check`): lol_prior, recency, skills (the
+    // champions' stats are the game's, not read here)
+    let settings = Settings {
+        lol_prior: env("PMA_LOL_PRIOR", Settings::default().lol_prior),
+        lol_prior_auto: false,
+        recency: std::env::var("PMA_RECENCY").ok().and_then(|v| v.parse().ok()).or(Settings::default().recency),
+        recency_auto: false,
+        skills: std::env::var("PMA_SKILLS").map_or(Settings::default().skills, |v| v == "on"),
+        skills_auto: false,
+        stat_prior: false,
+        stat_prior_auto: false,
+        ..Settings::default()
+    };
+    let meta = build(
+        &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &model_rounds },
+        &settings,
+    );
+    let mods = std::path::PathBuf::from(mods);
+    let cat = patch_meta_ai::items::Catalog::parse(&std::fs::read_to_string(mods.join("alele_runes_and_items").join("item-catalog.json")).unwrap()).unwrap();
+    let builds = patch_meta_ai::items::parse_builds(&std::fs::read(mods.join("alele_equipment_selection").join("ai-tail-builds.json")).unwrap(), &cat).unwrap();
+    let used: std::collections::HashSet<&String> = builds.values().flatten().collect();
+    let item_names = used.into_iter().filter(|k| cat.identifiable(k)).filter_map(|k| Some((k.clone(), cat.item(k)?.1.name.clone()))).collect();
+    let inputs = patch_meta_ai::items::Inputs { builds: std::sync::Arc::new(builds), names: item_names };
+    let last = rounds.last().map(|r| r.version.clone()).unwrap_or_default();
+    let mut parts: Vec<u32> = last.split('.').filter_map(|p| p.parse().ok()).collect();
+    if let Some(minor) = parts.get_mut(1) {
+        *minor += 1;
+    }
+    if let Some(patch) = parts.get_mut(2) {
+        *patch = 0;
+    }
+    let next = parts.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+    let rules = Rules {
+        count: env("PMA_COUNT", 60.0) as usize,
+        max_step: env("PMA_MAX", 25.0) as i32,
+        per_point: patch_meta_ai::balance::DEFAULT_PER_POINT,
+        unpicked: env("PMA_UNPICKED", 20.0) as usize,
+        items: true,
+        item_count: patch_meta_ai::balance::DEFAULT_ITEM_COUNT,
+        item_max: patch_meta_ai::balance::DEFAULT_ITEM_MAX,
+        item_users: patch_meta_ai::balance::DEFAULT_ITEM_USERS,
+        item_band: patch_meta_ai::balance::DEFAULT_ITEM_BAND,
+        item_per_point: patch_meta_ai::balance::DEFAULT_ITEM_PER_POINT,
+    };
+    eprintln!("{} games, newest patch {current}, {} rounds in the book (newest {last}); the next round as {next}", games.len(), rounds.len());
+    let due = Due::Patch(next.clone());
+    let round = make_round_with(&meta, &rounds, rules, &due, None, Some(&inputs), &Skip::default());
+    let without = make_round_with(&meta, &rounds, Rules { items: false, ..rules }, &due, None, Some(&inputs), &Skip::default());
+    eprintln!("items ({}):", round.items.len());
+    for c in &round.items {
+        eprintln!("  ITEM {} {:+} (total {:+}, {} builders, {:.1}%)", c.name, c.step, c.total, c.users, c.win);
+    }
+    eprintln!("champions: {} changes ({} without the items)", round.changes.len(), without.changes.len());
+    for c in &round.changes {
+        let alone = without.changes.iter().find(|x| x.champion == c.champion).map_or(0, |x| x.step);
+        let mark = if alone != c.step { format!("  (without the items {alone:+})") } else { String::new() };
+        eprintln!("  CHAMP {} {:+} ({:.1}%{}){mark}", c.champion, c.step, c.win, if c.unpicked { ", unpicked" } else { "" });
+    }
+    eprintln!("summary: {}", round.summary);
+    // every item's builders (30+ recent games) against the field, and the builders' own mean
+    if std::env::var("PMA_ALL_ITEMS").is_ok() {
+        let centre = patch_meta_ai::balance::field_centre(&meta);
+        let builders: Vec<(String, f32, f32)> = meta
+            .champions
+            .iter()
+            .filter(|c| c.evidence >= 30.0 && inputs.builds.contains_key(&c.name))
+            .map(|c| (c.name.clone(), patch_meta_ai::balance::field_win(c, centre), c.evidence))
+            .collect();
+        let w: f32 = builders.iter().map(|b| b.2.min(200.0)).sum();
+        eprintln!("builders {}: games-weighted mean {:.1}% against the field", builders.len(), builders.iter().map(|b| b.1 * b.2.min(200.0)).sum::<f32>() / w);
+        let mut rows: Vec<(f32, String, usize)> = inputs
+            .names
+            .iter()
+            .filter_map(|(key, name)| {
+                let us: Vec<&(String, f32, f32)> = builders.iter().filter(|b| inputs.builds[&b.0].contains(key)).collect();
+                (us.len() >= 3).then(|| {
+                    let w: f32 = us.iter().map(|b| b.2.min(200.0)).sum();
+                    (us.iter().map(|b| b.1 * b.2.min(200.0)).sum::<f32>() / w, name.clone(), us.len())
+                })
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (win, name, n) in &rows {
+            eprintln!("  GROUP {win:5.1}% {name} ({n})");
+        }
+    }
+}

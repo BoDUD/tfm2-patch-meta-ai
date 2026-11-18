@@ -2110,6 +2110,9 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         items: cfg.item_balance,
         item_count: cfg.item_balance_count,
         item_max: cfg.item_balance_max,
+        item_users: cfg.item_balance_users,
+        item_band: cfg.item_balance_band,
+        item_per_point: cfg.item_balance_per_point,
     };
     let skip = skip_lists(st, cfg);
     // the champions' numbers against what the book saw (2.11.0): the player's changes take the balance's power off
