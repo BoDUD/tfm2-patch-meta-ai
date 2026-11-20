@@ -180,6 +180,8 @@ impl BalanceView {
         }
         for panel in &self.panels {
             if !ui.exists(panel.shown) || ui.visible(panel.shown) == Some(false) {
+                // 不在屏幕上：读不出英雄的帧数重新数
+                self.misses.remove(panel.name);
                 continue;
             }
             let name = ui.text(panel.name);
@@ -339,6 +341,14 @@ mod tests {
         let names = NameBook::default();
         let mut bv = BalanceView::default();
         let v = view(&[("league_tryndamere", 30)], &[]);
+        for _ in 1..DUMP_AFTER {
+            bv.tick(&mut ui, &names, Some(&v));
+        }
+        assert!(bv.dumped.is_empty());
+        // 中间离开这一页一帧：重新数
+        ui.nodes.get_mut(ENCYCLOPEDIA_STATS).unwrap().visible = false;
+        bv.tick(&mut ui, &names, Some(&v));
+        ui.nodes.get_mut(ENCYCLOPEDIA_STATS).unwrap().visible = true;
         for _ in 1..DUMP_AFTER {
             bv.tick(&mut ui, &names, Some(&v));
         }
