@@ -54,6 +54,15 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.12.3：百科英雄页显示补丁后的数值（游戏 0.7.3）
+
+玩家截图（经用户转来）：补丁历史里双弹瓦斯攻击力 89.6 → 92，游戏百科「英雄信息」的「查看当前数值」还是 80。用户：「我感觉是bug吧？」
+
+- **原因**：电竞大脑的平衡是比赛里的加成，游戏的英雄数据不动，所以游戏的面板写的是原始数值，`ui::balance_view` 每帧在游戏之后把攻击力、法术强度、生命值改成补丁后的（2.8.0）。它靠面板上的英雄名字标签认出是谁，名字标签不可见就跳过整块面板。游戏 0.7.3 的百科英雄页（布局 `champion_info` / `champion_info_d`）把 `stat.header`、`stat.name`、`stat.category` 都设成了 `visible: false`，改成在上面的网格里高亮选中的英雄，于是这一页一直被跳过。选人界面的面板不受影响（用户的 `diag.log`：莉莉娅 +10%，攻击力 85 → 89.2）。
+- **现在**：每块面板多一个「在不在屏幕上」看的节点（`Panel.shown`）。选人界面和提示框还是看名字标签；百科页看数值那一块（`stat.stats`），英雄名照旧从藏起来的名字标签读——游戏 EXE 里百科页的代码（`champion_info_ui.rs`）还在写 `data.champion_info.stat.name`。
+- **万一读不出**：数值那一块在屏幕上、连续 30 帧读不出英雄时，`diag.log` 记一行 `[ui] stat panel ...: on screen for 30 frames, but its name label names no champion (...)`，并把整页（`main.top.right.champion_info.data`）的界面树写进 `ui_champion_info.txt`，一次游戏只写一次，下一版照着改（比如改读网格里选中的那张卡）。
+- **核对用**：读到了就和以前一样，第一次改写时 `diag.log` 记 `[ui] stat panel main.top.right.champion_info.data.champion_info.stat.name: <英雄> at +N% of power, ...`。
+
 ## 2.12.2：补丁历史里也有装备改动
 
 用户：「等等装备补丁 为什么不会显示在历史补丁里面」，看了原因后选「要」。
