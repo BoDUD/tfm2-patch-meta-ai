@@ -87,6 +87,14 @@ pub struct Config {
     /// item keys or the names the game shows, as written (`edits::list`); their power comes off.
     pub balance_skip: Vec<String>,
     pub item_balance_skip: Vec<String>,
+    /// 防御塔和大小龙的血量也由平衡补丁调（2.13.0，`crate::objectives`；用户：「现在防御塔 大小龙血量补丁不会自动调整
+    /// 我们能加吗」）：对局时长的目标（分钟）、小龙和大龙刷新以后活多久的目标（秒）、每轮最多和累计最多（百分比）
+    pub objective_balance: bool,
+    pub objective_length: (f32, f32),
+    pub objective_drake: (f32, f32),
+    pub objective_baron: (f32, f32),
+    pub objective_step: i32,
+    pub objective_max: i32,
     pub tier_list: Switch,
     // [model]
     /// Patches the model looks back over, the current one included.
@@ -183,6 +191,12 @@ impl Default for Config {
             item_balance_per_point: crate::balance::DEFAULT_ITEM_PER_POINT,
             balance_skip: Vec::new(),
             item_balance_skip: Vec::new(),
+            objective_balance: true,
+            objective_length: crate::objectives::DEFAULT_TARGETS.length,
+            objective_drake: crate::objectives::DEFAULT_TARGETS.drake,
+            objective_baron: crate::objectives::DEFAULT_TARGETS.baron,
+            objective_step: crate::objectives::DEFAULT_TARGETS.step,
+            objective_max: crate::objectives::DEFAULT_TARGETS.max,
             tier_list: Switch::Auto,
             patches: 12.0,
             drift: 0.08,
@@ -311,6 +325,14 @@ fn number(v: &str) -> Result<f32, String> {
     }
 }
 
+/// 一个范围：「19-24」「19–24」「19~24」都行，两头反了就换过来
+fn range(v: &str, lowest: f32, highest: f32) -> Result<(f32, f32), String> {
+    let parts: Vec<&str> = v.split(['-', '–', '—', '~', '～']).map(str::trim).filter(|p| !p.is_empty()).collect();
+    let [a, b] = parts.as_slice() else { return Err(format!("expected two numbers like 19-24, got {v:?}")) };
+    let (a, b) = (number(a)?.clamp(lowest, highest), number(b)?.clamp(lowest, highest));
+    Ok(if a <= b { (a, b) } else { (b, a) })
+}
+
 fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
     match key {
         "ban_pick" => cfg.ban_pick = Switch::parse(value)?,
@@ -335,6 +357,13 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "item_balance_band" => cfg.item_balance_band = number(value)?.clamp(0.0, 5.0),
         "item_balance_per_point" => cfg.item_balance_per_point = number(value)?.clamp(1.0, 50.0),
         "balance_skip" => cfg.balance_skip = crate::edits::list(value),
+        // 2.13.0：塔和龙
+        "objective_balance" => cfg.objective_balance = flag(value)?,
+        "objective_length" => cfg.objective_length = range(value, 5.0, 90.0)?,
+        "objective_drake" => cfg.objective_drake = range(value, 5.0, 900.0)?,
+        "objective_baron" => cfg.objective_baron = range(value, 5.0, 900.0)?,
+        "objective_step" => cfg.objective_step = number(value)?.round().clamp(1.0, 50.0) as i32,
+        "objective_max" => cfg.objective_max = number(value)?.round().clamp(0.0, 300.0) as i32,
         "item_balance_skip" => cfg.item_balance_skip = crate::edits::list(value),
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
         "recency" if value.trim().eq_ignore_ascii_case("off") => {
@@ -583,7 +612,8 @@ pub fn summary(c: &Config) -> String {
          lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
-         item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}]",
+         item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}] \
+         objective_balance={} objective_length={}-{} objective_drake={}-{} objective_baron={}-{} objective_step={} objective_max={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -645,7 +675,16 @@ pub fn summary(c: &Config) -> String {
         c.item_balance_band,
         c.item_balance_per_point,
         c.balance_skip.join(","),
-        c.item_balance_skip.join(",")
+        c.item_balance_skip.join(","),
+        if c.objective_balance { "on" } else { "off" },
+        c.objective_length.0,
+        c.objective_length.1,
+        c.objective_drake.0,
+        c.objective_drake.1,
+        c.objective_baron.0,
+        c.objective_baron.1,
+        c.objective_step,
+        c.objective_max
     )
 }
 
@@ -786,6 +825,29 @@ balance_skip=
 ; item_balance_skip : the same for the 4+6 items (their keys or names, e.g. 无尽之刃)
 ; item_balance_skip : 4+6 装备的同样设置（填装备的 key 或名字，例如 无尽之刃）
 item_balance_skip=
+; objective_balance : the balance patches also set the health of the towers, the drakes and Baron
+;                (2.13.0): a percentage on top of the save's numbers in every match, the database keeps
+;                its numbers. Towers follow the matches' length: shorter on average than objective_length
+;                (minutes) and they get sturdier, longer and they get weaker. Drakes and Baron follow how
+;                long one lives after it spawns (seconds, measured in the matches): dying sooner than
+;                objective_drake / objective_baron and they get more health, later and less. Each patch
+;                makes up half the gap, at most objective_step %, in all between -50% and objective_max %.
+;                Judged on the matches played since its last change (30 matches, 30 spawned); the
+;                changes come as news of their own and under the patch in the patch history. Health you
+;                change in the database takes this mod's percentage off at once. Needs balance=on.
+; objective_balance : 平衡补丁也调防御塔、小龙、大龙的生命值（2.13.0）：比赛里在存档数值上按百分比加减，
+;                所有比赛生效，数据库里的数值不变。塔看对局时长：平均比 objective_length（分钟）短就加血，
+;                长就减血。小龙、大龙看刷新以后活多久（秒，比赛里实测）：比 objective_drake / objective_baron
+;                死得快就加血，慢就减血。每个版本补差距的一半，单版最多 objective_step %，累计在 -50% 到
+;                objective_max % 之间。只看上次改它以后打的比赛（够 30 场、刷新过 30 条才判断）；改动单独
+;                发一条新闻，补丁历史里也写在那个版本下面。你在数据库里改了它们的生命值，电竞大脑的百分比
+;                马上去掉。要先开 balance。
+objective_balance=on
+objective_length=19-24
+objective_drake=60-120
+objective_baron=120-240
+objective_step=15
+objective_max=100
 tier_list=auto
 
 [model]
@@ -1038,6 +1100,29 @@ item_balance_max=10
         // the model expects a step by the same number
         assert_eq!(parse("balance_per_point=4").0.model().balance_per_point, 4.0);
         assert!(summary(&parse("balance_per_point=4").0).contains("balance_per_point=4"));
+    }
+
+    #[test]
+    fn the_tower_and_monster_targets_are_ranges() {
+        let d = Config::default();
+        assert!(d.objective_balance);
+        assert_eq!((d.objective_length, d.objective_drake, d.objective_baron), ((19.0, 24.0), (60.0, 120.0), (120.0, 240.0)));
+        assert_eq!((d.objective_step, d.objective_max), (15, 100));
+        let (cfg, warnings) = parse("objective_length=15–20
+objective_drake = 90 ~ 45
+objective_baron=100-200
+objective_step=80
+objective_max=150
+objective_balance=off
+");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!((cfg.objective_length, cfg.objective_drake, cfg.objective_baron), ((15.0, 20.0), (45.0, 90.0), (100.0, 200.0)));
+        assert_eq!((cfg.objective_step, cfg.objective_max, cfg.objective_balance), (50, 150, false));
+        let (cfg, warnings) = parse("objective_length=20
+");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(cfg.objective_length, (19.0, 24.0), "a bad value keeps the default");
+        assert!(summary(&d).contains("objective_balance=on objective_length=19-24 objective_drake=60-120"), "{}", summary(&d));
     }
 
     #[test]

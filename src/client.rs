@@ -75,6 +75,10 @@ pub trait Game: Source {
     fn schedule_json(&mut self, _path: &str) -> Option<String> {
         None
     }
+    /// 游戏设置里的一个数（2.13.0：塔和龙的基础生命、一秒几个 tick）
+    fn game_setting(&mut self, _path: &str) -> Option<i64> {
+        None
+    }
     /// Fit in a background thread (tests fit in the frame, to stay deterministic).
     fn threaded(&self) -> bool {
         false
@@ -243,6 +247,12 @@ impl Game for ClientGame<'_, '_> {
         let asked = Instant::now();
         let out = self.ctx.schedule_get_json(path);
         host_call(|| "schedule".to_string(), asked.elapsed());
+        out
+    }
+    fn game_setting(&mut self, path: &str) -> Option<i64> {
+        let asked = Instant::now();
+        let out = self.ctx.setting_get_i64(mod_api_stable::SettingTargetV1::GameSetting, path);
+        host_call(|| format!("setting {path}"), asked.elapsed());
         out
     }
     fn threaded(&self) -> bool {
@@ -1865,6 +1875,10 @@ struct BalanceSync {
     /// of the last frame.
     near_patch: Option<(Date, bool)>,
     watching: bool,
+    /// 塔和龙（2.13.0）：下次读游戏设置的时候，读到的基础生命（塔、小龙、大龙；0 = 没读到），一秒几个 tick（0 = 没读到）
+    objectives_at: Option<Instant>,
+    objective_base: [i64; 3],
+    tps: f32,
 }
 
 type Date = (i32, u32, u32);
@@ -2102,6 +2116,8 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         }
         Some(_) => {}
     }
+    // 塔和龙的基础生命：玩家在数据库里改了的去掉电竞大脑的百分比（2.13.0）
+    let edited_objectives = look_at_objectives(st, game, cfg, now);
     let rules = crate::balance::Rules {
         count: cfg.balance_count,
         max_step: cfg.balance_max,
@@ -2113,6 +2129,15 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         item_users: cfg.item_balance_users,
         item_band: cfg.item_balance_band,
         item_per_point: cfg.item_balance_per_point,
+        objectives: cfg.objective_balance.then_some(crate::objectives::Targets {
+            length: cfg.objective_length,
+            drake: cfg.objective_drake,
+            baron: cfg.objective_baron,
+            step: cfg.objective_step,
+            max: cfg.objective_max,
+            tps: if st.balance.tps > 0.0 { st.balance.tps } else { crate::objectives::DEFAULT_TARGETS.tps },
+            base: st.balance.objective_base,
+        }),
     };
     let skip = skip_lists(st, cfg);
     // the champions' numbers against what the book saw (2.11.0): the player's changes take the balance's power off
@@ -2122,7 +2147,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         if cfg.item_balance {
             crate::items::refresh();
         }
-        make_resets(st, game, &skip, &edited, now);
+        make_resets(st, game, &skip, &edited, &edited_objectives, now);
         // the news' end: a new item (the game's patch notes, a round's own) has the list read again - often around the
         // game's patch days, once in a long while on the others (2.11.0: a look costs the game ~100-180 ms)
         let watching = patch_days(st, game);
@@ -2173,6 +2198,9 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                             round.id,
                             if items.is_empty() { "no changes".to_string() } else { items.join(", ") }
                         ));
+                    }
+                    if !round.objective_summary.is_empty() {
+                        diag::log(&format!("[balance] round {} towers / monsters: {}", round.id, round.objective_summary));
                     }
                     log_held(&round);
                     crate::balance::publish(round);
@@ -2290,18 +2318,55 @@ fn look_at_numbers(st: &mut State, judging: bool) -> Vec<String> {
     player
 }
 
+/// 塔和龙的基础生命（2.13.0）：每 [`NUMBERS_EVERY`] 读一次游戏设置（顺便读一秒几个 tick），和账本上次读到的比。
+/// 返回玩家在数据库里改了的那些和改后的数（平衡和 objective_balance 都开着才算）。
+fn look_at_objectives(st: &mut State, game: &mut impl Game, cfg: &Config, now: Instant) -> Vec<(crate::objectives::Objective, i64)> {
+    if !due(st.balance.objectives_at, now) || crate::balance::book().is_none() {
+        return Vec::new();
+    }
+    st.balance.objectives_at = Some(now + NUMBERS_EVERY);
+    if let Some(tps) = game.game_setting("tick_per_second").filter(|t| *t > 0) {
+        st.balance.tps = tps as f32;
+    }
+    let mut values = Vec::new();
+    for o in crate::objectives::Objective::ALL {
+        if let Some(v) = game.game_setting(o.setting_path()).filter(|v| *v > 0) {
+            st.balance.objective_base[o.index()] = v;
+            values.push((o, v));
+        }
+    }
+    if values.is_empty() {
+        diag::log_once("objectives-no-setting", "[objectives] the tower / drake / Baron health of the game settings are not readable");
+        return Vec::new();
+    }
+    let patch = st.balance.patch.clone().unwrap_or_default();
+    let edited = crate::balance::observe_objectives(&values, &patch, st.balance.watching, cfg.balance && cfg.objective_balance);
+    if !edited.is_empty() {
+        diag::log(&format!("[edits] tower / monster health the player changed (database): {edited:?}"));
+    }
+    values.into_iter().filter(|(o, _)| edited.contains(o)).collect()
+}
+
 /// A round of resets at once (2.11.0, `balance::make_reset`): the champions whose numbers the player changed, and
-/// the champions and items the skip lists name that still have power (looked for every few seconds).
-fn make_resets(st: &mut State, game: &mut impl Game, skip: &crate::balance::Skip, edited: &[String], now: Instant) {
+/// the champions and items the skip lists name that still have power (looked for every few seconds); 2.13.0 起也有
+/// 玩家改了生命值的塔和龙。
+fn make_resets(
+    st: &mut State,
+    game: &mut impl Game,
+    skip: &crate::balance::Skip,
+    edited: &[String],
+    objectives: &[(crate::objectives::Objective, i64)],
+    now: Instant,
+) {
     let look = due(st.balance.resets_at, now);
-    if edited.is_empty() && !look {
+    if edited.is_empty() && objectives.is_empty() && !look {
         return;
     }
     if look {
         st.balance.resets_at = Some(now + Duration::from_secs(5));
     }
     let (skipped, skipped_items) = crate::balance::with_power(&skip.champions, &skip.items);
-    if edited.is_empty() && skipped.is_empty() && skipped_items.is_empty() {
+    if edited.is_empty() && objectives.is_empty() && skipped.is_empty() && skipped_items.is_empty() {
         return;
     }
     let mut champions: Vec<(String, crate::balance::Reset)> =
@@ -2315,12 +2380,13 @@ fn make_resets(st: &mut State, game: &mut impl Game, skip: &crate::balance::Skip
             (k, name, crate::balance::Reset::Skip)
         })
         .collect();
-    let Some(round) = crate::balance::reset_now(&champions, &items, game.game_date()) else { return };
+    let Some(round) = crate::balance::reset_now(&champions, &items, objectives, game.game_date()) else { return };
     let list: Vec<String> = round
         .changes
         .iter()
         .map(|c| format!("{} {:+} ({:?})", c.champion, c.step, c.reset.unwrap_or(crate::balance::Reset::Edit)))
         .chain(round.items.iter().map(|c| format!("{} {:+} (item, skip)", c.name, c.step)))
+        .chain(round.objectives.iter().map(|c| format!("{:?} {:+} (health edited)", c.objective, c.step)))
         .collect();
     diag::log(&format!("[balance] round {} {} (resets): {}", round.id, round.label, list.join(", ")));
     crate::balance::publish(round);
@@ -2374,6 +2440,10 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
         catalog.as_ref().and_then(|cat| cat.item(&c.item)).map(|(_, item)| crate::items::icon_text(&item.icon)).unwrap_or_default()
     };
     let items_news = crate::balance::item_news(round, chinese, &item_lines, &item_icon);
+    // 塔和龙（2.13.0）：游戏是中文就写中文（看英雄的名字）
+    let cjk = |t: &str| t.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    let chinese_game = st.labels.champions.values().take(20).any(|l| cjk(l));
+    let objectives_news = crate::objectives::news(&name, &round.objectives, chinese_game);
     BalanceRequest {
         team,
         off: true,
@@ -2381,6 +2451,7 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
         note: Some(NoteRequest { version: round.version.clone(), label: name, merge: round.merged, champions, title, content }),
         articles,
         items_news,
+        objectives_news,
     }
 }
 

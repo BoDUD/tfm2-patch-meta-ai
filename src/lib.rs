@@ -36,6 +36,7 @@ pub mod knowledge;
 pub mod lock;
 pub mod meta;
 pub mod model;
+pub mod objectives;
 mod paths;
 pub mod patchnotes;
 mod perf;
