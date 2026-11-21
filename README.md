@@ -54,6 +54,17 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.13.0：防御塔和大小龙的血量也进平衡补丁（`objective_balance`）
+
+用户：「现在防御塔 大小龙血量补丁不会自动调整 我们能加吗」，选了塔看对局时长、大小龙看刷新以后活多久，对局时长目标 19–24 分钟。
+
+- **为什么**：游戏自己的规则补丁只在赛季开始出一次，嫌对局太长就砍塔血（用户存档里 4800 → 4080 → 3713，还加了击杀金币），小龙、大龙只改吃到的增益，龙本身的血从来不动。电竞大脑只关掉了游戏的英雄补丁，规则补丁没管。用户存档 2028 赛季 5118 场平均 12.8 分钟（中位 11.7）。
+- **怎么调**：每轮补丁给塔、小龙、大龙各一个生命值百分比，比赛里挂一个只加生命上限的增益（`patch_meta_ai_objective`），存档和数据库里的数值不改。塔（双子塔也算，水晶枢纽不算）看平均对局时长；小龙（远古龙也是它）和大龙看刷新以后平均活多久：活着的总时间除以被打死的条数，打完还活着的也算时间。在目标里面不动；外面就补到最近那一头差距的一半（生命值按和要花的时间成正比算），单版最多 `objective_step`（15%），累计在 -50% 到 `objective_max`（100%）之间。只看上次改它以后打的比赛，够 30 场（塔）、刷新过 30 条（龙）才判断。
+- **数据从哪来**：服务端跑出结果的那一份模拟每 30 tick 看一次场上，记下这一场打了多久、每条小龙和大龙刷新和被打死的 tick，存在这个存档的账本里（`balance-<id>.json` 的 `watched`，最近 3000 场）。装上以后才开始记，第一次调整在攒够比赛以后的那个版本。
+- **改血**：每份模拟（服务端、看比赛、回放）在同样的 tick 给没改过的塔和龙挂增益，当前血按原来的比例补上（满血还是满血）；引擎下一 tick 才算上限的，等一次再补；增益加不上上限的，改基础生命（日志写 `base stat`）。第一次改每一样时 `diag.log` 记一行 `[objectives] Tower +15%: hp 3713/3713 -> 4269/4269 (buff; ...)`。
+- **在哪看**：单独一条新闻「电竞大脑防御塔和大小龙 v<版本>」，写明改前改后的生命值（游戏设置里的基础生命）、本次和累计、量到了什么；游戏百科「补丁历史」那一版的英雄列表下面也有（和装备在同一块）。`diag.log` 每轮一行 `[balance] round N towers / monsters: tower: 12.6 min on 412 (target 19-24), +0% -> +15%; ...`。
+- **玩家改的数**：在数据库里改了塔、小龙或大龙的生命值，电竞大脑马上去掉它的百分比（出一个热修复，新闻写「恢复」），按玩家的数值来，之后从这里重新数比赛。同一个版本里、又不在补丁日前后变的才算玩家改的（游戏自己的规则补丁在赛季开始那个补丁日改塔血）。
+
 ## 2.12.3：百科英雄页显示补丁后的数值（游戏 0.7.3）
 
 玩家截图（经用户转来）：补丁历史里双弹瓦斯攻击力 89.6 → 92，游戏百科「英雄信息」的「查看当前数值」还是 80。用户：「我感觉是bug吧？」
@@ -290,6 +301,10 @@
 | | `item_balance_per_point` | 10 | 每超出 1 个点调装备数值的百分之几（1～50；2.12.0 前固定 2） |
 | | `balance_skip` | （空） | 平衡补丁永远不调整的英雄（id 或游戏里显示的名字，逗号分隔）；已有调整马上取消（2.11.0） |
 | | `item_balance_skip` | （空） | 同上，4+6 装备（key 或名字） |
+| | `objective_balance` | on | 平衡补丁也调防御塔、小龙、大龙的生命值（2.13.0；要先开 `balance`）：比赛里按百分比加减，数据库不改 |
+| | `objective_length` | 19-24 | 对局时长的目标（分钟）：平均比它短给塔加血，长就减 |
+| | `objective_drake` / `objective_baron` | 60-120 / 120-240 | 小龙、大龙刷新以后活多久的目标（秒）：死得快加血，慢就减 |
+| | `objective_step` / `objective_max` | 15 / 100 | 每个版本最多调多少、累计最多加多少（百分比；最低 -50%） |
 | `[report]` | `report` | on | 写 `meta_report.html` |
 | `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 Insert 随时写一份；F9 在主界面是游戏的「设施」键） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
@@ -321,6 +336,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.13.0 (the user: "the towers' and the drakes' / Baron's health never get patched - can we add that?"): each balance round also sets a health percentage for the towers, the drakes and Baron (`objective_balance`, on with `balance`), a buff in every match (`patch_meta_ai_objective`, max health only; the save and the database keep their numbers). Towers follow the matches' mean length (target `objective_length`, 19-24 min), drakes and Baron how long one lives after it spawns (time alive over deaths; targets `objective_drake` 60-120 s, `objective_baron` 120-240 s). Half the gap to the band's nearer edge a round, at most `objective_step` (15%), in all between -50% and `objective_max` (100%), judged on the matches since its last change (30 matches / 30 spawns). The server's run of each match records its length and every drake's and Baron's spawn and death tick (`watched` in the save's book). Health the player changes in the database takes the percentage off at once. The changes come as news of their own and under the patch in the patch history.
 
 2.10.0 (the user: "make every champion balanced, not just cut the overpowered ones"): a fit over the user's 2699 games of the 4+6 item era (champions, players and side, with each champion's balance power per patch as a covariate) gave 0.7-1.5 log-odds per 100% of power - a -10% step moved its champion 2-4 points where the rule's 1.5% a point expected 6.7, so the strong champions stayed strong after their cuts. The step is now a setting, `balance_per_point` (default 2.5, 1-5; cautious, since some of our own kit changes came with cuts), used by the champion rule, the items' expectation of a champion's step and the model's expectation of a step. The champions' overall limit goes from 50% to 80% (`balance_max` up to 80; items keep 50%); the defaults are now 30 champions and 20% a round. **Unpicked buffs** (`balance_unpicked`, default 20, 0 = off): champions of the save's pool (picked or banned in a kept match) with fewer than 30 recent games, at most 50% against the field and under +30% get +10% each round (up to +30% through this rule; fewest games first, then the weakest), besides `balance_count`, so that they get played and judged. A book whose newest round was made under older rules gets one hotfix of the current patch at once (`Due::Recalibration`, `Round::rules`).
 

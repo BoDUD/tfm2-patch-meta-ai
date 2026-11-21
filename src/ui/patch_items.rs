@@ -14,11 +14,14 @@
 //! game lists a round's champions in the round's order). The game makes the content again for another patch; the
 //! block follows it. Once a session the right panel's tree goes to `ui_patch_history.txt`, so a game update that moves
 //! the page can be seen.
+//!
+//! 2.13.0 起防御塔、小龙、大龙的改动也写在这个块里（装备后面，没有装备改动就只有它们）。
 
 use super::names::NameBook;
 use super::{color, quote, Ui};
 use crate::balance::ItemChange;
 use crate::items::{Catalog, STATS};
+use crate::objectives::ObjectiveChange;
 
 /// The main screen's right side: the patch history is one of its children (`<child>.data.right_panel`).
 pub const RIGHT: &str = "main.top.right";
@@ -57,8 +60,8 @@ impl Shown {
         self.buffs + self.nerfs == 0
     }
 }
-/// The round a patch's champions belong to: its label and its item changes.
-pub type Found = Option<(String, Vec<ItemChange>)>;
+/// The round a patch's champions belong to: its label, its item changes and (2.13.0) its tower / monster changes.
+pub type Found = Option<(String, Vec<ItemChange>, Vec<ObjectiveChange>)>;
 
 /// The patch history's item block.
 #[derive(Default)]
@@ -110,16 +113,20 @@ impl PatchItems {
         }
         self.placed = false;
         let found = if shown.is_empty() { None } else { find(&shown) };
-        let lines = match (&found, catalog) {
-            (Some((_, items)), Some(catalog)) if !items.is_empty() => lines_of(items, catalog, true),
+        let mut lines = match (&found, catalog) {
+            (Some((_, items, _)), Some(catalog)) if !items.is_empty() => lines_of(items, catalog, true),
             _ => Vec::new(),
         };
+        let items = lines.len();
+        if let Some((_, _, objectives)) = &found {
+            lines.extend(objective_lines(objectives, true));
+        }
         let scroll = format!("{content}.scroll");
         if lines.is_empty() {
             ui.set_properties(&scroll, &format!("height: {SCROLL_H}px;"));
             return;
         }
-        let (source, height) = block(&lines, true);
+        let (source, height) = block(&lines, title(items > 0, lines.len() > items, true));
         // the list ends where the block fits in the panel's sight (the game's list runs 57 px past the panel's bottom)
         let room = match (ui.rect(&panel), ui.rect(&scroll)) {
             (Some((_, py, _, ph)), Some((_, sy, _, _))) if ph > 0.0 && sy > py => (py + ph - sy).round() as i32 - 8,
@@ -128,10 +135,13 @@ impl PatchItems {
         ui.set_properties(&scroll, &format!("height: {}px;", (room - height).max(SCROLL_MIN)));
         if ui.spawn(&content, &source) {
             self.placed = true;
-            let label = found.as_ref().map_or("", |(l, _)| l.as_str());
+            let label = found.as_ref().map_or("", |(l, _, _)| l.as_str());
             crate::diag::log_once(
                 &format!("patch-items-{label}"),
-                &format!("[ui] patch history {content}: {shown:?} = round {label}, {} item lines under the list ({height} px)", lines.len()),
+                &format!(
+                    "[ui] patch history {content}: {shown:?} = round {label}, {items} item lines + {} tower / monster lines under the list ({height} px)",
+                    lines.len() - items
+                ),
             );
         }
     }
@@ -233,9 +243,40 @@ pub fn lines_of(changes: &[ItemChange], catalog: &Catalog, chinese: bool) -> Vec
         .collect()
 }
 
+/// 塔和龙的改动，一样一行：名字、改了多少（颜色）和累计、生命值改前改后、灰字写量到了什么
+pub fn objective_lines(changes: &[ObjectiveChange], chinese: bool) -> Vec<String> {
+    let mut changes: Vec<&ObjectiveChange> = changes.iter().collect();
+    changes.sort_by_key(|c| c.objective);
+    changes
+        .into_iter()
+        .map(|c| {
+            let (name, hp, why) = crate::objectives::history_parts(c, chinese);
+            let step = format!("<{}>{:+}%<>", color(if c.step > 0 { UP } else { DOWN }), c.step);
+            let grey = format!("<{}>{why}<>", color(GREY));
+            let total = match (c.reset.is_some(), chinese) {
+                (true, _) => String::new(),
+                (false, true) => format!("（累计 {:+}%）", c.total),
+                (false, false) => format!(" ({:+}% in all)", c.total),
+            };
+            format!("{name}  {step}{total}  {hp}  {grey}")
+        })
+        .collect()
+}
+
+/// 块的标题：有什么写什么
+pub fn title(items: bool, objectives: bool, chinese: bool) -> &'static str {
+    match (items, objectives, chinese) {
+        (true, true, true) => "装备、防御塔和大小龙（电竞大脑）",
+        (false, true, true) => "防御塔和大小龙（电竞大脑）",
+        (_, false, true) => "装备（电竞大脑装备平衡）",
+        (true, true, false) => "Items, towers and epic monsters (Patch Meta AI)",
+        (false, true, false) => "Towers and epic monsters (Patch Meta AI)",
+        (_, false, false) => "Items (Patch Meta AI)",
+    }
+}
+
 /// The block's `.ui` source and height: a rule, the title, then a line an item.
-pub fn block(lines: &[String], chinese: bool) -> (String, i32) {
-    let title = if chinese { "装备（电竞大脑装备平衡）" } else { "Items (Patch Meta AI)" };
+pub fn block(lines: &[String], title: &str) -> (String, i32) {
     let mut body = format!(
         "#bar:color {{ x: 0px; y: 6px; width: {WIDTH}px; height: 1px; color: {}; ignore_event: true; }} \
          #title:label {{ @\"asset/base/style/main#bold_label\"; x: 8px; y: 8px; width: 1040px; height: {}px; size: 20; align_y: Center; color: {}; text: {}; }} ",
@@ -289,7 +330,22 @@ mod tests {
 
     /// The round of 2028.2.1 by its champions; any other patch: none.
     fn find(shown: &Shown) -> Found {
-        (*shown == shown_221()).then(|| ("2028.2.1".to_string(), vec![change("item_storm", "风暴狂涌", 2, 2), change("item_heart", "心之钢", 1, 1), change("item_rod", "虚空之杖", -6, -6)]))
+        (*shown == shown_221()).then(|| {
+            ("2028.2.1".to_string(), vec![change("item_storm", "风暴狂涌", 2, 2), change("item_heart", "心之钢", 1, 1), change("item_rod", "虚空之杖", -6, -6)], tower())
+        })
+    }
+
+    fn tower() -> Vec<ObjectiveChange> {
+        vec![ObjectiveChange {
+            objective: crate::objectives::Objective::Tower,
+            measured: 12.6,
+            evidence: 412,
+            step: 15,
+            total: 15,
+            reset: None,
+            band: (19.0, 24.0),
+            base: 3713,
+        }]
     }
 
     /// The patch history as the game lays it out: the page, its right panel, the patch content with the champions'
@@ -328,7 +384,7 @@ mod tests {
         let mut view = PatchItems::default();
         view.tick(&mut ui, Some(&cat), &n, &find);
         let ours = format!("{content}.{SECTION}");
-        assert!(ui.exists(&ours) && ui.exists(&format!("{ours}.i2")), "three item lines");
+        assert!(ui.exists(&ours) && ui.exists(&format!("{ours}.i3")), "three item lines and the towers'");
         let props = &ui.nodes[&format!("{content}.scroll")].props;
         assert!(props.last().is_some_and(|p| p.starts_with("height: ") && p != "height: 830px;"), "the list gives up the room: {props:?}");
         // the next frames: nothing again
@@ -350,7 +406,7 @@ mod tests {
     #[test]
     fn a_line_an_item() {
         let cat = Catalog::parse(CATALOG).unwrap();
-        let (_, items) = find(&shown_221()).unwrap();
+        let (_, items, _) = find(&shown_221()).unwrap();
         let lines = lines_of(&items, &cat, true);
         assert_eq!(lines.len(), 3);
         let green = color(UP);
@@ -361,8 +417,18 @@ mod tests {
         );
         assert!(lines[1].contains("心之钢") && lines[1].contains("生命值 900 → 909"), "{}", lines[1]);
         assert!(lines[2].contains("虚空之杖") && lines[2].contains(&format!("<{}>-6%<>", color(DOWN))) && lines[2].contains("法术强度 70 → 66"), "{}", lines[2]);
-        let (source, height) = block(&lines, true);
+        let (source, height) = block(&lines, title(true, false, true));
         assert!(source.starts_with("pma_patch_items:empty") && source.contains("#i2:label"), "{source}");
         assert_eq!(height, TITLE_H + 3 * ROW_H + 8);
+    }
+
+    #[test]
+    fn a_line_for_the_towers_and_monsters() {
+        let lines = objective_lines(&tower(), true);
+        assert_eq!(
+            lines,
+            [format!("防御塔  <{}>+15%<>（累计 +15%）  生命值 3713 → 4270  <{}>最近 412 场平均 12.6 分钟，目标 19–24 分钟<>", color(UP), color(GREY))]
+        );
+        assert_eq!(title(false, true, true), "防御塔和大小龙（电竞大脑）");
     }
 }

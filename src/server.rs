@@ -330,6 +330,9 @@ pub struct BalanceRequest {
     /// The round's item changes as news of their own (2.9.0, `balance::item_news`): title and content.
     #[serde(default)]
     pub items_news: Option<(String, String)>,
+    /// 塔和龙的改动也单独一条新闻（2.13.0，`objectives::news`）
+    #[serde(default)]
+    pub objectives_news: Option<(String, String)>,
 }
 
 /// A round's notes: for the game's patch `version`, named `label`; `merge`d into the game's own notes of that patch
@@ -636,6 +639,13 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
                         "the item changes as news".to_string()
                     } else {
                         "the game refused the item news".to_string()
+                    });
+                }
+                if let Some((title, content)) = &req.objectives_news {
+                    said.push(if host.push_news(req.team, title, content, crate::balance::AUTHOR) {
+                        "the tower / monster changes as news".to_string()
+                    } else {
+                        "the game refused the tower / monster news".to_string()
                     });
                 }
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
@@ -1244,7 +1254,15 @@ mod tests {
     }
 
     fn breq(off: bool, round: u32) -> BalanceRequest {
-        BalanceRequest { team: 3, off, round, note: Some(note("2027.4.1", "2027.4.1b", false)), articles: Vec::new(), items_news: None }
+        BalanceRequest {
+            team: 3,
+            off,
+            round,
+            note: Some(note("2027.4.1", "2027.4.1b", false)),
+            articles: Vec::new(),
+            items_news: None,
+            objectives_news: None,
+        }
     }
 
     #[test]
@@ -1270,6 +1288,21 @@ mod tests {
         let off = champion_patches_off(&zeros).unwrap();
         assert_eq!(off["repeat_high_streak_threshold"], 99);
         assert!(champion_patches_off(&Value::from(3)).is_none());
+    }
+
+    #[test]
+    fn the_tower_and_monster_changes_are_news_of_their_own() {
+        let original = r#"{"major_strong_nerf_count":2,"meta_stale_high_threshold":4}"#;
+        let mut host = Host { autopatch: Some(original.into()), news: vec![official("2027.4.1")], ..Host::default() };
+        let mut req = breq(true, 1);
+        req.objectives_news = Some(("电竞大脑防御塔和大小龙 2027.4.1b".into(), "【加强】防御塔".into()));
+        let (ok, said) = balance(&mut host, &req);
+        assert!(ok && said.contains("the tower / monster changes as news"), "{said}");
+        assert!(host.news.iter().any(|n| n["title"] == "电竞大脑防御塔和大小龙 2027.4.1b" && n["author"] == crate::balance::AUTHOR));
+        // 同一轮再来一次不重复
+        let n = host.news.len();
+        balance(&mut host, &req);
+        assert_eq!(host.news.len(), n);
     }
 
     #[test]
@@ -1522,7 +1555,15 @@ mod tests {
             news: vec![official("2027.4.1")],
             ..Host::default()
         };
-        let req = BalanceRequest { team: 3, off: true, round: 1, note: Some(nobody("2027.4.1", "2027.4.1b", false)), articles: Vec::new(), items_news: None };
+        let req = BalanceRequest {
+            team: 3,
+            off: true,
+            round: 1,
+            note: Some(nobody("2027.4.1", "2027.4.1b", false)),
+            articles: Vec::new(),
+            items_news: None,
+            objectives_news: None,
+        };
         let (ok, said) = balance(&mut host, &req);
         assert!(ok && said.contains("round 1 no champion changed"), "{said}");
         assert_eq!((host.news.len(), host.saved.get(NEWS_DONE).map(String::as_str)), (1, Some("1")));

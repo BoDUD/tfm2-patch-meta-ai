@@ -55,6 +55,8 @@
 //!   ([`make_reset`], [`Reset::Edit`]) - so it plays exactly the player's numbers, and the rounds judge it again from
 //!   the games it plays with them. Champions `balance_skip` lists (and items `item_balance_skip` lists) are never
 //!   changed, their power taken off the same way ([`Reset::Skip`], [`Skip`]).
+//! - **防御塔和大小龙**（2.13.0，[`crate::objectives`]）：每轮也给塔、小龙、大龙各一个生命值百分比，塔看对局时长，
+//!   小龙大龙看刷新以后活多久；比赛里挂增益，服务端那一份记下每场的长度和龙的死活（账本里的 `watched`）。
 //!
 //! The book is one file a save in the mod folder (`balance-<id>.json`, the id kept in the save since 2.8.2 - named by
 //! the team before, a new career with the same team took the old one's book): every round (its changes and every
@@ -69,6 +71,7 @@ use mod_api_stable::{BuffV1, SimOriginKindV1, StableSim};
 use serde::{Deserialize, Serialize};
 
 use crate::meta::Meta;
+use crate::objectives::{Objective, ObjectiveChange, Tracker, Watch};
 use crate::patchnotes::PatchNote;
 use crate::records::compare_versions;
 use crate::stats::Stats;
@@ -167,6 +170,8 @@ pub struct Rules {
     pub item_users: usize,
     pub item_band: f32,
     pub item_per_point: f32,
+    /// 防御塔和大小龙也调（2.13.0，`objective_balance`）：目标和步子；None = 不调
+    pub objectives: Option<crate::objectives::Targets>,
 }
 
 /// One champion's change in a round.
@@ -262,6 +267,14 @@ pub struct Round {
     /// a hotfix in the notes, but not a round the late hotfix's timer or the rules' check counts ([`due`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reset: bool,
+    /// 塔、小龙、大龙这一轮的改动，和改完以后各自的百分比（2.13.0）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objectives: Vec<ObjectiveChange>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub objective_power: BTreeMap<Objective, i32>,
+    /// 这一轮塔和龙量到了什么，只写日志
+    #[serde(skip)]
+    pub objective_summary: String,
 }
 
 /// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
@@ -688,6 +701,10 @@ pub fn make_round_with(
         summary,
         rules: RULES_VERSION,
         reset: false,
+        // 塔和龙在 `make` 里判断，这里先照抄上一轮的
+        objectives: Vec::new(),
+        objective_power: last.map(|r| r.objective_power.clone()).unwrap_or_default(),
+        objective_summary: String::new(),
     }
 }
 
@@ -695,10 +712,12 @@ pub fn make_round_with(
 /// ([`Reset::Edit`] - listed even without power, so that the notes say the change was seen and the rounds count its
 /// games from here) and the champions and items `balance_skip` / `item_balance_skip` list that still have power
 /// ([`Reset::Skip`]). A hotfix of the newest round's patch. None: nothing to take off or say.
+/// `objectives`（2.13.0）：玩家在数据库里改了生命值的塔和龙，和改后的基础生命；没有百分比的也写上，之后从这里重新数比赛。
 pub fn make_reset(
     rounds: &[Round],
     champions: &[(String, Reset)],
     items: &[(String, String, Reset)],
+    objectives: &[(Objective, i64)],
     today: Option<(i32, u32, u32)>,
 ) -> Option<Round> {
     let last = rounds.last()?;
@@ -718,7 +737,22 @@ pub fn make_reset(
         let Some(was) = item_power.remove(key).filter(|p| *p != 0) else { continue };
         item_changes.push(ItemChange { item: key.clone(), name: name.clone(), users: 0, win: 0.0, step: -was, total: 0, reset: Some(*why) });
     }
-    if changes.is_empty() && item_changes.is_empty() {
+    let mut objective_power = last.objective_power.clone();
+    let mut objective_changes = Vec::new();
+    for &(objective, base) in objectives {
+        let was = objective_power.remove(&objective).unwrap_or(0);
+        objective_changes.push(ObjectiveChange {
+            objective,
+            measured: 0.0,
+            evidence: 0,
+            step: -was,
+            total: 0,
+            reset: Some(Reset::Edit),
+            band: (0.0, 0.0),
+            base,
+        });
+    }
+    if changes.is_empty() && item_changes.is_empty() && objective_changes.is_empty() {
         return None;
     }
     Some(Round {
@@ -736,6 +770,9 @@ pub fn make_reset(
         summary: String::new(),
         rules: last.rules,
         reset: true,
+        objectives: objective_changes,
+        objective_power,
+        objective_summary: String::new(),
     })
 }
 
@@ -1184,6 +1221,15 @@ struct Book {
     /// Every champion's numbers when last read, and its definition then (2.11.0, [`crate::edits`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     seen: BTreeMap<String, crate::edits::Seen>,
+    /// 每场比赛服务端那一份看到的塔和龙（2.13.0，比赛编号和记录），最新的在后面
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    watched: Vec<(String, Watch)>,
+    /// 服务端那一份关着 objective_balance 的比赛：之后每一份都不改塔和龙的血
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    objectives_off: Vec<String>,
+    /// 塔和龙的基础生命上次读到的数，和那时的版本（玩家在数据库里改了没有）
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    seen_objectives: BTreeMap<Objective, (i64, String)>,
 }
 
 #[derive(Default)]
@@ -1212,6 +1258,11 @@ struct Store {
     view: Option<Arc<View>>,
     /// The champions' numbers when last read ([`Book::seen`]).
     seen: BTreeMap<String, crate::edits::Seen>,
+    /// 2.13.0：每轮塔和龙的百分比，每场看到的，关着打的比赛，基础生命上次读到的
+    objective_powers: HashMap<u32, Arc<BTreeMap<Objective, i32>>>,
+    watched: VecDeque<(String, Watch)>,
+    objectives_off: std::collections::HashSet<String>,
+    seen_objectives: BTreeMap<Objective, (i64, String)>,
 }
 
 /// The newest round as the screens show it: every champion's power, and this round's steps.
@@ -1276,6 +1327,7 @@ fn open_book_file(file: PathBuf, legacy: PathBuf, done: u32) {
         for r in &later {
             st.powers.remove(&r.id);
             st.item_powers.remove(&r.id);
+            st.objective_powers.remove(&r.id);
         }
         let view = st.rounds.last().and_then(|r| st.powers.get(&r.id).map(|power| view_of(r, power)));
         st.view = view;
@@ -1300,6 +1352,7 @@ fn load(st: &mut Store, book: Book) {
         st.view = Some(view_of(&r, &power));
         st.powers.insert(r.id, power);
         st.item_powers.insert(r.id, Arc::new(r.item_power.clone()));
+        st.objective_powers.insert(r.id, Arc::new(r.objective_power.clone()));
         st.rounds.push(r);
     }
     for (key, id) in book.kept {
@@ -1308,7 +1361,10 @@ fn load(st: &mut Store, book: Book) {
         }
     }
     st.items_off = book.items_off.into_iter().filter(|k| st.kept.contains_key(k)).collect();
+    st.objectives_off = book.objectives_off.into_iter().filter(|k| st.kept.contains_key(k)).collect();
     st.seen = book.seen;
+    st.watched = book.watched.into_iter().collect();
+    st.seen_objectives = book.seen_objectives;
 }
 
 /// The save is closed (its kept matches written first).
@@ -1324,7 +1380,17 @@ fn write(st: &mut Store) {
     let Some(file) = &st.file else { return };
     let kept = st.order.iter().filter_map(|k| Some((k.clone(), *st.kept.get(k)?))).collect();
     let items_off = st.order.iter().filter(|k| st.items_off.contains(*k)).cloned().collect();
-    let book = Book { v: 1, rounds: st.rounds.iter().chain(&st.later).cloned().collect(), kept, items_off, seen: st.seen.clone() };
+    let objectives_off = st.order.iter().filter(|k| st.objectives_off.contains(*k)).cloned().collect();
+    let book = Book {
+        v: 1,
+        rounds: st.rounds.iter().chain(&st.later).cloned().collect(),
+        kept,
+        items_off,
+        seen: st.seen.clone(),
+        watched: st.watched.iter().cloned().collect(),
+        objectives_off,
+        seen_objectives: st.seen_objectives.clone(),
+    };
     if let Ok(text) = serde_json::to_string(&book) {
         let _ = std::fs::write(file, text);
     }
@@ -1352,7 +1418,7 @@ pub fn view() -> Option<Arc<View>> {
 /// column's count and first champion can be read): the rounds whose buffs and nerfs (steps other than 0, in the
 /// round's order - the order the game lists them) are as many as shown and hold the shown first ones; of those the one
 /// whose first ones are the shown first ones, the newest of equals. Its label and its item changes.
-pub fn round_of_patch(shown: &crate::ui::patch_items::Shown) -> Option<(String, Vec<ItemChange>)> {
+pub fn round_of_patch(shown: &crate::ui::patch_items::Shown) -> crate::ui::patch_items::Found {
     if shown.is_empty() {
         return None;
     }
@@ -1374,7 +1440,7 @@ pub fn round_of_patch(shown: &crate::ui::patch_items::Shown) -> Option<(String, 
         }
     }
     let (_, r) = best?;
-    Some((if r.label.is_empty() { r.version.clone() } else { r.label.clone() }, r.items.clone()))
+    Some((if r.label.is_empty() { r.version.clone() } else { r.label.clone() }, r.items.clone(), r.objectives.clone()))
 }
 
 /// The newest round's item power as the item pages show it (2.12.1, `ui::item_view`; a pointer, no copy).
@@ -1400,14 +1466,33 @@ pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>
     let st = store();
     let mut round = make_round_with(meta, &st.rounds, rules, due, today, items.as_ref(), skip);
     round.id = round.id.max(st.done + 1);
+    // 塔和龙（2.13.0）：拿账本里每场看到的判断
+    if let Some(targets) = rules.objectives {
+        let watched: Vec<&Watch> = st.watched.iter().map(|(_, w)| w).collect();
+        let (changes, said) = crate::objectives::decide(&st.rounds, &watched, &round.objective_power, &targets);
+        for c in &changes {
+            if c.total == 0 {
+                round.objective_power.remove(&c.objective);
+            } else {
+                round.objective_power.insert(c.objective, c.total);
+            }
+        }
+        round.objectives = changes;
+        round.objective_summary = format!("{said} ({} matches watched)", watched.len());
+    }
     round
 }
 
 /// The round of resets due on this save now ([`make_reset`]); not in the book until [`publish`]ed.
-pub fn reset_now(champions: &[(String, Reset)], items: &[(String, String, Reset)], today: Option<(i32, u32, u32)>) -> Option<Round> {
+pub fn reset_now(
+    champions: &[(String, Reset)],
+    items: &[(String, String, Reset)],
+    objectives: &[(Objective, i64)],
+    today: Option<(i32, u32, u32)>,
+) -> Option<Round> {
     let st = store();
     st.file.as_ref()?;
-    let mut round = make_reset(&st.rounds, champions, items, today)?;
+    let mut round = make_reset(&st.rounds, champions, items, objectives, today)?;
     round.id = round.id.max(st.done + 1);
     Some(round)
 }
@@ -1458,6 +1543,56 @@ pub fn observe(
     out
 }
 
+/// 塔和龙的基础生命（游戏设置里的）和账本上次读到的比（2.13.0）：账本记下新的数，返回玩家在数据库里改了的那些。
+/// 同一个版本里、又不在补丁日前后变的才算玩家改的（游戏自己的规则补丁在赛季开始那个补丁日改塔血）；`judging` 关着
+/// （平衡没开）的时候只记不算。
+pub fn observe_objectives(now: &[(Objective, i64)], patch: &str, near_patch: bool, judging: bool) -> Vec<Objective> {
+    let mut st = store();
+    if st.file.is_none() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(objective, value) in now {
+        match st.seen_objectives.get(&objective) {
+            Some((was, seen_in)) if *was == value && seen_in == patch => continue,
+            Some((was, seen_in)) if *was != value && seen_in == patch && judging && !near_patch => out.push(objective),
+            _ => {}
+        }
+        st.seen_objectives.insert(objective, (value, patch.to_string()));
+        st.unwritten = true;
+    }
+    if st.unwritten {
+        write(&mut st);
+    }
+    out
+}
+
+/// 服务端那一份交来的一场比赛的记录（2.13.0）：同一场的换掉，新的放最后，只留 [`crate::objectives::WATCHED`] 场
+fn keep_watch(key: &str, watch: Watch) {
+    let mut st = store();
+    if st.file.is_none() || key.is_empty() {
+        return;
+    }
+    match st.watched.iter().rposition(|(k, _)| k == key) {
+        Some(at) => st.watched[at].1 = watch,
+        None => {
+            st.watched.push_back((key.to_string(), watch));
+            while st.watched.len() > crate::objectives::WATCHED {
+                st.watched.pop_front();
+            }
+            // 游戏里看得到已经在记了
+            diag::log_once(
+                "objectives-watch",
+                &format!("[objectives] the server's runs write down each match's length and drake / Baron lives (first: match {key}, {} kept)", st.watched.len()),
+            );
+        }
+    }
+    st.unwritten = true;
+    if st.written_at.is_none_or(|t| t.elapsed() >= WRITE_EVERY) {
+        write(&mut st);
+    }
+}
+
 /// A new round: in the book from now on (new matches play it).
 pub fn publish(round: Round) {
     publish_in(&mut store(), round);
@@ -1473,6 +1608,7 @@ fn publish_in(st: &mut Store, round: Round) {
     st.view = Some(view_of(&round, &power));
     st.powers.insert(round.id, power);
     st.item_powers.insert(round.id, Arc::new(round.item_power.clone()));
+    st.objective_powers.insert(round.id, Arc::new(round.objective_power.clone()));
     st.rounds.push(round);
     write(st);
 }
@@ -1517,6 +1653,8 @@ struct Run {
     last_tick: usize,
     /// None until decided; Some(None) = no balance.
     power: Option<Option<RunPower>>,
+    /// 塔和龙：记录（服务端那一份）和改血（2.13.0）
+    tracker: Option<Tracker>,
 }
 
 /// What a run plays: every champion's power, and the items' (None: no item change).
@@ -1524,6 +1662,9 @@ struct Run {
 struct RunPower {
     champions: Arc<BTreeMap<String, i32>>,
     items: Option<Arc<BTreeMap<String, i32>>>,
+    /// 打的是哪一轮，和塔、小龙、大龙的百分比（None：这一场不改）
+    round: u32,
+    objectives: Option<Arc<BTreeMap<Objective, i32>>>,
 }
 
 static RUNS: LazyLock<Mutex<VecDeque<Run>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -1534,7 +1675,7 @@ fn run_key(sim: &StableSim<'_>) -> RunKey {
 
 /// This run's balance, decided once it has its champions (None: not yet). The server's run takes the newest round
 /// (`on`: the setting) and keeps it; any other run plays what was kept (none when nothing was).
-fn decide_run(sim: &StableSim<'_>, on: bool, items_on: bool) -> Option<Option<RunPower>> {
+fn decide_run(sim: &StableSim<'_>, on: bool, items_on: bool, objectives_on: bool) -> Option<Option<RunPower>> {
     let mut sides: [Vec<String>; 2] = [Vec::new(), Vec::new()];
     let mut missing = 0;
     for i in 0..sim.player_count() {
@@ -1549,13 +1690,13 @@ fn decide_run(sim: &StableSim<'_>, on: bool, items_on: bool) -> Option<Option<Ru
     }
     let key = crate::ai_tactics::key(&sides);
     let first_run = sim.sim_origin().is_some_and(|o| SimOriginKindV1::from_code(o.kind) == Some(SimOriginKindV1::ServerPresim));
-    Some(round_for(key, first_run, on, items_on))
+    Some(round_for(key, first_run, on, items_on, objectives_on))
 }
 
 /// The power a run of the match `key` plays: the server's run (`first_run`) takes the newest round (none with the
 /// setting off) and keeps it under the key; any other run plays what was kept (none when nothing was). The items'
-/// power with it, unless the server's run had `item_balance` off (kept too, 2.9.0).
-fn round_for(key: String, first_run: bool, on: bool, items_on: bool) -> Option<RunPower> {
+/// power with it, unless the server's run had `item_balance` off (kept too, 2.9.0); 塔和龙的也一样（2.13.0）。
+fn round_for(key: String, first_run: bool, on: bool, items_on: bool, objectives_on: bool) -> Option<RunPower> {
     let mut st = store();
     // no save open here (yet): nothing to play, nothing to keep
     st.file.as_ref()?;
@@ -1566,7 +1707,8 @@ fn round_for(key: String, first_run: bool, on: bool, items_on: bool) -> Option<R
             return None;
         }
         let items_changed = if items_on { st.items_off.remove(&key) } else { st.items_off.insert(key.clone()) };
-        if items_changed {
+        let objectives_changed = if objectives_on { st.objectives_off.remove(&key) } else { st.objectives_off.insert(key.clone()) };
+        if items_changed || objectives_changed {
             st.unwritten = true;
         }
         match st.kept.insert(key.clone(), id) {
@@ -1579,6 +1721,7 @@ fn round_for(key: String, first_run: bool, on: bool, items_on: bool) -> Option<R
                         if let Some(old) = st.order.pop_front() {
                             st.kept.remove(&old);
                             st.items_off.remove(&old);
+                            st.objectives_off.remove(&old);
                         }
                     }
                 }
@@ -1588,17 +1731,33 @@ fn round_for(key: String, first_run: bool, on: bool, items_on: bool) -> Option<R
                 }
             }
         }
-        return run_power(&st, id, items_on);
+        return run_power(&st, id, items_on, objectives_on);
     }
     let id = st.kept.get(&key).copied().unwrap_or(0);
     let items_on = !st.items_off.contains(&key);
-    run_power(&st, id, items_on)
+    let objectives_on = !st.objectives_off.contains(&key);
+    run_power(&st, id, items_on, objectives_on)
 }
 
-fn run_power(st: &Store, id: u32, items_on: bool) -> Option<RunPower> {
+fn run_power(st: &Store, id: u32, items_on: bool, objectives_on: bool) -> Option<RunPower> {
     let champions = st.powers.get(&id).cloned()?;
     let items = if items_on { st.item_powers.get(&id).filter(|m| !m.is_empty()).cloned() } else { None };
-    Some(RunPower { champions, items })
+    let objectives = if objectives_on { st.objective_powers.get(&id).filter(|m| !m.is_empty()).cloned() } else { None };
+    Some(RunPower { champions, items, round: id, objectives })
+}
+
+/// 这一份要不要看塔和龙：服务端那一份（十个英雄的正式比赛）记录，别的只在有百分比的时候改血
+fn start_tracker(sim: &StableSim<'_>, power: &RunPower, objectives_on: bool) -> Option<Tracker> {
+    let origin = sim.sim_origin();
+    let server = origin.is_some_and(|o| SimOriginKindV1::from_code(o.kind) == Some(SimOriginKindV1::ServerPresim));
+    if server && sim.player_count() >= 10 {
+        if let Some(o) = origin {
+            let mut tracker = Tracker::recording(Watch { r: power.round, off: !objectives_on, ..Watch::default() });
+            tracker.key = format!("{}.{}", o.match_id, o.set_index);
+            return Some(tracker);
+        }
+    }
+    power.objectives.as_ref().filter(|m| !m.is_empty()).map(|_| Tracker::default())
 }
 
 /// The champions to give the buff now: alive, a power of their own, not carrying it yet - (entity id, power).
@@ -1613,15 +1772,16 @@ pub fn missing(champions: &[(usize, String, bool, bool)], power: &BTreeMap<Strin
 /// Every tick of every match (the mod's match hook): the run's balance (decided once) on each of its champions that
 /// does not carry it yet - at the start, and again after every respawn; every [`ITEM_EVERY`] ticks the items'
 /// corrections on their holders (2.9.0).
-pub fn on_tick(sim: &mut StableSim<'_>, on: bool, items_on: bool) {
+pub fn on_tick(sim: &mut StableSim<'_>, on: bool, items_on: bool, objectives_on: bool) {
     let key = run_key(sim);
     let tick = sim.tick();
-    let power = {
+    let scan = tick.is_multiple_of(crate::objectives::SCAN);
+    let (power, tracker) = {
         let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
         let at = match runs.iter().position(|r| r.key == key) {
             Some(at) => at,
             None => {
-                runs.push_back(Run { key, last_tick: tick, power: None });
+                runs.push_back(Run { key, last_tick: tick, power: None, tracker: None });
                 while runs.len() > RUNS_KEPT {
                     runs.pop_front();
                 }
@@ -1632,15 +1792,22 @@ pub fn on_tick(sim: &mut StableSim<'_>, on: bool, items_on: bool) {
         if tick < run.last_tick {
             // the match started over
             run.power = None;
+            run.tracker = None;
         }
         run.last_tick = tick;
         if run.power.is_none() {
-            run.power = decide_run(sim, on, items_on);
+            run.power = decide_run(sim, on, items_on, objectives_on);
+            if let Some(Some(p)) = &run.power {
+                run.tracker = start_tracker(sim, p, objectives_on);
+            }
         }
-        match &run.power {
+        let power = match &run.power {
             Some(Some(p)) => p.clone(),
             _ => return,
-        }
+        };
+        // 塔和龙每 SCAN tick 看一次：拿出来用，用完放回去
+        let tracker = if scan { run.tracker.take() } else { None };
+        (power, tracker)
     };
     let champions: Vec<(usize, String, bool, bool)> = (0..sim.player_count())
         .filter_map(|i| sim.player_at(i).and_then(|p| p.champion()))
@@ -1652,8 +1819,38 @@ pub fn on_tick(sim: &mut StableSim<'_>, on: bool, items_on: bool) {
     for (id, pw) in missing(&champions, &power.champions) {
         sim.add_buff(id, &buff(pw));
     }
-    if let Some(items) = power.items.filter(|_| tick.is_multiple_of(ITEM_EVERY)) {
-        item_pass(sim, &items);
+    if let Some(items) = power.items.as_ref().filter(|_| tick.is_multiple_of(ITEM_EVERY)) {
+        item_pass(sim, items);
+    }
+    if let Some(tracker) = tracker {
+        objective_pass(sim, key, tick, tracker, &power);
+    }
+}
+
+/// 塔和龙（2.13.0）：看一次场上，改血、记录，服务端那一份把记录交给账本，最后放回这一份里
+fn objective_pass(sim: &mut StableSim<'_>, key: RunKey, tick: usize, mut tracker: Tracker, power: &RunPower) {
+    let none = BTreeMap::new();
+    let powers = power.objectives.as_deref().unwrap_or(&none);
+    for a in tracker.step(&mut crate::objectives::SimField { sim }, powers) {
+        diag::log_once(
+            &format!("objective-{:?}-{}", a.objective, a.how),
+            &format!(
+                "[objectives] {:?} {:+}%: hp {}/{} -> {}/{} ({}; later ones are not logged)",
+                a.objective, a.power, a.before.0, a.before.1, a.after.0, a.after.1, a.how
+            ),
+        );
+    }
+    if tracker.watch.is_some() && (tracker.changed || tracker.over || tick.is_multiple_of(crate::objectives::FLUSH)) {
+        if let Some(watch) = tracker.snapshot() {
+            keep_watch(&tracker.key, watch);
+        }
+        tracker.changed = false;
+    }
+    let mut runs = RUNS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(run) = runs.iter_mut().find(|r| r.key == key) {
+        if run.tracker.is_none() && run.power.is_some() {
+            run.tracker = Some(tracker);
+        }
     }
 }
 
@@ -1723,7 +1920,7 @@ mod tests {
 
     /// The champions' power a run plays (the items' left out), as the tests before 2.9.0 read it.
     fn champs(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<String, i32>>> {
-        round_for(key, first_run, on, true).map(|p| p.champions)
+        round_for(key, first_run, on, true, true).map(|p| p.champions)
     }
 
     const RULES: Rules = Rules {
@@ -1737,6 +1934,7 @@ mod tests {
         item_users: DEFAULT_ITEM_USERS,
         item_band: DEFAULT_ITEM_BAND,
         item_per_point: DEFAULT_ITEM_PER_POINT,
+        objectives: None,
     };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
@@ -2378,17 +2576,17 @@ mod tests {
         publish(Round { id: 1, version: "1.1".into(), power, item_power, ..Round::default() });
         let items_of = |p: Option<RunPower>| p.and_then(|p| p.items).map(|m| m.get("rfc").copied());
         // the server's run with the item balance on: every run of the match plays the items
-        assert_eq!(items_of(round_for("on".into(), true, true, true)), Some(Some(-10)));
-        assert_eq!(items_of(round_for("on".into(), false, true, false)), Some(Some(-10)), "a later run follows the first");
+        assert_eq!(items_of(round_for("on".into(), true, true, true, true)), Some(Some(-10)));
+        assert_eq!(items_of(round_for("on".into(), false, true, false, true)), Some(Some(-10)), "a later run follows the first");
         // with it off: the champions' power, no items - for its replays too, after the book is read again
-        let off = round_for("off".into(), true, true, false).expect("a run power");
+        let off = round_for("off".into(), true, true, false, true).expect("a run power");
         assert_eq!(off.champions.get("maddie"), Some(&-10));
         assert!(off.items.is_none());
-        assert_eq!(items_of(round_for("off".into(), false, true, true)), None);
+        assert_eq!(items_of(round_for("off".into(), false, true, true, true)), None);
         close();
         open_file(file.clone());
-        assert_eq!(items_of(round_for("off".into(), false, true, true)), None);
-        assert_eq!(items_of(round_for("on".into(), false, true, true)), Some(Some(-10)));
+        assert_eq!(items_of(round_for("off".into(), false, true, true, true)), None);
+        assert_eq!(items_of(round_for("on".into(), false, true, true, true)), Some(Some(-10)));
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
     }
@@ -2621,7 +2819,7 @@ mod tests {
             ("zeri".to_string(), Reset::Skip),
             ("nopower".to_string(), Reset::Skip),
         ];
-        let reset = make_reset(&rounds, &champions, &[("ie".into(), "无尽之刃".into(), Reset::Skip)], today).unwrap();
+        let reset = make_reset(&rounds, &champions, &[("ie".into(), "无尽之刃".into(), Reset::Skip)], &[], today).unwrap();
         assert!(reset.reset && !reset.merged);
         assert_eq!((reset.id, reset.label.as_str(), reset.version.as_str(), reset.date), (5, "2028.2.0b", "2028.2.0", today));
         assert!(reset.power.is_empty() && reset.item_power.is_empty(), "{:?} {:?}", reset.power, reset.item_power);
@@ -2642,8 +2840,8 @@ mod tests {
         let (_, body) = item_news(&reset, true, &|_| Vec::new(), &|_| String::new()).unwrap();
         assert!(body.contains("【恢复】无尽之刃：设置里列为不调整（item_balance_skip），取消电竞大脑之前的 -10%"), "{body}");
         // nothing to take off or say: no round; no round yet: no power at all
-        assert!(make_reset(&rounds, &[("nopower".into(), Reset::Skip)], &[], today).is_none());
-        assert!(make_reset(&[], &[("jinx".into(), Reset::Edit)], &[], today).is_none());
+        assert!(make_reset(&rounds, &[("nopower".into(), Reset::Skip)], &[], &[], today).is_none());
+        assert!(make_reset(&[], &[("jinx".into(), Reset::Edit)], &[], &[], today).is_none());
         // a round of resets is not the balance's: the late hotfix's timer and the rules' check look past it
         let mut book = rounds.clone();
         book.push(reset.clone());
@@ -2718,5 +2916,93 @@ mod tests {
         assert_eq!(observe(&now, &defs2, true), vec![("fighter".to_string(), Verdict::Player)]);
         close();
         let _ = std::fs::remove_file(&file);
+    }
+
+    // ===================== 2.13.0：防御塔和大小龙 =====================
+
+    fn watch(r: u32) -> Watch {
+        // 12.5 分钟；小龙活 10 秒，大龙活 1000 tick
+        Watch { r, e: 45000, d: vec![(7200, 7800)], b: vec![(36000, 37000)], off: false }
+    }
+
+    #[test]
+    fn a_round_judges_the_towers_and_monsters_on_the_matches_watched() {
+        reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_objectives_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        open_file(file.clone());
+        publish(Round { id: 1, version: "1.1".into(), rules: RULES_VERSION, ..Round::default() });
+        for k in 0..40 {
+            keep_watch(&format!("{k}.0"), watch(1));
+        }
+        // 同一场再交一次是换掉
+        keep_watch("39.0", watch(1));
+        let targets = crate::objectives::Targets { base: [3713, 5000, 10000], ..crate::objectives::DEFAULT_TARGETS };
+        let rules = Rules { objectives: Some(targets), ..RULES };
+        let round = make(&meta(), rules, &Due::Patch("1.2".into()), None, &Skip::default());
+        let got: Vec<(Objective, i32, i64)> = round.objectives.iter().map(|c| (c.objective, c.step, c.base)).collect();
+        assert_eq!(got, [(Objective::Tower, 15, 3713), (Objective::Drake, 15, 5000), (Objective::Baron, 15, 10000)]);
+        assert_eq!(round.objective_power.get(&Objective::Tower), Some(&15));
+        assert!(round.objective_summary.contains("tower: 12.5 min on 40") && round.objective_summary.contains("40 matches watched"), "{}", round.objective_summary);
+        // 关着 objective_balance：上一轮的照抄，不判断
+        let off = make(&meta(), RULES, &Due::Patch("1.2".into()), None, &Skip::default());
+        assert!(off.objectives.is_empty() && off.objective_power.is_empty());
+        publish(round);
+        // 账本写下了记录和百分比，再读回来一样
+        close();
+        open_file(file.clone());
+        assert_eq!(latest().unwrap().objective_power.get(&Objective::Drake), Some(&15));
+        assert_eq!(store().watched.len(), 40);
+        // 比赛按最新一轮改血；服务端那一份关着 objective_balance，它的重播也不改
+        let p = round_for("m".into(), true, true, true, true).unwrap();
+        assert_eq!((p.round, p.objectives.unwrap().get(&Objective::Baron).copied()), (2, Some(15)));
+        assert!(round_for("n".into(), true, true, true, false).unwrap().objectives.is_none());
+        assert!(round_for("n".into(), false, true, true, true).unwrap().objectives.is_none(), "its replays follow the server run");
+        // 下一轮：改过以后的比赛还不够 30 场，不动
+        let next = make(&meta(), rules, &Due::Patch("1.3".into()), None, &Skip::default());
+        assert!(next.objectives.is_empty(), "{:?}", next.objectives);
+        assert_eq!(next.objective_power.get(&Objective::Tower), Some(&15), "carried");
+        close();
+        let _ = std::fs::remove_file(&file);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn health_the_player_changes_takes_the_percentage_off_at_once() {
+        let today = Some((2028, 3, 20));
+        let mut rounds = vec![powered(&[("jinx", -20)], &[])];
+        rounds[0].objective_power = [(Objective::Tower, 30), (Objective::Drake, 15)].into_iter().collect();
+        let reset = make_reset(&rounds, &[], &[], &[(Objective::Tower, 5000), (Objective::Baron, 12000)], today).unwrap();
+        assert!(reset.reset);
+        let got: Vec<(Objective, i32, i32, i64)> = reset.objectives.iter().map(|c| (c.objective, c.step, c.total, c.base)).collect();
+        // 大龙没有百分比：也写上，之后从这一轮重新数比赛
+        assert_eq!(got, [(Objective::Tower, -30, 0, 5000), (Objective::Baron, 0, 0, 12000)]);
+        assert_eq!(reset.objective_power, [(Objective::Drake, 15)].into_iter().collect());
+        assert_eq!(reset.power.get("jinx"), Some(&-20), "the champions keep theirs");
+    }
+
+    #[test]
+    fn a_health_change_in_the_same_patch_away_from_patch_days_is_the_players() {
+        reset_for_tests();
+        let file = std::env::temp_dir().join(format!("pma_objectives_seen_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        open_file(file.clone());
+        let tower = |hp: i64| [(Objective::Tower, hp)];
+        // 第一次读：只记下
+        assert!(observe_objectives(&tower(3713), "2028.5.1", false, true).is_empty());
+        assert!(observe_objectives(&tower(3713), "2028.5.1", false, true).is_empty());
+        // 同一个版本里改了：玩家改的
+        assert_eq!(observe_objectives(&tower(5000), "2028.5.1", false, true), [Objective::Tower]);
+        // 补丁日前后变的、换了版本才变的：游戏自己的规则补丁
+        assert!(observe_objectives(&tower(4500), "2028.5.1", true, true).is_empty());
+        assert!(observe_objectives(&tower(4000), "2029.0.0", false, true).is_empty());
+        // 平衡关着：只记不算
+        assert!(observe_objectives(&tower(3000), "2029.0.0", false, false).is_empty());
+        close();
+        open_file(file.clone());
+        assert_eq!(store().seen_objectives.get(&Objective::Tower), Some(&(3000, "2029.0.0".to_string())));
+        close();
+        let _ = std::fs::remove_file(&file);
+        reset_for_tests();
     }
 }

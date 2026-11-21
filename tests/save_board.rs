@@ -352,6 +352,7 @@ fn next_round_on_a_save() {
         item_users: patch_meta_ai::balance::DEFAULT_ITEM_USERS,
         item_band: patch_meta_ai::balance::DEFAULT_ITEM_BAND,
         item_per_point: patch_meta_ai::balance::DEFAULT_ITEM_PER_POINT,
+        objectives: None,
     };
     eprintln!("{} games, newest patch {current}, {} rounds in the book (newest {last}); the next round as {next}", games.len(), rounds.len());
     let due = Due::Patch(next.clone());
