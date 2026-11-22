@@ -68,7 +68,7 @@ fn board_on_a_save() {
     let pool = advisor::lookahead_pool(&meta, &offer, 28);
     let board = advisor::ban_board(&meta, Team::new(&[], &[]), Team::new(&[], &[]), Mastery::FULL, &none, &offer, Some(true));
     for b in board.iter().take(5) {
-        let w = advisor::simulate(&meta, Team::new(&[], &[]), Team::new(&[], &[]), &pool, 0, b.champ, &none);
+        let w = advisor::simulate(&meta, Team::new(&[], &[]), Team::new(&[], &[]), &pool, 0, b.champ, false, &none);
         eprintln!("  ban {:<14} -> blue {:.1}%", name(b.champ), w * 100.0);
     }
     eprintln!("lookahead, 5 candidates from the first ban: {:?}", started.elapsed());
@@ -395,5 +395,144 @@ fn next_round_on_a_save() {
         for (win, name, n) in &rows {
             eprintln!("  GROUP {win:5.1}% {name} ({n})");
         }
+    }
+}
+
+/// 拿真实存档复现一手 3+2 第二轮禁用：
+///
+/// `PMA_HISTORY=<history 文件> PMA_ALLY=a,b,c PMA_ENEMY=x,y,z PMA_BANS=... PMA_BLUE=1 cargo test --release --test save_board -- --ignored --nocapture draft_turn`
+///
+/// 打印双方猜出来的位置、禁用板前 12 个（拿走对方多少、拿走我们多少）、推演完的胜率和最后的顺序。
+#[test]
+#[ignore]
+fn draft_turn_on_a_save() {
+    let Ok(path) = std::env::var("PMA_HISTORY") else {
+        eprintln!("PMA_HISTORY not set");
+        return;
+    };
+    let list = |k: &str| -> Vec<String> { std::env::var(k).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() };
+    let text = std::fs::read_to_string(&path).expect("history file");
+    let mut names = Names::default();
+    let games: Vec<_> = patch_meta_ai::cache::decode(&text, &mut names).into_iter().map(|(_, g)| g).collect();
+    let mut champions: Vec<String> = knowledge::get().positions.keys().cloned().collect();
+    for g in &games {
+        for side in &g.sides {
+            for s in side {
+                let n = names.name(s.champ).to_string();
+                if !champions.contains(&n) {
+                    champions.push(n);
+                }
+            }
+        }
+    }
+    champions.sort();
+    let current = games.iter().map(|g| g.version.clone()).max().unwrap_or_default();
+    let settings = Settings { lol_prior: 0.5, stat_prior: false, recency: None, ..Settings::default() };
+    let meta = build(
+        &Inputs { games: &games, names: &names, champions: &champions, notes: &[], current: &current, warm: None, stats: None, balance: &[] },
+        &settings,
+    );
+    let id = |n: &str| meta.names.get(n).unwrap_or_else(|| panic!("{n}"));
+    let ally: Vec<u16> = list("PMA_ALLY").iter().map(|n| id(n)).collect();
+    let enemy: Vec<u16> = list("PMA_ENEMY").iter().map(|n| id(n)).collect();
+    let bans: Vec<u16> = list("PMA_BANS").iter().map(|n| id(n)).collect();
+    // Fearless 用掉的：拿不了，但不算禁用
+    let gone: Vec<u16> = list("PMA_GONE").iter().map(|n| id(n)).collect();
+    let blue = std::env::var("PMA_BLUE").map_or(true, |v| v == "1");
+    let name = |c: u16| meta.names.name(c).to_string();
+    let none = |_: u16| None;
+    eprintln!("{} games, patch {current}", games.len());
+    let show_lanes = |who: &str, picks: &[u16]| {
+        let l = advisor::lanes(&meta, picks);
+        let probs = advisor::lane_probabilities(&meta, picks);
+        for ((c, r), p) in picks.iter().zip(&l.roles).zip(&probs) {
+            let shares = advisor::lane_shares(&meta, *c);
+            eprintln!("  {who} {:<18} -> {:?}  probs {:?}  shares {:?}", name(*c), r, p.map(|x| (x * 100.0).round() / 100.0), shares.map(|s| s.map(|x| (x * 100.0).round() / 100.0)));
+        }
+        eprintln!("  {who} open lanes: {:?} (confidence {:.2})", advisor::open_lanes(&meta, picks), l.confidence);
+    };
+    show_lanes("ally ", &ally);
+    show_lanes("enemy", &enemy);
+    let taken: Vec<u16> = ally.iter().chain(&enemy).chain(&bans).chain(&gone).copied().collect();
+    let offer: Vec<u16> = (0..meta.names.len() as u16).filter(|c| !taken.contains(c) && meta.by_id(*c).is_some()).collect();
+    // 两队的习惯（最近 20 场每个英雄上场的比例）和最近一场的上场选手，像游戏里那样
+    let team_of = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    let mut by_team: std::collections::HashMap<u32, Vec<&patch_meta_ai::history::Game>> = std::collections::HashMap::new();
+    for g in &games {
+        for t in g.teams.iter().flatten() {
+            by_team.entry(*t).or_default().push(g);
+        }
+    }
+    let habits_of = |team: Option<u32>| -> std::collections::HashMap<u16, f32> {
+        let Some(team) = team else { return Default::default() };
+        let mut list = by_team.get(&team).cloned().unwrap_or_default();
+        list.sort_by_key(|g| std::cmp::Reverse(g.record));
+        let recent = list.len().clamp(1, 20) as f32;
+        let mut out: std::collections::HashMap<u16, f32> = Default::default();
+        for g in list.iter().take(20) {
+            let side = if g.teams[0] == Some(team) { 0 } else { 1 };
+            for s in &g.sides[side] {
+                *out.entry(meta.names.get(names.name(s.champ)).unwrap_or(u16::MAX)).or_default() += 1.0 / recent;
+            }
+        }
+        out
+    };
+    let roster_of = |team: Option<u32>| -> Vec<(u32, Option<patch_meta_ai::history::Role>)> {
+        let Some(team) = team else { return Vec::new() };
+        let Some(g) = by_team.get(&team).and_then(|l| l.iter().max_by_key(|g| g.record)) else { return Vec::new() };
+        let side = if g.teams[0] == Some(team) { 0 } else { 1 };
+        let mut r: Vec<(u32, Option<patch_meta_ai::history::Role>)> = g.sides[side].iter().filter_map(|s| Some((s.athlete?, s.role))).collect();
+        r.sort_by_key(|(_, role)| role.map_or(9, |x| x.index()));
+        r
+    };
+    let (us_team, them_team) = (team_of("PMA_US_TEAM"), team_of("PMA_THEM_TEAM"));
+    let (us_habits, them_habits) = (habits_of(us_team), habits_of(them_team));
+    let (us_roster, them_roster) = (roster_of(us_team), roster_of(them_team));
+    eprintln!("habits: us {} champions, them {}; rosters {:?} / {:?}", us_habits.len(), them_habits.len(), us_roster, them_roster);
+    let us = Team { habits: (!us_habits.is_empty()).then_some(&us_habits), ..Team::new(&ally, &us_roster) };
+    let them = Team { habits: (!them_habits.is_empty()).then_some(&them_habits), ..Team::new(&enemy, &them_roster) };
+    let board = advisor::ban_board(&meta, us, them, Mastery::FULL, &none, &offer, Some(blue));
+    eprintln!("\nban board ({} on offer):", offer.len());
+    for b in board.iter().take(12) {
+        eprintln!("  {:<18} total {:+.3}  deny {:.3}  own {:.3}  threat lane {:?}  lanes {}", name(b.champ), b.total, b.deny, b.own, b.threat.role, b.lanes);
+    }
+    let turn = advisor::TurnInput {
+        us,
+        them,
+        offer: &offer,
+        pickable: &offer,
+        banning: true,
+        blue: Some(blue),
+        bans_made: bans.len(),
+        lookahead: true,
+        conserve: 0.0,
+        also: &[],
+    };
+    // 改之前的推演：禁用板前 5 个，各推演一次
+    let (bp, rp) = if blue { (ally.len(), enemy.len()) } else { (enemy.len(), ally.len()) };
+    if let Some(at) = advisor::order_position(bans.len(), bp, rp) {
+        let mut pool = advisor::lookahead_pool(&meta, &offer, advisor::LOOKAHEAD_POOL);
+        let top: Vec<u16> = board.iter().take(advisor::LOOKAHEAD).map(|b| b.champ).collect();
+        for c in &top {
+            if !pool.contains(c) {
+                pool.push(*c);
+            }
+        }
+        let (bt, rt) = if blue { (us, them) } else { (them, us) };
+        let mut old: Vec<(u16, f32)> = top
+            .iter()
+            .map(|c| {
+                let w = advisor::simulate(&meta, bt, rt, &pool, at, *c, false, &none);
+                (*c, if blue { w } else { 1.0 - w })
+            })
+            .collect();
+        old.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let text: Vec<String> = old.iter().map(|(c, w)| format!("{} {:.1}%", name(*c), w * 100.0)).collect();
+        eprintln!("the old lookahead (board top 5, one play-out each): {}", text.join(", "));
+    }
+    let plan = advisor::plan_turn(&meta, &turn, &none);
+    eprintln!("\nafter the lookahead:");
+    for b in plan.board.iter().take(6) {
+        eprintln!("  {:<18} outlook {:?}  board total {:+.3}", name(b.champ), plan.outlook.get(&b.champ).map(|w| (w * 1000.0).round() / 10.0), b.total);
     }
 }

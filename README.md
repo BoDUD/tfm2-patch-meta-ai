@@ -54,6 +54,22 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.13.2：AI 战术更积极（`ai_tactics_margin`）
+
+用户觉得现在 AI 队伍不够强。查下来 AI 智能BP 每手都在接管（当天 5 场 `ai_bp 10 decided, 10 made`），玩家这边 BP 结束时的胜率 64 / 49 / 50 / 40 / 42%，和教练托管打平；玩家最近 100 场赢 72 场，主要是阵容实力。用户在几个办法里选了「AI 战术更积极」。
+
+- 以前（2.7.8 起）AI 队伍只有在模型的战术比原来的好 0.1（对数几率）以上才换。按当时的保留比赛检验，领先多少都有约 52% 胜率，领先 0.1 约 55%。现在是设置 `ai_tactics_margin`，默认 0：只要模型认为更好就换（一样好的不换）。想回到以前填 0.1。
+- 「收官」照旧由各队教练自己选（2.7.14，用户定的，免得比赛被打短）；玩家自己的战术照旧不动。
+- 只影响新比赛：已经定过战术的比赛（`ai_tactics.json`）每次重播照旧。
+
+## 2.13.1：3+2 第二轮禁用不再禁对方已经不需要的位置
+
+用户：「这个自动bp代托管的逻辑还是有点问题的 比如前三手对方选了adc了 自动bp在3+2bp模式下最后两手还会ban adc 这对吗」。日志里有两场：对方前三手里已经有卡莉丝塔 / 卡莎，教练托管第二轮还禁了德莱文、图奇 / 卡莉丝塔，我们自己那时还没选 ADC。
+
+- **原因**：禁用板本身是对的，按对方还缺的位置算一个禁用拿走他们多少（拿真实存档复现，对方缺中路和辅助时 ADC 都不在前 12）。问题在 3+2 的推演：轮到我们禁人时，把禁用板前 5 个各推演到 BP 结束，再按推演出的胜率重新排。第二轮对方只缺两个位置，前 5 个里常常只有一两个真能拿走对方东西，其余拿走的不到 0.01（对数几率），推演出来的胜率却能差 8 个点：后面每一手跟着变（对方和我们自己都会换人）的波动盖过了禁用本身。复现的两手里，推演把只拿走对方 0.005 的 tft_idas、0.003 的阿利斯塔排到了第一，真正的威胁辛吉德（0.159，对方中路辅助都能用）排到最后。
+- **现在**：推演只拿拿走对方至少 0.02（约半个胜率点）的禁用来比，不到两个就照禁用板的顺序；推演里一个禁用的胜率取「真禁掉」和「只对对方禁掉、我们还能选」两次里差的那个。禁用不会让自己的阵容变好，推演里自己后面换了人才显得好的那部分不算。选人的推演不变；AI 智能BP（`ai_bp`）的禁用和面板的建议走的是同一套，也一样。
+- **复现工具**：`tests/save_board.rs` 的 `draft_turn_on_a_save`，用真实存档的 history 文件加一手的双方选人和禁用，打印双方猜出的位置、禁用板、改之前和现在的推演。
+
 ## 2.13.0：防御塔和大小龙的血量也进平衡补丁（`objective_balance`）
 
 用户：「现在防御塔 大小龙血量补丁不会自动调整 我们能加吗」，选了塔看对局时长、大小龙看刷新以后活多久，对局时长目标 19–24 分钟。
@@ -265,7 +281,8 @@
 | `[features]` | `ban_pick` / `tier_list` | off / auto | AI 选人（2.7.10 起默认关）、自动梯队：`auto` = 开，除非已启用做同样事情的 Mod；`on` / `off` |
 | | `ai_bp` | off | AI BP：所有 AI 队伍完全按本 Mod 的建议禁和选（含 3+2 推演、对手习惯），盖过其他 BP Mod |
 | | `ai_variety` | 1 | AI BP 的多样性：每局对英雄的判断浮动，每一手最多让出这么多胜率点（0～5，0 = 永远选最佳） |
-| | `ai_tactics` | off | 由模型 BP 的 AI 队伍开场时按模型选战术（明显更好才换；你自己的战术不动；「收官」留给各队教练） |
+| | `ai_tactics` | off | 由模型 BP 的 AI 队伍开场时按模型选战术（比原来的好 `ai_tactics_margin` 以上才换；你自己的战术不动；「收官」留给各队教练） |
+| | `ai_tactics_margin` | 0 | 模型的战术要比 AI 队伍原来的好多少（对数几率）才换：0 = 只要更好就换（2.13.2 起），0.1 = 明显更好才换（以前），0～1 |
 | | `coach` | on | 教练托管时你自己的队伍完全照面板的建议禁和选（即使 `ban_pick=off`，别的 Mod 接管时也以它为准） |
 | `[model]` | `patches` | 12 | 模型回看的版本数（含当前，1～12） |
 | | `drift` / `change` | 0.08 / 0.3 | 英雄强度每个版本的变化幅度：未改动 / 被补丁改动（对数几率） |
@@ -336,6 +353,10 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.13.2: AI teams take the strategy the model rates best whenever it is better than their own (`ai_tactics_margin`, default 0; it was a fixed 0.1 log-odds since 2.7.8 - on held-out matches the advised side won about 52% at any lead, 55% at 0.1). Game finish stays the coaches', the player's own tactics stay; matches already decided replay as before.
+
+2.13.1 (the user: "the enemy already took an ADC in their first three picks, and the coach still bans ADCs with the last two bans in a 3+2 draft - is that right?"): the ban board was right (it values a ban by what it takes from the enemy's open lanes); the 3+2 lookahead was not. It played the board's top five out to the end of the draft and re-ranked them by the win chance they ended in, and in the second ban phase most of those five take next to nothing from the enemy (under 0.01 log-odds) while the played-out win chances spread over 8 points from the later picks cascading. Now only bans that take at least `LOOKAHEAD_MIN_DENY` (0.02) from the enemy are played out (fewer than two: the board's order), and a ban's played-out win chance is the worse of banning it and keeping it for us only - a ban cannot improve our own picks. `draft_turn_on_a_save` in `tests/save_board.rs` replays one turn of a real save.
 
 2.13.0 (the user: "the towers' and the drakes' / Baron's health never get patched - can we add that?"): each balance round also sets a health percentage for the towers, the drakes and Baron (`objective_balance`, on with `balance`), a buff in every match (`patch_meta_ai_objective`, max health only; the save and the database keep their numbers). Towers follow the matches' mean length (target `objective_length`, 19-24 min), drakes and Baron how long one lives after it spawns (time alive over deaths; targets `objective_drake` 60-120 s, `objective_baron` 120-240 s). Half the gap to the band's nearer edge a round, at most `objective_step` (15%), in all between -50% and `objective_max` (100%), judged on the matches since its last change (30 matches / 30 spawns). The server's run of each match records its length and every drake's and Baron's spawn and death tick (`watched` in the save's book). Health the player changes in the database takes the percentage off at once. The changes come as news of their own and under the patch in the patch history.
 
