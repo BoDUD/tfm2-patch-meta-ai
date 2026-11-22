@@ -61,6 +61,9 @@ pub struct Config {
     /// Teams drafted by the model (AI teams with `ai_bp`, the player's after an auto BP) also
     /// play the strategy the model rates best for their five champions.
     pub ai_tactics: bool,
+    /// 换成模型的战术要比队伍原来的好多少（对数几率，2.13.2；用户：「AI 战术更积极」）：0 = 只要更好就换（默认），
+    /// 0.1 = 2.7.8 - 2.13.1 的「明显更好才换」
+    pub ai_tactics_margin: f32,
     /// This mod makes the balance patches (`balance`, 2.8.0): a round per game patch (written into the game's own
     /// patch notes), the game's own champion patches off while it is on.
     pub balance: bool,
@@ -178,6 +181,7 @@ impl Default for Config {
             ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
+            ai_tactics_margin: 0.0,
             balance: false,
             balance_count: 30,
             balance_max: 20,
@@ -341,6 +345,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "ai_bp" | "ai_draft" => cfg.ai_bp = flag(value)?,
         "ai_variety" => cfg.ai_variety = number(value)?,
         "ai_tactics" => cfg.ai_tactics = flag(value)?,
+        "ai_tactics_margin" => cfg.ai_tactics_margin = number(value)?.clamp(0.0, 1.0),
         "balance" => cfg.balance = flag(value)?,
         // up to 60 and 50 since 2.9.0 (the user: 「英雄上限调多点吧 最多60个 还有max也调高点」); balance_max up to the
         // champions' CAP, 80 since 2.10.0
@@ -608,7 +613,7 @@ fn reload(path: &PathBuf) {
 
 pub fn summary(c: &Config) -> String {
     format!(
-        "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
+        "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} ai_tactics_margin={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
          ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
@@ -619,6 +624,7 @@ pub fn summary(c: &Config) -> String {
         if c.ai_bp { "on" } else { "off" },
         c.ai_variety,
         if c.ai_tactics { "on" } else { "off" },
+        c.ai_tactics_margin,
         c.tier_list.as_str(),
         c.patches,
         c.drift,
@@ -727,12 +733,19 @@ ai_bp=off
 ;              0 = 永远选最佳，1 = 默认，最大 5。
 ai_variety=1
 ; ai_tactics : AI teams the model drafts (ai_bp on) also play the strategy the model rates best
-;              for their five champions (the tactics screen's ★) where it is clearly better than
-;              their own, set when the match starts. Your own team keeps your strategy. Game
-;              finish stays each team's coach's choice.
+;              for their five champions (the tactics screen's ★) where it is better than their own
+;              by ai_tactics_margin, set when the match starts. Your own team keeps your strategy.
+;              Game finish stays each team's coach's choice.
 ; ai_tactics : 由模型 BP 的 AI 队伍（ai_bp 开着时）在比赛开始时也按模型给这五个英雄选战术（战术界面上
-;              ★ 的那些；明显比原来的好才换）。你自己的战术不动，自动 BP 也一样。「收官」由各队教练自己选。
+;              ★ 的那些；比原来的好 ai_tactics_margin 以上才换）。你自己的战术不动，自动 BP 也一样。
+;              「收官」由各队教练自己选。
 ai_tactics=off
+; ai_tactics_margin : how much better (log-odds) the model's option must be before an AI team
+;              switches to it: 0 = whenever it is better (2.13.2 default), 0.1 = only when clearly
+;              better (2.7.8 - 2.13.1), up to 1.
+; ai_tactics_margin : 模型的战术要比 AI 队伍原来的好多少（对数几率）才换：0 = 只要更好就换（2.13.2 起默认），
+;              0.1 = 明显更好才换（2.7.8～2.13.1），最大 1。
+ai_tactics_margin=0
 ; balance : this mod makes the balance patches instead of the game. On every patch the game
 ;           makes (and once right away, as a hotfix: 2027.4.1b) the champions the model rates
 ;           furthest outside a 48-52% win rate (with enough games, at most balance_count, up to
@@ -1123,6 +1136,17 @@ objective_balance=off
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert_eq!(cfg.objective_length, (19.0, 24.0), "a bad value keeps the default");
         assert!(summary(&d).contains("objective_balance=on objective_length=19-24 objective_drake=60-120"), "{}", summary(&d));
+    }
+
+    #[test]
+    fn the_ai_tactics_margin_is_read_and_clamped() {
+        assert_eq!(Config::default().ai_tactics_margin, 0.0);
+        let (cfg, warnings) = parse("ai_tactics_margin=0.1\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.ai_tactics_margin, 0.1);
+        assert_eq!(parse("ai_tactics_margin=5\n").0.ai_tactics_margin, 1.0);
+        assert_eq!(parse("ai_tactics_margin=-1\n").0.ai_tactics_margin, 0.0);
+        assert!(summary(&cfg).contains("ai_tactics=off ai_tactics_margin=0.1 "), "{}", summary(&cfg));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! `ai_tactics`: AI teams the model drafted (`ai_bp` on) also play the strategy the model
 //! rates best for their five champions (`plan::tactics_for`, the tactics screen's ★), set when
 //! the match starts (`StableMatchHook::on_match_start`, `strategy_set_json`). A setting keeps the
-//! team's own option unless the advised one is worth [`SWITCH_MARGIN`] more by the model; the
-//! player's team always keeps the player's own strategy, auto BP or not.
+//! team's own option unless the advised one is worth `ai_tactics_margin` more by the model (2.13.2: 0 by default -
+//! any better option is taken; 0.1 fixed before, [`OLD_MARGIN`]); the player's team always keeps the player's own
+//! strategy, auto BP or not.
 //!
 //! A match is simulated more than once: the server plays it out first (`ServerPresim`, the
 //! result), the client plays it again to show it, and replays play it again later. Every run
@@ -38,10 +39,11 @@ const KEPT: usize = 4000;
 /// Matches written to `diag.log` per game session besides the player's own.
 const LOGGED: usize = 4;
 
-/// What the advised option must be worth over the team's own (log-odds) before it is set: on a
-/// save's matches the model was not fitted on, the side playing the advice won about 52% where
-/// it was ahead by any margin, about 55% where it was ahead by this much.
-const SWITCH_MARGIN: f32 = 0.1;
+/// What the advised option had to be worth over the team's own (log-odds) before it was set, 2.7.8 - 2.13.1: on a
+/// save's matches the model was not fitted on, the side playing the advice won about 52% where it was ahead by any
+/// margin, about 55% where it was ahead by this much. 2.13.2（用户觉得 AI 不够强，选了「AI 战术更积极」）起是设置
+/// `ai_tactics_margin`，默认 0：只要模型认为更好就换，领先一点也有约 52%。
+pub const OLD_MARGIN: f32 = 0.1;
 
 /// Settings `ai_tactics` never sets: the team's own coach chooses them. `game_finish`: with the
 /// model's Aggressive on 97% of the AI sides the matches ended about three minutes sooner - on a
@@ -196,12 +198,15 @@ fn option_of(current: Option<&Value>) -> Option<&str> {
     }
 }
 
-/// Whether the advice is worth more than the team's own option by [`SWITCH_MARGIN`] (an own
-/// option the model does not rate: yes).
-fn worth_switching(advice: &plan::TacticAdvice, current: Option<&str>) -> bool {
+/// Whether the advice is worth more than the team's own option by `margin` (`ai_tactics_margin`; 0: any better
+/// option; an own option the model does not rate: yes). Equal options never switch.
+fn worth_switching(advice: &plan::TacticAdvice, current: Option<&str>, margin: f32) -> bool {
     let Some(best) = advice.options.first() else { return false };
     match current.and_then(|c| advice.options.iter().find(|o| o.0 == c)) {
-        Some(own) => best.1 - own.1 >= SWITCH_MARGIN,
+        Some(own) => {
+            let gain = best.1 - own.1;
+            gain > 0.0 && gain >= margin
+        }
         None => true,
     }
 }
@@ -376,7 +381,7 @@ fn apply(sim: &mut StableSim<'_>) -> bool {
                 for advice in acted_on(advised(&snapshot, &sides[side])) {
                     let (setting, option) = (advice.setting.as_str(), advice.option.as_str());
                     let current = sim.strategy_get_json(side, setting).and_then(|j| serde_json::from_str::<Value>(&j).ok());
-                    if !worth_switching(&advice, option_of(current.as_ref())) {
+                    if !worth_switching(&advice, option_of(current.as_ref()), cfg.ai_tactics_margin) {
                         continue;
                     }
                     if let Some(json) = value_for(current.as_ref(), option) {
@@ -489,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn the_advice_must_be_clearly_better() {
+    fn the_advice_must_be_better_by_the_margin() {
         let advice = |options: &[(&str, f32)]| plan::TacticAdvice {
             setting: "game_finish".into(),
             option: options[0].0.into(),
@@ -497,10 +502,16 @@ mod tests {
             options: options.iter().map(|(o, v)| (o.to_string(), *v)).collect(),
         };
         let close = advice(&[("Aggressive", 0.05), ("Flexible", 0.0), ("Stable", -0.2)]);
-        assert!(!worth_switching(&close, Some("Flexible")), "within the margin: the team's own stays");
-        assert!(worth_switching(&close, Some("Stable")));
-        assert!(worth_switching(&close, None), "no option read");
-        assert!(worth_switching(&close, Some("Unknown")), "an option the model does not rate");
+        // 2.7.8 - 2.13.1 的门槛：差 0.05 不换
+        assert!(!worth_switching(&close, Some("Flexible"), OLD_MARGIN), "within the margin: the team's own stays");
+        assert!(worth_switching(&close, Some("Stable"), OLD_MARGIN));
+        assert!(worth_switching(&close, None, OLD_MARGIN), "no option read");
+        assert!(worth_switching(&close, Some("Unknown"), OLD_MARGIN), "an option the model does not rate");
+        // 2.13.2 默认 0：更好就换，一样的不换
+        assert!(worth_switching(&close, Some("Flexible"), 0.0));
+        assert!(!worth_switching(&close, Some("Aggressive"), 0.0), "already the best");
+        let tie = advice(&[("Gather", 0.0), ("Battle", 0.0)]);
+        assert!(!worth_switching(&tie, Some("Battle"), 0.0), "equal options stay");
         let split: Value = serde_json::from_str(r#"{"Split131": {"position1": "Top"}}"#).unwrap();
         assert_eq!(option_of(Some(&split)), Some("Split131"));
         assert_eq!(option_of(Some(&Value::String("Gather".into()))), Some("Gather"));
