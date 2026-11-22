@@ -755,6 +755,9 @@ pub fn lookahead_pool(meta: &Meta, offer: &[u16], n: usize) -> Vec<u16> {
 /// Plays out the rest of a 3+2 draft from step `at` of [`ORDER_3_2`], where `first` is the
 /// acting side's choice; afterwards each side bans the top of its ban board and picks its best
 /// pick from `pool` - a side Hell Draft AI drafts for its way ([`Team::lean`]). Returns the blue side's win chance with the line-ups it ends in.
+/// `reserve`（2.13.1）：`first` 是这一方的禁用时，只对另一方禁掉，这一方后面照样能选它。拿来和真禁掉比：
+/// 禁用不能让自己的阵容变好，推演里自己后面换了人才显得好的那部分不算。
+#[allow(clippy::too_many_arguments)]
 pub fn simulate(
     meta: &Meta,
     blue: Team<'_>,
@@ -762,11 +765,15 @@ pub fn simulate(
     pool: &[u16],
     at: usize,
     first: u16,
+    reserve: bool,
     damage: &dyn Fn(u16) -> Option<Damage>,
 ) -> f32 {
     let (mut bp, mut rp) = (blue.picks.to_vec(), red.picks.to_vec());
     let mut offer: Vec<u16> = pool.iter().copied().filter(|c| *c != first).collect();
     let none = Mastery { weight: 0.0, cap: 0.0 };
+    // 留给这一方自己的那个（只有 reserve 而且第一步是禁用时）
+    let actor = ORDER_3_2.get(at).map(|s| s.blue);
+    let mut kept = ORDER_3_2.get(at).filter(|s| reserve && s.ban).map(|_| first);
     for (i, s) in ORDER_3_2.iter().enumerate().skip(at) {
         let (own, other) = if s.blue { (&mut bp, &rp) } else { (&mut rp, &bp) };
         let (own_team, other_team) = if s.blue { (blue, red) } else { (red, blue) };
@@ -780,9 +787,12 @@ pub fn simulate(
             ban_board(meta, us, them, none, damage, &offer, Some(s.blue)).first().map(|b| b.champ)
         } else if own.len() < 5 {
             let open = open_lanes(meta, own);
+            let mine = kept.filter(|_| actor == Some(s.blue));
             offer
                 .iter()
-                .map(|c| (*c, pick_value_weighted(meta, *c, own, other, own_team.players, none, damage, &open).total + own_team.habit(*c)))
+                .copied()
+                .chain(mine)
+                .map(|c| (c, pick_value_weighted(meta, c, own, other, own_team.players, none, damage, &open).total + own_team.habit(c)))
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(c, _)| c)
         } else {
@@ -790,6 +800,9 @@ pub fn simulate(
         };
         let Some(c) = choice else { continue };
         offer.retain(|x| *x != c);
+        if kept == Some(c) && i != at {
+            kept = None;
+        }
         if !s.ban && own.len() < 5 {
             own.push(c);
         }
@@ -805,6 +818,10 @@ pub const CONTEST: f32 = 0.5;
 /// Candidates the lookahead plays out, and the champions it plays with.
 pub const LOOKAHEAD: usize = 5;
 pub const LOOKAHEAD_POOL: usize = 28;
+/// 推演只拿真能拿走对方东西的禁用来比（2.13.1；用户：「前三手对方选了adc了 自动bp在3+2bp模式下最后两手还会ban
+/// adc」）：拿走对方不到这么多（对数几率，约半个胜率点）的，推演出来的差别只是后面每一手跟着变的波动，盖过了
+/// 禁用本身的价值。够格的不到两个就照禁用板的顺序。
+pub const LOOKAHEAD_MIN_DENY: f32 = 0.02;
 
 /// One team's turn: what the draft screen advises the player, and what the AI does with
 /// `ai_bp` on.
@@ -881,16 +898,21 @@ pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<
         order_position(t.bans_made, bp, rp).filter(|i| ORDER_3_2[*i].blue == blue && ORDER_3_2[*i].ban == t.banning).map(|i| (i, blue))
     });
     if let Some((at, blue)) = at {
+        let threat = |c: &u16| board.iter().find(|b| b.champ == *c).is_some_and(|b| b.deny >= LOOKAHEAD_MIN_DENY);
         let mut candidates: Vec<u16> = if t.banning {
-            board.iter().take(LOOKAHEAD).map(|b| b.champ).collect()
+            board.iter().filter(|b| b.deny >= LOOKAHEAD_MIN_DENY).take(LOOKAHEAD).map(|b| b.champ).collect()
         } else {
             picks.iter().take(LOOKAHEAD).map(|v| v.champ).collect()
         };
-        let allowed = |c: &u16| if t.banning { t.offer.contains(c) } else { t.pickable.contains(c) };
+        let allowed = |c: &u16| if t.banning { t.offer.contains(c) && threat(c) } else { t.pickable.contains(c) };
         for c in t.also.iter().filter(|c| allowed(c)) {
             if !candidates.contains(c) {
                 candidates.push(*c);
             }
+        }
+        // 禁用只剩一个真有威胁的（或者一个都没有）：推演比不出什么，照禁用板
+        if t.banning && candidates.len() < 2 {
+            candidates.clear();
         }
         let mut pool = lookahead_pool(meta, t.offer, LOOKAHEAD_POOL);
         for c in &candidates {
@@ -899,9 +921,14 @@ pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<
             }
         }
         let (blue_team, red_team) = if blue { (t.us, t.them) } else { (t.them, t.us) };
+        let ours = |w: f32| if blue { w } else { 1.0 - w };
         for c in candidates {
-            let blue_wins = simulate(meta, blue_team, red_team, &pool, at, c, damage);
-            outlook.insert(c, if blue { blue_wins } else { 1.0 - blue_wins });
+            let mut win = ours(simulate(meta, blue_team, red_team, &pool, at, c, false, damage));
+            if t.banning {
+                // 自己还能选它时更差：真禁掉比它好的那部分是推演里自己换人的波动，不算
+                win = win.min(ours(simulate(meta, blue_team, red_team, &pool, at, c, true, damage)));
+            }
+            outlook.insert(c, win);
         }
         let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0);
         if t.banning {
@@ -1118,8 +1145,8 @@ mod tests {
         // blue's first pick: the strong champion leads to a better draft than the weak one
         let blue = Team::new(&[], &[]);
         let red = Team::new(&[], &[]);
-        let with_c = super::simulate(&m, blue, red, &pool, 6, c, &none);
-        let with_l = super::simulate(&m, blue, red, &[pool.clone(), vec![l]].concat(), 6, l, &none);
+        let with_c = super::simulate(&m, blue, red, &pool, 6, c, false, &none);
+        let with_l = super::simulate(&m, blue, red, &[pool.clone(), vec![l]].concat(), 6, l, false, &none);
         assert!(with_c > with_l, "{with_c} vs {with_l}");
         assert!((0.0..=1.0).contains(&with_c));
     }
@@ -1196,9 +1223,15 @@ mod tests {
 
     #[test]
     fn a_turn_on_a_full_pool_is_quick_and_plays_out() {
-        // the game's pool: two hundred champions besides the twelve with games
+        // the game's pool: two hundred champions besides the twelve with games; several strong ones, so that several
+        // bans take something from the enemy (2.13.1: only those are played out)
         let (names, games) = simulate(3000, "1.1", |n| match n {
             "c" => 0.5,
+            "d" => 0.45,
+            "e" => 0.4,
+            "f" => 0.35,
+            "g" => 0.3,
+            "h" => 0.25,
             "l" => -0.5,
             _ => 0.0,
         }, 11);
@@ -1225,15 +1258,66 @@ mod tests {
         };
         let plan = plan_turn(&m, &turn, &none);
         let took = started.elapsed();
-        assert_eq!(plan.outlook.len(), LOOKAHEAD, "the first ban of a 3+2 draft is played out");
+        assert!((2..=LOOKAHEAD).contains(&plan.outlook.len()), "the first ban of a 3+2 draft is played out: {:?}", plan.outlook);
+        assert!(plan.outlook.keys().all(|c| plan.board.iter().any(|b| b.champ == *c && b.deny >= LOOKAHEAD_MIN_DENY)), "only real threats");
         assert!(plan.outlook.contains_key(&plan.board[0].champ), "the lookahead's best leads");
         assert!(took.as_secs_f32() < 2.0, "{took:?}");
         eprintln!("one turn on {} champions: {took:?}", offer.len());
         // the side not known: no lookahead
         let blind = plan_turn(&m, &TurnInput { blue: None, ..turn }, &none);
         assert!(blind.outlook.is_empty());
-        // a pick: the strongest
+        // a pick: one of the strong ones (they are close: the lookahead decides among them)
         let pick = plan_turn(&m, &TurnInput { banning: false, bans_made: 6, ..turn }, &none);
-        assert_eq!(pick.ranked(false)[0], m.names.get("c").unwrap());
+        let strong: Vec<u16> = ["c", "d", "e", "f", "g", "h"].iter().map(|n| m.names.get(n).unwrap()).collect();
+        assert!(strong.contains(&pick.ranked(false)[0]), "{}", m.names.name(pick.ranked(false)[0]));
+    }
+
+    #[test]
+    fn a_lone_threat_is_banned_without_playing_out_the_rest() {
+        // 只有 c 比替补强：别的禁用拿不走对方什么，推演比出来的只是波动，照禁用板禁 c
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
+        let turn = TurnInput {
+            us: Team::new(&[], &[]),
+            them: Team::new(&[], &[]),
+            offer: &offer,
+            pickable: &offer,
+            banning: true,
+            blue: Some(true),
+            bans_made: 0,
+            lookahead: true,
+            conserve: 0.0,
+            also: &[],
+        };
+        let plan = plan_turn(&m, &turn, &none);
+        let threats = plan.board.iter().filter(|b| b.deny >= LOOKAHEAD_MIN_DENY).count();
+        if threats < 2 {
+            assert!(plan.outlook.is_empty(), "{:?}", plan.outlook);
+        }
+        assert_eq!(plan.board[0].champ, m.names.get("c").unwrap());
+        // 推演只拿真威胁比：ai_variety 想要的那几个里拿不走对方东西的也不推演
+        let weak = m.names.get("l").unwrap();
+        let wished = plan_turn(&m, &TurnInput { also: &[weak], ..turn }, &none);
+        assert!(!wished.outlook.contains_key(&weak));
+    }
+
+    #[test]
+    fn a_ban_kept_for_ourselves_is_never_worse_for_us() {
+        // 蓝方第一手禁 c：真禁掉，和只对红方禁掉（蓝方后面还能选）比；c 是最强的，留给自己只会更好，
+        // 所以 plan_turn 取两次里差的那个，禁用不会因为改了自己后面的选择而显得好
+        let m = meta();
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).collect();
+        let pool = lookahead_pool(&m, &offer, 10);
+        let c = m.names.get("c").unwrap();
+        let blue = Team::new(&[], &[]);
+        let red = Team::new(&[], &[]);
+        let banned = super::simulate(&m, blue, red, &pool, 0, c, false, &none);
+        let kept = super::simulate(&m, blue, red, &pool, 0, c, true, &none);
+        assert!(kept >= banned, "{kept} vs {banned}");
+        // 选人那一步 reserve 不起作用
+        let pick = super::simulate(&m, blue, red, &pool, 6, c, false, &none);
+        assert_eq!(super::simulate(&m, blue, red, &pool, 6, c, true, &none), pick);
     }
 }
