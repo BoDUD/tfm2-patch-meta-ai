@@ -279,6 +279,18 @@ SKIP = {
     "vi": "Được đặt là không điều chỉnh (balance_skip): các điều chỉnh trước của mod này bị hủy và sẽ không điều chỉnh nữa.",
     "th": "ตั้งไว้ว่าไม่ต้องปรับ (balance_skip): การปรับก่อนหน้านี้ของม็อดนี้ถูกยกเลิก และจะไม่ปรับอีก",
 }
+# a theme patch (2.14.0, `theme`, `pma_theme_<category>`): a class of champions buffed together; categories are the
+# game's ChampionCategoryV1 codes 0-5
+THEME_NAMES = {
+    "zh-hans": ["战士", "射手", "法师", "辅助", "刺客", "坦克"],
+    "zh-hant": ["戰士", "射手", "法師", "輔助", "刺客", "坦克"],
+    "en": ["fighters", "marksmen", "mages", "supports", "assassins", "tanks"],
+}
+THEME = {
+    "zh-hans": "主题版本「{name}版本」：所有{name}一起加强，之后照常按胜率调整。",
+    "zh-hant": "主題版本「{name}版本」：所有{name}一起加強，之後照常按勝率調整。",
+    "en": "Theme patch, {name}: every one of them is buffed together; later patches judge them by win rate as usual.",
+}
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
 
@@ -295,6 +307,10 @@ def reasons(lang):
     out["pma_unpicked"] = UNPICKED.get(lang, UNPICKED["en"])
     out["pma_custom"] = CUSTOM.get(lang, CUSTOM["en"])
     out["pma_skip"] = SKIP.get(lang, SKIP["en"])
+    names = THEME_NAMES.get(lang, THEME_NAMES["en"])
+    theme = THEME.get(lang, THEME["en"])
+    for category, name in enumerate(names):
+        out[f"pma_theme_{category}"] = theme.format(name=name)
     power, power_hp, in_all = POWER.get(lang, POWER["en"])
     signed = lambda v: f"{v:+d}"
     for v in range(-CAP, CAP + 1):

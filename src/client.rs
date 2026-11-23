@@ -391,6 +391,9 @@ struct State {
     starting: Vec<u32>,
     current_strategy: Vec<(String, String)>,
     team_read_day: Option<Date>,
+    /// 比赛前后的新闻（2.14.0，`stories`），和各队风格是哪个模型算的
+    stories: Stories,
+    styles_from: Option<usize>,
 }
 
 impl State {
@@ -446,6 +449,8 @@ impl State {
             athlete_queue: std::collections::VecDeque::new(),
             athletes_tried: std::collections::HashSet::new(),
             team_names: HashMap::new(),
+            stories: Stories::default(),
+            styles_from: None,
             probes_written: false,
             records_probed: false,
             starting: Vec::new(),
@@ -959,6 +964,272 @@ fn run_steps(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Insta
     steps.mark("tiers");
     sync_balance(st, game, cfg, team, now, &events);
     steps.mark("balance");
+    sync_styles(st);
+    sync_stories(st, game, cfg, team, now, &events);
+    steps.mark("stories");
+}
+
+/// 每次有新的模型就重新算一遍各队的风格（2.14.0，`styles`）
+fn sync_styles(st: &mut State) {
+    let Some(snapshot) = shared::get() else { return };
+    let from = Arc::as_ptr(&snapshot) as usize;
+    if st.styles_from == Some(from) {
+        return;
+    }
+    st.styles_from = Some(from);
+    let categories = champion_categories(st);
+    let styles = crate::styles::build(st.comp.games.values().map(|g| g.as_ref()), &snapshot.meta, &categories);
+    diag::log_once("styles-built", &format!("[styles] {} teams have a style of their own", styles.teams.len()));
+    crate::styles::set(Some(styles));
+}
+
+// ===================== 比赛前后的新闻（2.14.0，`stories`） =====================
+
+/// 主界面上每隔这么久再看一次你最近几天的比赛
+const STORY_RECHECK: Duration = Duration::from_secs(10);
+/// 读系列赛记录每帧最多花这么久
+const STORY_BUDGET: Duration = Duration::from_millis(2);
+/// 只复盘这几天以内打的（第一次装上不会把以前的全发一遍）
+const REVIEW_DAYS: i64 = 2;
+
+#[derive(Default)]
+struct Stories {
+    /// 哪一天读的；还没读的系列赛；读到的；联赛积分榜
+    day: Option<Date>,
+    pending: Vec<usize>,
+    fixtures: Vec<crate::stories::Fixture>,
+    table: Vec<crate::stories::Row>,
+    recheck_at: Option<Instant>,
+    /// 这次游戏里发过的（存档里服务端也会再查一遍）
+    sent: std::collections::HashSet<String>,
+}
+
+/// 你所在联赛这个赛季的积分榜和全部系列赛（常规赛加季后赛）：从最新的联赛记录往前找有你的那一个
+fn current_league(game: &mut impl Game, us: u32) -> Option<(Vec<crate::stories::Row>, Vec<usize>)> {
+    let mut ids = game.record_ids(RecordKindV1::LeagueCompetition);
+    ids.sort_unstable();
+    for id in ids.iter().rev().take(12) {
+        let Some(standings) = game.record_json(RecordKindV1::LeagueCompetition, *id, "standings") else { continue };
+        let table = crate::stories::standings(&format!("{{\"standings\":{standings}}}"));
+        if !table.iter().any(|t| t.0 == us) {
+            continue;
+        }
+        let mut list = |path: &str| {
+            game.record_json(RecordKindV1::LeagueCompetition, *id, path).and_then(|j| serde_json::from_str::<Vec<usize>>(&j).ok()).unwrap_or_default()
+        };
+        let mut matches = list("matches");
+        matches.extend(list("playoffs"));
+        return Some((table, matches));
+    }
+    None
+}
+
+/// 一支队的名字（问过一次就记着）
+fn team_label(st: &mut State, game: &mut impl Game, team: u32) -> String {
+    st.team_names.entry(team).or_insert_with(|| game.team_name(team as usize).unwrap_or_default()).trim().to_string()
+}
+
+/// 一支队最近一场比赛的上场选手和位置
+fn roster_of(st: &State, team: u32) -> Vec<(u32, Option<crate::history::Role>)> {
+    let newest = st.comp.games.values().filter(|g| g.teams.contains(&Some(team))).max_by_key(|g| g.record);
+    let Some(g) = newest else { return Vec::new() };
+    let side = if g.teams[0] == Some(team) { 0 } else { 1 };
+    let mut out: Vec<(u32, Option<crate::history::Role>)> = g.sides[side].iter().filter_map(|s| Some((s.athlete?, s.role))).collect();
+    out.sort_by_key(|(_, r)| r.map_or(9, |r| r.index()));
+    out
+}
+
+fn send_story(game: &mut impl Game, team: usize, key: &str, story: (String, String)) -> bool {
+    let req = crate::server::NewsRequest { team, key: key.to_string(), title: story.0, content: story.1 };
+    game.send_command(crate::server::PUSH_NEWS, req.encode().as_bytes())
+}
+
+/// 赛前前瞻的内容
+fn story_preview(st: &mut State, game: &mut impl Game, us: u32, f: &crate::stories::Fixture) -> Option<(String, String)> {
+    let them = f.opponent(us)?;
+    let chinese = game_in_chinese(st);
+    let fallback = |ours: bool| match (ours, chinese) {
+        (true, true) => "你的队伍",
+        (false, true) => "对手",
+        (true, false) => "Your team",
+        (false, false) => "Opponent",
+    };
+    let name = |st: &mut State, game: &mut _, t: u32, ours: bool| {
+        let n = team_label(st, game, t);
+        if n.is_empty() { fallback(ours).to_string() } else { n }
+    };
+    let us_name = name(st, game, us, true);
+    let them_name = name(st, game, them, false);
+    let info = |st: &State, t: u32, n: String| crate::stories::TeamInfo {
+        name: n,
+        rank: crate::stories::rank_of(&st.stories.table, t),
+        form: crate::stories::form(&st.stories.fixtures, t, f.date, 5),
+    };
+    let mut p = crate::stories::Preview {
+        us: info(st, us, us_name),
+        them: info(st, them, them_name),
+        best_of: f.best_of(),
+        ..crate::stories::Preview::default()
+    };
+    // 交手：这个存档里记着的两队之间的每一局
+    for g in st.comp.games.values() {
+        let (Some(a), Some(b)) = (g.teams.iter().position(|t| *t == Some(us)), g.teams.iter().position(|t| *t == Some(them))) else { continue };
+        if a == b {
+            continue;
+        }
+        if g.won(a) {
+            p.head_to_head.0 += 1;
+        } else {
+            p.head_to_head.1 += 1;
+        }
+    }
+    let Some(snapshot) = shared::get() else { return Some(crate::stories::preview_news(&p, chinese)) };
+    let meta = &snapshot.meta;
+    let label = |st: &State, c: u16| st.labels.champion(meta.names.name(c));
+    let habits = shared::habits();
+    let habit_of = |t: u32| habits.as_ref().and_then(|h| h.get(&t));
+    // 招牌英雄：对方最近上场最多的
+    if let Some(h) = habit_of(them) {
+        let mut top: Vec<(&u16, &f32)> = h.iter().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(b.0)));
+        p.them_signature = top.iter().take(3).filter(|(_, s)| **s >= 0.2).map(|(c, _)| label(st, **c)).collect();
+    }
+    p.them_style = crate::styles::label_of(them, chinese);
+    // 对方可能先禁：照 AI 替他们禁人的算法，空 BP、看你的选手
+    let (ours, theirs) = (roster_of(st, us), roster_of(st, them));
+    let offer: Vec<u16> = meta.champions.iter().filter_map(|c| meta.names.get(&c.name)).collect();
+    let damage = |c: u16| snapshot.damage_of(c);
+    let them_team = crate::advisor::Team { habits: habit_of(them), ..crate::advisor::Team::new(&[], &theirs) };
+    let us_team = crate::advisor::Team { habits: habit_of(us), ..crate::advisor::Team::new(&[], &ours) };
+    let board = crate::advisor::ban_board(meta, them_team, us_team, crate::advisor::Mastery::FULL, &damage, &offer, None);
+    p.likely_bans = board.iter().take(3).map(|b| label(st, b.champ)).collect();
+    // 对方关键选手：模型里选手自己的实力最高的两个
+    let mut key: Vec<(u32, Option<crate::history::Role>, f32)> =
+        theirs.iter().filter_map(|(a, r)| Some((*a, *r, meta.athletes.get(a)?.value))).filter(|k| k.2 > 0.0).collect();
+    key.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    for (a, role, _) in key.into_iter().take(2) {
+        let n = game.athlete_name(a).or_else(|| st.labels.athletes.get(&a).cloned()).unwrap_or_else(|| format!("#{a}"));
+        p.key_players.push((n, role.map_or("", |r| r.name()).to_string()));
+    }
+    // 只看选手的赛前胜率
+    if !ours.is_empty() && !theirs.is_empty() {
+        let sum = |r: &[(u32, Option<crate::history::Role>)]| -> f32 { r.iter().filter_map(|(a, _)| meta.athletes.get(a)).map(|e| e.value).sum() };
+        let eta = (sum(&ours) - sum(&theirs)) * meta.calibration.unwrap_or(1.0);
+        p.strength = Some(crate::glm::sigmoid(eta));
+    }
+    Some(crate::stories::preview_news(&p, chinese))
+}
+
+/// 赛后复盘的内容（每局的记录还没有就是 None，过一会儿再试）
+fn story_review(st: &mut State, game: &mut impl Game, us: u32, f: &crate::stories::Fixture) -> Option<(String, String)> {
+    let crate::stories::State::End { score, .. } = f.state else { return None };
+    let them = f.opponent(us)?;
+    let score = if f.teams[0] == Some(us) { (score[0], score[1]) } else { (score[1], score[0]) };
+    let games: Vec<crate::stories::GameRecord> =
+        f.replays.iter().filter_map(|id| game.record_json(RecordKindV1::MatchReplay, *id, "").and_then(|j| crate::stories::parse_game(&j))).collect();
+    if games.is_empty() {
+        return None;
+    }
+    let chinese = game_in_chinese(st);
+    let us_name = team_label(st, game, us);
+    let them_name = team_label(st, game, them);
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for a in games.iter().flat_map(|g| g.sides.iter()).flat_map(|s| s.players.iter()).filter_map(|p| p.athlete) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(a) {
+            slot.insert(game.athlete_name(a).or_else(|| st.labels.athletes.get(&a).cloned()).unwrap_or_else(|| format!("#{a}")));
+        }
+    }
+    let athlete = |a: u32| names.get(&a).cloned().unwrap_or_default();
+    let champion = |c: &str| st.labels.champion(c);
+    Some(crate::stories::review_news(us, (&us_name, &them_name), score, &games, chinese, &athlete, &champion))
+}
+
+/// 比赛前后的新闻：每个游戏日读一遍你联赛的赛程（每帧一点），你的比赛当天发前瞻，打完发复盘
+fn sync_stories(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize, now: Instant, events: &[(String, Vec<u8>)]) {
+    for (event, payload) in events {
+        if event == crate::server::NEWS_RESULT {
+            diag::log(&format!("[stories] the server: {}", String::from_utf8_lossy(payload).replace('\t', " ")));
+        }
+    }
+    if !cfg.match_stories {
+        return;
+    }
+    let Some(today) = game.game_date() else { return };
+    let us = team as u32;
+    if st.stories.day != Some(today) {
+        st.stories.day = Some(today);
+        st.stories.fixtures.clear();
+        st.stories.recheck_at = None;
+        match current_league(game, us) {
+            Some((table, matches)) => {
+                st.stories.table = table;
+                st.stories.pending = matches;
+            }
+            None => {
+                st.stories.table.clear();
+                st.stories.pending.clear();
+                diag::log_once("stories-no-league", "[stories] no league competition lists this team: no previews / reviews for now");
+            }
+        }
+    }
+    if !st.stories.pending.is_empty() {
+        let started = Instant::now();
+        while let Some(id) = st.stories.pending.pop() {
+            if let Some(f) = game.record_json(RecordKindV1::MatchNormal, id, "").and_then(|j| crate::stories::parse_fixture(id, &j)) {
+                st.stories.fixtures.push(f);
+            }
+            if started.elapsed() >= STORY_BUDGET {
+                break;
+            }
+        }
+        if !st.stories.pending.is_empty() {
+            return;
+        }
+    }
+    if !due(st.stories.recheck_at, now) {
+        return;
+    }
+    st.stories.recheck_at = Some(now + STORY_RECHECK);
+    let days = |d: Date| crate::balance::day_number(today) - crate::balance::day_number(d);
+    let recent: Vec<usize> = st
+        .stories
+        .fixtures
+        .iter()
+        .filter(|f| f.has(us) && !f.practice && (0..=REVIEW_DAYS).contains(&days(f.date)))
+        .map(|f| f.id)
+        .collect();
+    for id in recent {
+        // 再读一次：今天的比赛可能刚打完
+        let fresh = game.record_json(RecordKindV1::MatchNormal, id, "").and_then(|j| crate::stories::parse_fixture(id, &j));
+        let Some(f) = fresh else { continue };
+        if let Some(slot) = st.stories.fixtures.iter_mut().find(|x| x.id == id) {
+            *slot = f.clone();
+        }
+        let (key, story) = match &f.state {
+            crate::stories::State::Wait if f.date == today => {
+                let key = format!("preview-match-{id}");
+                if st.stories.sent.contains(&key) {
+                    continue;
+                }
+                let story = story_preview(st, game, us, &f);
+                (key, story)
+            }
+            crate::stories::State::End { .. } => {
+                let key = format!("review-match-{id}");
+                if st.stories.sent.contains(&key) {
+                    continue;
+                }
+                let story = story_review(st, game, us, &f);
+                (key, story)
+            }
+            _ => continue,
+        };
+        let Some(story) = story else { continue };
+        if send_story(game, team, &key, story) {
+            diag::log(&format!("[stories] {key} sent"));
+            st.stories.sent.insert(key);
+        }
+    }
 }
 
 /// The save's first model where the management screens were left before it was there: the champions read on, the
@@ -1875,6 +2146,8 @@ struct BalanceSync {
     /// of the last frame.
     near_patch: Option<(Date, bool)>,
     watching: bool,
+    /// 发过补丁预告的补丁日（2.14.0）
+    previewed: Option<Date>,
     /// 塔和龙（2.13.0）：下次读游戏设置的时候，读到的基础生命（塔、小龙、大龙；0 = 没读到），一秒几个 tick（0 = 没读到）
     objectives_at: Option<Instant>,
     objective_base: [i64; 3],
@@ -1969,6 +2242,8 @@ fn prepare_next(
     rules: crate::balance::Rules,
     patch: Option<&str>,
     skip: &crate::balance::Skip,
+    categories: &HashMap<String, u8>,
+    preview: bool,
 ) {
     let today = game.game_date();
     let next = match (today, st.balance.next_patch) {
@@ -1993,7 +2268,18 @@ fn prepare_next(
         return;
     }
     st.balance.prepared_from = Some(from);
-    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day), skip);
+    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day), skip, categories);
+    // 补丁预告（2.14.0）：这个补丁日第一次做好时发一条，存档里同一个补丁日只发一次
+    if preview && st.balance.previewed != Some(day) {
+        let label = |n: &str| st.labels.champion(n);
+        let (title, content) = crate::balance::preview_news(&round, day, game_in_chinese(st), &label);
+        let key = format!("preview-{}-{:02}-{:02}", day.0, day.1, day.2);
+        let req = crate::server::NewsRequest { team, key, title, content };
+        if game.send_command(crate::server::PUSH_NEWS, req.encode().as_bytes()) {
+            st.balance.previewed = Some(day);
+            diag::log(&format!("[balance] patch preview for {} sent ({} champion changes planned)", req.key, round.changes.len()));
+        }
+    }
     // the patch it is for: the first newer than every patch known (the book's, the news', the matches')
     let mut after = crate::balance::latest().map(|r| r.version).unwrap_or_default();
     if let Some(p) = patch.filter(|p| compare_versions(p, &after) == std::cmp::Ordering::Greater) {
@@ -2138,7 +2424,10 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
             tps: if st.balance.tps > 0.0 { st.balance.tps } else { crate::objectives::DEFAULT_TARGETS.tps },
             base: st.balance.objective_base,
         }),
+        theme_every: cfg.balance_theme_every,
+        theme_step: cfg.balance_theme_step,
     };
+    let categories = champion_categories(st);
     let skip = skip_lists(st, cfg);
     // the champions' numbers against what the book saw (2.11.0): the player's changes take the balance's power off
     let edited = look_at_numbers(st, cfg.balance);
@@ -2176,7 +2465,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     (notes, played) => notes.or(played),
                 };
                 if let Some(due) = crate::balance::due_now(patch.as_deref(), today) {
-                    let round = crate::balance::make(&snapshot.meta, rules, &due, today, &skip);
+                    let round = crate::balance::make(&snapshot.meta, rules, &due, today, &skip, &categories);
                     let list: Vec<String> = round
                         .changes
                         .iter()
@@ -2208,7 +2497,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     st.dirty = true;
                     st.balance.prepared_from = None;
                 }
-                prepare_next(st, game, team, &snapshot, rules, patch.as_deref(), &skip);
+                prepare_next(st, game, team, &snapshot, rules, patch.as_deref(), &skip, &categories, cfg.patch_preview);
             }
         }
     } else {
@@ -2395,6 +2684,17 @@ fn make_resets(
     st.balance.prepared_from = None;
 }
 
+/// 游戏是不是中文（看英雄在游戏里的名字有没有汉字）
+fn game_in_chinese(st: &State) -> bool {
+    let cjk = |t: &str| t.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    st.labels.champions.values().take(20).any(|l| cjk(l))
+}
+
+/// 每个英雄的职业（主题版本用，从游戏读到的英雄数据里来）
+fn champion_categories(st: &State) -> HashMap<String, u8> {
+    st.stats.iter().filter_map(|(k, s)| Some((k.clone(), s.category?))).collect()
+}
+
 /// The champions a round left for later (outside the band, too few games with their new numbers), in the log.
 fn log_held(round: &crate::balance::Round) {
     if !round.held.is_empty() {
@@ -2441,9 +2741,7 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
     };
     let items_news = crate::balance::item_news(round, chinese, &item_lines, &item_icon);
     // 塔和龙（2.13.0）：游戏是中文就写中文（看英雄的名字）
-    let cjk = |t: &str| t.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
-    let chinese_game = st.labels.champions.values().take(20).any(|l| cjk(l));
-    let objectives_news = crate::objectives::news(&name, &round.objectives, chinese_game);
+    let objectives_news = crate::objectives::news(&name, &round.objectives, game_in_chinese(st));
     BalanceRequest {
         team,
         off: true,
@@ -2530,6 +2828,10 @@ mod tests {
         /// The server answers the balance requests (ok), and the requests it got (2.10.0's recalibration test).
         answer_balance: bool,
         balance_requests: Vec<BalanceRequest>,
+        /// 2.14.0：系列赛记录、联赛记录、发出去的新闻
+        fixtures: Map<usize, String>,
+        leagues: Map<usize, Value>,
+        stories_sent: Vec<server::NewsRequest>,
     }
 
     impl Source for FakeGame {
@@ -2537,6 +2839,8 @@ mod tests {
             match kind {
                 RecordKindV1::MatchReplay => self.replays.keys().copied().collect(),
                 RecordKindV1::SoloRankMatch => self.solo.keys().copied().collect(),
+                RecordKindV1::MatchNormal => self.fixtures.keys().copied().collect(),
+                RecordKindV1::LeagueCompetition => self.leagues.keys().copied().collect(),
                 _ => vec![],
             }
         }
@@ -2548,6 +2852,8 @@ mod tests {
             match (kind, path) {
                 (RecordKindV1::MatchReplay, "") => self.replays.get(&id).cloned(),
                 (RecordKindV1::SoloRankMatch, "") => self.solo.get(&id).cloned(),
+                (RecordKindV1::MatchNormal, "") => self.fixtures.get(&id).cloned(),
+                (RecordKindV1::LeagueCompetition, p) => self.leagues.get(&id).and_then(|l| l.get(p)).map(Value::to_string),
                 (RecordKindV1::Team, "news") if id == self.team => Some(self.news.clone()),
                 (RecordKindV1::Team, "champion_tiers") if id == self.team => Some(self.tiers.to_string()),
                 // one news item: `news.<index>`
@@ -2596,6 +2902,12 @@ mod tests {
                 // which book the save has (none unless a test gives it one)
                 let answer = format!("{}\t{}\t{}", self.book.0, self.book.1, self.save_id);
                 self.events.push((server::BOOK_RESULT.to_string(), answer.into_bytes()));
+                return true;
+            }
+            if command == server::PUSH_NEWS {
+                let req = server::NewsRequest::parse(payload).unwrap();
+                self.events.push((server::NEWS_RESULT.to_string(), format!("{}\tok\twritten", req.key).into_bytes()));
+                self.stories_sent.push(req);
                 return true;
             }
             if command == server::APPLY_BALANCE || command == server::PREPARE_BALANCE {
@@ -3461,5 +3773,62 @@ mod tests {
     /// What the server last confirmed of the balance (the state's).
     fn st_acked() -> Option<(bool, u32)> {
         lock().as_ref().and_then(|st| st.balance.acked)
+    }
+
+    // ===================== 2.14.0：比赛前后的新闻 =====================
+
+    #[test]
+    fn todays_match_gets_a_preview_and_a_finished_one_a_review() {
+        let mut g = FakeGame { team: 4, team_name: "Mods FC".into(), date: (2028, 10, 22), ..Default::default() };
+        let fixture = |date: &str, a: u32, b: u32, state: Value, replays: &[usize]| {
+            serde_json::json!({"date": date, "need_win": 2, "is_practice": false, "replays": replays, "running_state": state,
+                "team1": {"Normal": a}, "team2": {"Normal": b}})
+            .to_string()
+        };
+        let end = |winner: u32| serde_json::json!({"End": {"winner": winner, "loser": 0, "team1_score": 2, "team2_score": 1}});
+        g.fixtures.insert(100, fixture("2028-10-22T19:00:00", 4, 13, Value::from("Wait"), &[]));
+        g.fixtures.insert(101, fixture("2028-10-21T19:00:00", 4, 13, end(4), &[500]));
+        g.fixtures.insert(102, fixture("2028-10-12T19:00:00", 4, 13, end(4), &[]));
+        g.fixtures.insert(103, fixture("2028-10-22T16:00:00", 7, 8, Value::from("Wait"), &[]));
+        g.leagues.insert(
+            9,
+            serde_json::json!({"standings": {"4": {"win": 10, "lose": 2, "set_win": 21, "set_lose": 8}, "13": {"win": 6, "lose": 6, "set_win": 14, "set_lose": 14}},
+                "matches": [100, 101, 102, 103], "playoffs": []}),
+        );
+        g.replays.insert(
+            500,
+            serde_json::json!({"blue_team_id": 4, "red_team_id": 13, "blue_team_win": true, "game_tick": 72_000,
+                "blue_team": [{"athlete_id": 1, "champion": "a", "position": "Mid", "statistics": {"kills": 7, "deaths": 1, "assists": 3, "rating": 81, "mvp": 1}}],
+                "red_team": [{"athlete_id": 2, "champion": "b", "position": "Mid", "statistics": {"kills": 1, "deaths": 7, "assists": 0, "rating": 50, "mvp": 0}}],
+                "blue_performance": {"total_kills": 15, "total_gold": 60000, "serpen_secured": 3, "epic_secured": 1},
+                "red_performance": {"total_kills": 4, "total_gold": 48000, "serpen_secured": 0, "epic_secured": 0}})
+            .to_string(),
+        );
+        let mut st = State::new();
+        let cfg = Config::default();
+        let mut now = Instant::now();
+        for _ in 0..5 {
+            sync_stories(&mut st, &mut g, &cfg, 4, now, &[]);
+            now += Duration::from_secs(11);
+        }
+        let keys: Vec<&str> = g.stories_sent.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["review-match-101", "preview-match-100"], "the old one (10 days ago) and other teams' get nothing");
+        let preview = &g.stories_sent[1];
+        assert!(preview.title.starts_with("Match preview: Mods FC vs Mods FC (Bo3)"), "{}", preview.title);
+        assert!(preview.content.contains("Standings: Mods FC #1 (10-2)"), "{}", preview.content);
+        assert!(preview.content.contains("Form: Mods FC W W"), "{}", preview.content);
+        let review = &g.stories_sent[0];
+        assert_eq!(review.title, "Match review: Mods FC 2-1 Mods FC");
+        assert!(review.content.starts_with("Game 1 (blue side, 20:00) won: kills 15-4"), "{}", review.content);
+        // 再来几轮也不重发；关掉就不发
+        for _ in 0..3 {
+            sync_stories(&mut st, &mut g, &cfg, 4, now, &[]);
+            now += Duration::from_secs(11);
+        }
+        assert_eq!(g.stories_sent.len(), 2);
+        let mut quiet = State::new();
+        let off = Config { match_stories: false, ..Config::default() };
+        sync_stories(&mut quiet, &mut g, &off, 4, now, &[]);
+        assert_eq!(g.stories_sent.len(), 2);
     }
 }

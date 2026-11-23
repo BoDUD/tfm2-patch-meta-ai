@@ -139,12 +139,22 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
     let habits = [habits_of(acting), habits_of(ctx.enemy_team())];
     let conserve = fearless_share(ctx, &snapshot);
-    let champ = if cfg.ai_variety > 0.0 {
+    // 风格（2.14.0，`styles`）：自己的风格只在差不多好的几个里挑（每一手最多让出 ai_style 个点），对方的用来预测它
+    let styles = crate::styles::get();
+    let style_of = |t: Option<usize>| styles.as_ref().and_then(|s| s.teams.get(&u32::try_from(t?).ok()?)).map(|s| &s.bonus);
+    let own_style = style_of(acting).filter(|_| cfg.ai_style > 0.0);
+    let their_style = style_of(ctx.enemy_team());
+    let margin = cfg.ai_variety.max(if own_style.is_some() { cfg.ai_style } else { 0.0 });
+    let champ = if margin > 0.0 {
         let progress = bans + ally.len() + enemy.len();
-        let believed = variety::sampled(&snapshot, (acting, ctx.enemy_team()), progress, 1.0);
-        varied_choice(&snapshot, &believed, cfg.ai_variety, &ally, &enemy, bans, ban, &available, &lineups, habits, conserve)?
+        let believed = variety::sampled(&snapshot, (acting, ctx.enemy_team()), progress, if cfg.ai_variety > 0.0 { 1.0 } else { 0.0 });
+        let styles = [own_style, their_style];
+        varied_choice_styled(&snapshot, &believed, margin, &ally, &enemy, bans, ban, &available, &lineups, habits, styles, conserve)?
     } else {
-        ai_choice(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, habits, conserve)?
+        ai_plan_styled(&snapshot, &ally, &enemy, bans, ban, &available, &lineups, habits, [None, their_style], conserve, &[], false)
+            .ranked(ban)
+            .first()
+            .copied()?
     };
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
     // the player's own match (the ban/pick screen is open, and the player's team is the other one)
@@ -234,9 +244,29 @@ pub fn varied_choice(
     habits: [Option<&HashMap<u16, f32>>; 2],
     conserve: f32,
 ) -> Option<u16> {
-    let wished = ai_plan(believed, ally, enemy, bans, ban, available, lineups, habits, conserve, &[], false).ranked(ban);
+    varied_choice_styled(model, believed, margin, ally, enemy, bans, ban, available, lineups, habits, [None, None], conserve)
+}
+
+/// [`varied_choice`] 带风格（2.14.0）：`styles` 是（自己, 对方）的风格加分。自己的只加在想法那一份里，模型那一份
+/// 不加，所以照风格选每一手最多让出 `margin` 个胜率点；对方的两份都用来预测它。
+#[allow(clippy::too_many_arguments)]
+pub fn varied_choice_styled(
+    model: &Snapshot,
+    believed: &Snapshot,
+    margin: f32,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
+    styles: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
+) -> Option<u16> {
+    let wished = ai_plan_styled(believed, ally, enemy, bans, ban, available, lineups, habits, styles, conserve, &[], false).ranked(ban);
     let top: Vec<u16> = wished.iter().take(WISHES).copied().collect();
-    let truth = ai_plan(model, ally, enemy, bans, ban, available, lineups, habits, conserve, &top, false);
+    let truth = ai_plan_styled(model, ally, enemy, bans, ban, available, lineups, habits, [None, styles[1]], conserve, &top, false);
     let best = truth.ranked(ban).first().copied()?;
     // in win-rate points: the win chance a played-out turn ends in, else the turn's own value
     let score: HashMap<u16, f32> = if truth.outlook.is_empty() {
@@ -272,13 +302,32 @@ fn ai_plan(
     also: &[u16],
     player: bool,
 ) -> advisor::TurnPlan {
+    ai_plan_styled(snapshot, ally, enemy, bans, ban, available, lineups, habits, [None, None], conserve, also, player)
+}
+
+/// [`ai_plan`] 带风格（2.14.0）：`styles` 是（自己, 对方）的风格加分
+#[allow(clippy::too_many_arguments)]
+fn ai_plan_styled(
+    snapshot: &Snapshot,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
+    styles: [Option<&HashMap<u16, f32>>; 2],
+    conserve: f32,
+    also: &[u16],
+    player: bool,
+) -> advisor::TurnPlan {
     let meta = &snapshot.meta;
     let offer: Vec<u16> = available.iter().map(|(_, m)| *m).collect();
     let pickable = lane_fits(snapshot, ally, &offer, |t| if player { t.player } else { t.ai });
     let damage = |c: u16| snapshot.damage_of(c);
     let turn = advisor::TurnInput {
-        us: advisor::Team { habits: habits[0], ..advisor::Team::new(ally, &lineups.ally) },
-        them: advisor::Team { habits: habits[1], ..advisor::Team::new(enemy, &lineups.enemy) },
+        us: advisor::Team { habits: habits[0], style: styles[0], ..advisor::Team::new(ally, &lineups.ally) },
+        them: advisor::Team { habits: habits[1], style: styles[1], ..advisor::Team::new(enemy, &lineups.enemy) },
         offer: &offer,
         pickable: &pickable,
         banning: ban,
@@ -420,7 +469,9 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     let habits = shared::habits();
     let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
     let conserve = fearless_share(ctx, &snapshot);
-    let (champ, source) = coach_choice(
+    let styles = crate::styles::get();
+    let their_style = ctx.enemy_team().and_then(|t| styles.as_ref()?.teams.get(&u32::try_from(t).ok()?)).map(|s| &s.bonus);
+    let (champ, source) = coach_choice_styled(
         &snapshot,
         &ally,
         &enemy,
@@ -429,6 +480,7 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
         &available,
         &lineups,
         [habits_of(ctx.ally_team()), habits_of(ctx.enemy_team())],
+        their_style,
         conserve,
     )?;
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
@@ -466,6 +518,23 @@ pub fn coach_choice(
     habits: [Option<&HashMap<u16, f32>>; 2],
     conserve: f32,
 ) -> Option<(u16, CoachSource)> {
+    coach_choice_styled(snapshot, ally, enemy, bans, ban, available, lineups, habits, None, conserve)
+}
+
+/// [`coach_choice`] 带对方的风格（2.14.0）：模型自己算的时候用它预测对方
+#[allow(clippy::too_many_arguments)]
+pub fn coach_choice_styled(
+    snapshot: &Snapshot,
+    ally: &[u16],
+    enemy: &[u16],
+    bans: usize,
+    ban: bool,
+    available: &[(usize, u16)],
+    lineups: &Lineups,
+    habits: [Option<&HashMap<u16, f32>>; 2],
+    their_style: Option<&HashMap<u16, f32>>,
+    conserve: f32,
+) -> Option<(u16, CoachSource)> {
     let on_offer = |c: u16| available.iter().any(|(_, m)| *m == c);
     let plan = shared::coach_plan();
     let (mut a, mut e) = (ally.to_vec(), enemy.to_vec());
@@ -479,7 +548,7 @@ pub fn coach_choice(
     let held: &[u16] = plan.as_ref().map_or(&[], |p| p.held.as_slice());
     let open: Vec<(usize, u16)> = available.iter().copied().filter(|(_, c)| ban || !held.contains(c)).collect();
     let open = if open.is_empty() { available.to_vec() } else { open };
-    let plan = ai_plan(snapshot, ally, enemy, bans, ban, &open, lineups, habits, conserve, &[], true);
+    let plan = ai_plan_styled(snapshot, ally, enemy, bans, ban, &open, lineups, habits, [None, their_style], conserve, &[], true);
     // 禁人时把禁用板前三写进日志，看得出为什么禁它（2.13.3）
     if ban {
         let top: Vec<String> = plan
@@ -1329,6 +1398,32 @@ mod tests {
         assert!(log.contains("[ai] team #12 pick 1 vs team #19, on screen: c"), "{log}");
         shared::set_player_team(None);
         shared::clear();
+        crate::reset_for_tests();
+    }
+
+    /// 2.14.0：风格只在差不多好的几个里挑。给一个弱一点的英雄风格加分：margin 够大就选它，0 就还是最强的
+    #[test]
+    fn a_style_picks_among_the_close_ones_only() {
+        let _serial = crate::tests::serial();
+        crate::reset_for_tests();
+        let s = snapshot();
+        let id = |n: &str| s.meta.names.get(n).unwrap();
+        let available: Vec<(usize, u16)> = (0..12u16).map(|c| (c as usize, c)).collect();
+        let none = Lineups::default();
+        let best = ai_choice(&s, &[], &[], 6, false, &available, &none, [None, None], 0.0).unwrap();
+        assert_eq!(best, id("c"));
+        // 一个按模型排第二的英雄，风格加分给它
+        let plan = ai_plan(&s, &[], &[], 6, false, &available, &none, [None, None], 0.0, &[], false);
+        let second = plan.ranked(false)[1];
+        let style: HashMap<u16, f32> = [(second, 2.0)].into_iter().collect();
+        let styled = |margin: f32| {
+            varied_choice_styled(&s, &s, margin, &[], &[], 6, false, &available, &none, [None, None], [Some(&style), None], 0.0)
+        };
+        assert_eq!(styled(100.0), Some(second), "within the margin: the style's pick");
+        assert_eq!(styled(0.0), Some(best), "no margin: the model's best");
+        // 对方的风格只用来预测，不改自己的选择
+        let theirs = varied_choice_styled(&s, &s, 0.0, &[], &[], 6, false, &available, &none, [None, None], [None, Some(&style)], 0.0);
+        assert_eq!(theirs, Some(best));
         crate::reset_for_tests();
     }
 

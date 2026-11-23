@@ -1042,7 +1042,19 @@ impl DraftScreen {
             if t.is_empty() { String::new() } else { format!("{label} {t}") }
         };
         ui.set_text(&format!("{OVERLAY}.win.detail"), &comp("我方", &ally));
-        ui.set_text(&format!("{OVERLAY}.win.enemy"), &comp("敌方", &enemy));
+        // 对方的风格（2.14.0，`styles`）：队名认出是哪支队
+        let styles = crate::styles::get();
+        let enemy_style = self
+            .enemy_team
+            .as_deref()
+            .and_then(|key| snapshot.team_names.iter().find(|(_, n)| team_key(n) == key).map(|(id, _)| *id))
+            .and_then(|id| styles.as_ref()?.teams.get(&id));
+        let enemy_text = match (comp("敌方", &enemy), enemy_style) {
+            (t, None) => t,
+            (t, Some(s)) if t.is_empty() => format!("敌方风格 {}", s.label_zh),
+            (t, Some(s)) => format!("{t} · 风格 {}", s.label_zh),
+        };
+        ui.set_text(&format!("{OVERLAY}.win.enemy"), &enemy_text);
         ui.set_properties(&format!("{OVERLAY}.win.back"), &format!("color: {};", color(theirs)));
         ui.set_properties(
             &format!("{OVERLAY}.win.back.fill"),
@@ -1080,9 +1092,14 @@ impl DraftScreen {
 
         // advice
         let their_left = 5usize.saturating_sub(enemy.len());
-        let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref(), lean: None };
-        let them =
-            advisor::Team { picks: &enemy, players: enemy_players, habits: their_habits.as_ref(), lean: their_lean.as_deref() };
+        let us = advisor::Team { picks: &ally, players, habits: our_habits.as_ref(), lean: None, style: None };
+        let them = advisor::Team {
+            picks: &enemy,
+            players: enemy_players,
+            habits: their_habits.as_ref(),
+            lean: their_lean.as_deref(),
+            style: enemy_style.map(|s| &s.bonus),
+        };
         let blue = turn.side_known.then_some(side == 0);
         // a Fearless series with games left: spending what nothing replaces costs a little
         let label = ui.text(SERIES).unwrap_or_default();
