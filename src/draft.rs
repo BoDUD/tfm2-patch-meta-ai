@@ -548,10 +548,21 @@ pub fn coach_choice_styled(
     let held: &[u16] = plan.as_ref().map_or(&[], |p| p.held.as_slice());
     let open: Vec<(usize, u16)> = available.iter().copied().filter(|(_, c)| ban || !held.contains(c)).collect();
     let open = if open.is_empty() { available.to_vec() } else { open };
-    ai_plan_styled(snapshot, ally, enemy, bans, ban, &open, lineups, habits, [None, their_style], conserve, &[], true)
-        .ranked(ban)
-        .first()
-        .map(|c| (*c, CoachSource::Model))
+    let plan = ai_plan_styled(snapshot, ally, enemy, bans, ban, &open, lineups, habits, [None, their_style], conserve, &[], true);
+    // 禁人时把禁用板前三写进日志，看得出为什么禁它（2.13.3）
+    if ban {
+        let top: Vec<String> = plan
+            .board
+            .iter()
+            .take(3)
+            .map(|b| {
+                let outlook = plan.outlook.get(&b.champ).map_or(String::new(), |w| format!(", played out {:.0}%", w * 100.0));
+                format!("{} (deny {:.3} in {:?}, own {:.3}{outlook})", snapshot.meta.names.name(b.champ), b.deny, b.threat.role, b.own)
+            })
+            .collect();
+        diag::log(&format!("[coach] ban board: {}", top.join(", ")));
+    }
+    plan.ranked(ban).first().map(|c| (*c, CoachSource::Model))
 }
 
 /// The champions of `offer` a team that picked `ally` may pick: by Smart Position Lock's own rule
