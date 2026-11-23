@@ -494,18 +494,26 @@ pub struct Team<'a> {
     /// Hell Draft AI drafts for this team: how much likelier it takes each champion than our
     /// values say (log-odds, `hell::lean`). Its bans follow its ratings, not a ban board.
     pub lean: Option<&'a HashMap<u16, f32>>,
+    /// 这支队的风格加分（2.14.0，`crate::styles`，对数几率）：预测它选人时算进去；它自己选人时（AI 的想法那一份）
+    /// 也加在它的选人上
+    pub style: Option<&'a HashMap<u16, f32>>,
 }
 
 impl<'a> Team<'a> {
     pub fn new(picks: &'a [u16], players: &'a Roster) -> Self {
-        Team { picks, players, habits: None, lean: None }
+        Team { picks, players, habits: None, lean: None, style: None }
     }
 
     /// How much likelier the team is to take `champ` because it plays it a lot (log-odds).
     pub fn habit(&self, champ: u16) -> f32 {
         let share = self.habits.and_then(|h| h.get(&champ)).copied().unwrap_or(0.0);
         let lean = self.lean.and_then(|l| l.get(&champ)).copied().unwrap_or(0.0);
-        HABIT_WEIGHT * (1.0 + HABIT_SCALE * share.clamp(0.0, 1.0)).ln() + lean
+        HABIT_WEIGHT * (1.0 + HABIT_SCALE * share.clamp(0.0, 1.0)).ln() + lean + self.style(champ)
+    }
+
+    /// 风格加分（没有风格就是 0）
+    pub fn style(&self, champ: u16) -> f32 {
+        self.style.and_then(|s| s.get(&champ)).copied().unwrap_or(0.0)
     }
 
     /// How Hell Draft AI rates a champion for its bans when it drafts for this team: its
@@ -885,7 +893,8 @@ pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<
             let b = by_ban.get(c);
             v.contest = CONTEST * b.map_or(0.0, |b| b.deny);
             v.conserve = t.conserve * b.map_or(0.0, |b| b.own);
-            v.total += v.contest - v.conserve;
+            // 风格（2.14.0）：只在 AI 替自己选人的那一份里有，给玩家的建议没有
+            v.total += v.contest - v.conserve + t.us.style(*c);
             v
         })
         .collect();
@@ -930,7 +939,8 @@ pub fn plan_turn(meta: &Meta, t: &TurnInput<'_>, damage: &dyn Fn(u16) -> Option<
             }
             outlook.insert(c, win);
         }
-        let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0);
+        // 风格（2.14.0）：AI 想法那一份里，推演完的选人也带上风格分（对数几率换成胜率约四分之一）
+        let rank = |c: u16| outlook.get(&c).copied().unwrap_or(-1.0) + if t.banning { 0.0 } else { t.us.style(c) * 0.25 };
         if t.banning {
             board.sort_by(|a, b| rank(b.champ).partial_cmp(&rank(a.champ)).unwrap_or(std::cmp::Ordering::Equal));
         } else {

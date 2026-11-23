@@ -391,8 +391,9 @@ struct State {
     starting: Vec<u32>,
     current_strategy: Vec<(String, String)>,
     team_read_day: Option<Date>,
-    /// 比赛前后的新闻（2.14.0，`stories`）
+    /// 比赛前后的新闻（2.14.0，`stories`），和各队风格是哪个模型算的
     stories: Stories,
+    styles_from: Option<usize>,
 }
 
 impl State {
@@ -449,6 +450,7 @@ impl State {
             athletes_tried: std::collections::HashSet::new(),
             team_names: HashMap::new(),
             stories: Stories::default(),
+            styles_from: None,
             probes_written: false,
             records_probed: false,
             starting: Vec::new(),
@@ -962,8 +964,23 @@ fn run_steps(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Insta
     steps.mark("tiers");
     sync_balance(st, game, cfg, team, now, &events);
     steps.mark("balance");
+    sync_styles(st);
     sync_stories(st, game, cfg, team, now, &events);
     steps.mark("stories");
+}
+
+/// 每次有新的模型就重新算一遍各队的风格（2.14.0，`styles`）
+fn sync_styles(st: &mut State) {
+    let Some(snapshot) = shared::get() else { return };
+    let from = Arc::as_ptr(&snapshot) as usize;
+    if st.styles_from == Some(from) {
+        return;
+    }
+    st.styles_from = Some(from);
+    let categories = champion_categories(st);
+    let styles = crate::styles::build(st.comp.games.values().map(|g| g.as_ref()), &snapshot.meta, &categories);
+    diag::log_once("styles-built", &format!("[styles] {} teams have a style of their own", styles.teams.len()));
+    crate::styles::set(Some(styles));
 }
 
 // ===================== 比赛前后的新闻（2.14.0，`stories`） =====================
