@@ -131,8 +131,21 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if available.is_empty() {
         return None;
     }
-    let (ally, enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
     let bans = ctx.ally_bans().len() + ctx.enemy_bans().len();
+    // the player's own match (the ban/pick screen is open, and the player's team is the other one)
+    let live = LIVE.load(Ordering::Relaxed) && ctx.enemy_team().is_some() && ctx.enemy_team() == shared::player_team();
+    // 游戏给的选人可能不全（2.14.1，[`picks_seen`]），用这一场之前看到的补全；玩家这一场补了就写进日志
+    let (listed_ally, listed_enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
+    let (ally, enemy, added) = picks_seen::complete(acting, ctx.enemy_team(), bans, &listed_ally, &listed_enemy);
+    if live && added > 0 {
+        diag::log(&format!(
+            "[ai] {} {} {}: {}",
+            team(&snapshot, acting),
+            if ban { "ban" } else { "pick" },
+            if ban { ctx.ally_bans().len() } else { ctx.ally_picks().len() } + 1,
+            picks_seen::describe(&snapshot, bans, &listed_ally, &listed_enemy, &ally, &enemy, added)
+        ));
+    }
     let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
     // both teams' habits (scouting), and this draft's own read of the champions (variety)
     let habits = shared::habits();
@@ -157,8 +170,9 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
             .copied()?
     };
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
-    // the player's own match (the ban/pick screen is open, and the player's team is the other one)
-    let live = LIVE.load(Ordering::Relaxed) && ctx.enemy_team().is_some() && ctx.enemy_team() == shared::player_team();
+    if !ban {
+        picks_seen::decided(acting, ctx.enemy_team(), champ);
+    }
     if live {
         shared::note_ai_choice(ban, champ);
     }
@@ -463,8 +477,13 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if available.is_empty() {
         return None;
     }
-    let (ally, enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
     let bans = ctx.ally_bans().len() + ctx.enemy_bans().len();
+    let (listed_ally, listed_enemy) = (ids(ctx.ally_picks()), ids(ctx.enemy_picks()));
+    // 游戏给的选人可能不全（2.14.1，[`picks_seen`]）：用这一场之前看到的、我们替两边定的补全；禁人时把游戏给的和补的写进日志
+    let (ally, enemy, added) = picks_seen::complete(ctx.ally_team(), ctx.enemy_team(), bans, &listed_ally, &listed_enemy);
+    if ban || added > 0 {
+        diag::log(&format!("[coach] {}", picks_seen::describe(&snapshot, bans, &listed_ally, &listed_enemy, &ally, &enemy, added)));
+    }
     let lineups = Lineups::from_game(ctx.ally_athletes(), ctx.enemy_athletes(), &ctx.slot_lanes());
     let habits = shared::habits();
     let habits_of = |t: Option<usize>| habits.as_ref().and_then(|h| h.get(&u32::try_from(t?).ok()?));
@@ -485,6 +504,9 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     )?;
     let game_id = available.iter().find(|(_, m)| *m == champ).map(|(g, _)| *g)?;
     shared::note_coach_choice(ban, champ);
+    if !ban {
+        picks_seen::decided(ctx.ally_team(), ctx.enemy_team(), champ);
+    }
     diag::log_once("coach-decides", "[coach] the coach override decides the player's team's bans and picks (coach=on)");
     diag::log(&format!(
         "[coach] {} {} {}: {} ({})",
@@ -1021,6 +1043,173 @@ pub fn reset_for_tests() {
     OFF_SCREEN_LOGGED.store(0, Ordering::Relaxed);
     LINEUPS_SEEN.lock().unwrap_or_else(PoisonError::into_inner).clear();
     PENDING.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// 同一场 BP 里两边的选人（2.14.1；用户：「我新开的一把明显还是选了ADC 还在 ban」）。那一把托管第二轮禁人时的禁用板
+/// 把对方的上路、下路、辅助都当成空的，可对方三手（希瓦娜、阿克尚、奎因）最多空出两路：游戏在 3+2 第二轮禁人时给钩子的
+/// 选人列表不全（第一轮禁选和后面的选人托管都是「照面板」，跟屏幕对得上，只有第二轮禁人一直对不上）。我们这边的卡莎可能
+/// 也漏了（禁克格莫还算出要「拿走我们 0.040」）。对方 AI 第二轮也禁了射手麦迪。所以每次问到时把两边看到的选人记下来，
+/// 再加上我们替两边做的选人决定（钩子定了游戏就照着选），游戏给的列表少了就补上。按两支队记；一场开始（没禁没选）、禁人数掉到之前一半以下、或者隔了三分钟没问过，就当是
+/// 新的一场，记的清掉——宁可清早了退回游戏给的列表，也不能把上一局的选人带进下一局。
+pub mod picks_seen {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use crate::shared::Snapshot;
+
+    struct Draft {
+        teams: (usize, usize),
+        /// 这一场见过的最多禁人数
+        most_bans: usize,
+        last: Instant,
+        picks: HashMap<usize, Vec<u16>>,
+    }
+
+    static DRAFTS: Mutex<Vec<Draft>> = Mutex::new(Vec::new());
+    /// 记着的场次（两支队一组）
+    const KEPT: usize = 64;
+    /// 一队最多五手
+    const TEAM: usize = 5;
+    /// 这么久没问过这两支队，就是新的一场（一场 BP 里两次问之间不过几十秒，两局之间隔着一整场比赛）
+    const GAP: Duration = Duration::from_secs(180);
+
+    /// 补全这一手看到的选人：返回补全后的两边，和补了几个（游戏给的没有、这一场之前见过的）。队伍不知道就原样返回。
+    pub fn complete(ally_team: Option<usize>, enemy_team: Option<usize>, bans: usize, ally: &[u16], enemy: &[u16]) -> (Vec<u16>, Vec<u16>, usize) {
+        complete_at(Instant::now(), ally_team, enemy_team, bans, ally, enemy)
+    }
+
+    fn complete_at(now: Instant, ally_team: Option<usize>, enemy_team: Option<usize>, bans: usize, ally: &[u16], enemy: &[u16]) -> (Vec<u16>, Vec<u16>, usize) {
+        let (Some(a), Some(e)) = (ally_team, enemy_team) else { return (ally.to_vec(), enemy.to_vec(), 0) };
+        let mut drafts = DRAFTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let d = draft(&mut drafts, a, e, now);
+        let fresh = bans == 0 && ally.is_empty() && enemy.is_empty();
+        if fresh || bans * 2 < d.most_bans || now.saturating_duration_since(d.last) > GAP {
+            d.picks.clear();
+            d.most_bans = 0;
+        }
+        d.most_bans = d.most_bans.max(bans);
+        d.last = now;
+        let mut added = 0;
+        let mut merge = |team: usize, listed: &[u16]| -> Vec<u16> {
+            let known = d.picks.entry(team).or_default();
+            for c in listed {
+                if !known.contains(c) {
+                    known.push(*c);
+                }
+            }
+            known.truncate(TEAM);
+            let mut out = listed.to_vec();
+            for c in known.iter() {
+                if !out.contains(c) && out.len() < TEAM {
+                    out.push(*c);
+                    added += 1;
+                }
+            }
+            out
+        };
+        let ally = merge(a, ally);
+        let enemy = merge(e, enemy);
+        (ally, enemy, added)
+    }
+
+    /// 我们替 `team` 选了 `champ`（钩子最后决定，游戏照这个来）
+    pub fn decided(team: Option<usize>, other: Option<usize>, champ: u16) {
+        let (Some(a), Some(e)) = (team, other) else { return };
+        let now = Instant::now();
+        let mut drafts = DRAFTS.lock().unwrap_or_else(PoisonError::into_inner);
+        let d = draft(&mut drafts, a, e, now);
+        d.last = now;
+        let known = d.picks.entry(a).or_default();
+        if !known.contains(&champ) && known.len() < TEAM {
+            known.push(champ);
+        }
+    }
+
+    /// 日志里的一句：游戏给的两边选人、禁人数，补了的话补成什么样
+    pub fn describe(snapshot: &Snapshot, bans: usize, listed_ally: &[u16], listed_enemy: &[u16], ally: &[u16], enemy: &[u16], added: usize) -> String {
+        let names = |list: &[u16]| list.iter().map(|c| snapshot.meta.names.name(*c).to_string()).collect::<Vec<_>>().join(",");
+        let mut line = format!("the draft as the game lists it: ours [{}], theirs [{}], {bans} bans", names(listed_ally), names(listed_enemy));
+        if added > 0 {
+            line.push_str(&format!(" - {added} picks it left out put back from this draft: ours [{}], theirs [{}]", names(ally), names(enemy)));
+        }
+        line
+    }
+
+    fn draft(drafts: &mut Vec<Draft>, a: usize, e: usize, now: Instant) -> &mut Draft {
+        let teams = (a.min(e), a.max(e));
+        let at = match drafts.iter().position(|d| d.teams == teams) {
+            Some(at) => at,
+            None => {
+                drafts.push(Draft { teams, most_bans: 0, last: now, picks: HashMap::new() });
+                if drafts.len() > KEPT {
+                    drafts.remove(0);
+                }
+                drafts.len() - 1
+            }
+        };
+        &mut drafts[at]
+    }
+
+    #[cfg(test)]
+    pub fn reset_for_tests() {
+        DRAFTS.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_picks_the_game_leaves_out_are_put_back() {
+            reset_for_tests();
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let (us, them) = (Some(78), Some(34));
+            // 第一轮禁人两边同时禁（第二个问到的已经看到一个禁用）
+            assert_eq!(complete_at(at(0), us, them, 0, &[], &[]).2, 0);
+            assert_eq!(complete_at(at(0), them, us, 1, &[], &[]).2, 0);
+            // 选人：我们 B1，对方 R1 R2，我们 B2 B3，对方 R3（问到时游戏给的都全）
+            complete_at(at(10), us, them, 6, &[], &[]);
+            decided(us, them, 1);
+            assert_eq!(complete_at(at(11), them, us, 6, &[], &[1]).2, 0);
+            decided(them, us, 11);
+            decided(them, us, 12);
+            complete_at(at(15), us, them, 6, &[1], &[11, 12]);
+            decided(us, them, 2);
+            decided(us, them, 3);
+            complete_at(at(20), them, us, 6, &[11, 12], &[1, 2]);
+            decided(them, us, 13);
+            // 第二轮禁人：游戏只给了各一手，禁人数也可能慢一拍
+            let (ally, enemy, added) = complete_at(at(28), us, them, 7, &[1], &[11]);
+            assert_eq!((ally, enemy, added), (vec![1, 2, 3], vec![11, 12, 13], 4));
+            let (ally, enemy, _) = complete_at(at(30), them, us, 6, &[11], &[1]);
+            assert_eq!((ally, enemy), (vec![11, 12, 13], vec![1, 2, 3]));
+            // 别的两支队互不相干；队伍不知道就原样
+            assert_eq!(complete_at(at(30), Some(1), Some(2), 7, &[5], &[]).0, vec![5]);
+            assert_eq!(complete_at(at(30), None, them, 7, &[9], &[]).0, vec![9]);
+            // 系列赛下一局：禁人数从头来（第二个问到的已经有一个禁用），上一局的不能带进来
+            let (ally, enemy, added) = complete_at(at(40), them, us, 1, &[], &[]);
+            assert_eq!((ally.len(), enemy.len(), added), (0, 0, 0));
+            reset_for_tests();
+        }
+
+        #[test]
+        fn a_long_gap_or_an_empty_draft_starts_over() {
+            reset_for_tests();
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            let (us, them) = (Some(5), Some(6));
+            complete_at(at(0), us, them, 6, &[1, 2], &[11]);
+            assert_eq!(complete_at(at(30), us, them, 6, &[1], &[]).2, 2, "same draft");
+            // 隔了一整场比赛：哪怕禁人数一样也是新的一场
+            assert_eq!(complete_at(at(30 + 181), us, them, 6, &[7], &[]).0, vec![7]);
+            // 没禁没选：新的一场
+            complete_at(at(300), us, them, 0, &[], &[]);
+            assert_eq!(complete_at(at(301), us, them, 6, &[], &[]).0, Vec::<u16>::new());
+            reset_for_tests();
+        }
+    }
 }
 
 #[cfg(test)]
