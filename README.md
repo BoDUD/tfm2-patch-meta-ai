@@ -54,6 +54,14 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.13.3：禁用只算英雄会打的那几路
+
+用户：「还有我昨天讲的BP逻辑 选完ADC后在3+2模式下 后两手继续ban ADC 自动托管模式下 压根不像一个职业顶级教练干出来的BP」。2.13.1 以后的对局里还有：对方有斯莫德、我们有克格莫，第二轮禁了卡莎；对方有尼菈，我们第二轮禁了克格莫和阿克尚（我们那时还没选射手）。
+
+- **原因**：算对方每一路还能选谁（禁用板的 `lane_options`，推测对方下一手也用它）时，所有英雄都放进去，不打这一路的只扣 0.6（对数几率）。游戏里还会加上对方常用英雄的加成（不分路）、选手对英雄的熟练度和出场率加成，又强又常用的射手扣完还能挤进对方中路、辅助候选的前几名，于是「对方中路还能选克格莫」，禁他就显得有用。可位置锁里克格莫、卡莎这些只能打下路，AI 队伍的选人被位置锁管着，下路有人以后根本不可能再选。
+- **现在**：新函数 `advisor::plays`：位置锁列了这个英雄（没装就看内置的英雄联盟位置）就只看列的那几路，没列的看它在存档里打这一路的比例够不够 8%，位置不知道的哪路都算。对方和我们每一路的候选都只放能打这一路的；推演里双方选人也只从能打还空着的那几路的英雄里选；面板推荐选人时判断「能不能打」也用它。阿克尚（下路、中路）、库奇这类真能换路的照样会被当成中路威胁。
+- **日志**：教练托管自己算的禁人（`the model's best`）多写一行 `[coach] ban board: ...`，列禁用板前三：拿走对方多少、在哪一路、拿走我们多少、推演胜率。以后再禁得奇怪，看这一行就知道为什么。
+
 ## 2.13.2：AI 战术更积极（`ai_tactics_margin`）
 
 用户觉得现在 AI 队伍不够强。查下来 AI 智能BP 每手都在接管（当天 5 场 `ai_bp 10 decided, 10 made`），玩家这边 BP 结束时的胜率 64 / 49 / 50 / 40 / 42%，和教练托管打平；玩家最近 100 场赢 72 场，主要是阵容实力。用户在几个办法里选了「AI 战术更积极」。
@@ -353,6 +361,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.13.3: the ban board counted every champion on offer as an option in each of the enemy's open lanes, off-role ones only 0.6 log-odds worse; with the team's habits (not per lane), the players' mastery and presence on top, a strong, popular marksman could still rank among the enemy's mid or support options - so the coach banned marksmen after the enemy had picked theirs, although Smart Position Lock lets those champions play Bottom only. `advisor::plays` now decides whether a champion plays a lane (Smart Position Lock's lanes, else League's, else an 8% share in the save), and the ban board's lane options, the lookahead's picks and the panel's lane check all use it. The coach's own phase-two bans log the board's top three (`[coach] ban board`).
 
 2.13.2: AI teams take the strategy the model rates best whenever it is better than their own (`ai_tactics_margin`, default 0; it was a fixed 0.1 log-odds since 2.7.8 - on held-out matches the advised side won about 52% at any lead, 55% at 0.1). Game finish stays the coaches', the player's own tactics stay; matches already decided replay as before.
 
