@@ -172,6 +172,9 @@ pub struct Rules {
     pub item_per_point: f32,
     /// 防御塔和大小龙也调（2.13.0，`objective_balance`）：目标和步子；None = 不调
     pub objectives: Option<crate::objectives::Targets>,
+    /// 主题版本（2.14.0，`balance_theme_every` / `balance_theme_step`）：每几个游戏版本一次（0 = 不出），一类加强多少
+    pub theme_every: u32,
+    pub theme_step: i32,
 }
 
 /// One champion's change in a round.
@@ -192,6 +195,9 @@ pub struct Change {
     /// Its power taken off at once, and why (2.11.0): the player changed its numbers, or `balance_skip` lists it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset: Option<Reset>,
+    /// 主题版本里这一类一起加强的（2.14.0，`crate::theme`）：英雄职业
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<u8>,
 }
 
 /// Why a champion's or an item's power was taken off at once (2.11.0, [`make_reset`]).
@@ -275,6 +281,9 @@ pub struct Round {
     /// 这一轮塔和龙量到了什么，只写日志
     #[serde(skip)]
     pub objective_summary: String,
+    /// 主题版本（2.14.0）：这一轮一起加强的英雄职业
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<u8>,
 }
 
 /// The strength in the middle of the field (2.9.0): the median of the champions' strengths, each counted once for
@@ -390,7 +399,7 @@ fn qualified(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, rules
             let total = (was + want).clamp(-CAP, CAP);
             let step = total - was;
             (step != 0).then(|| {
-                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total, unpicked: false, reset: None })
+                (gap.abs(), Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step, total, unpicked: false, reset: None, theme: None })
             })
         })
         .collect();
@@ -422,7 +431,7 @@ pub fn unpicked(candidates: &[Candidate<'_>], before: &BTreeMap<String, i32>, ru
         .take(rules.unpicked)
         .map(|(c, was)| {
             let total = (was + step).min(UNPICKED_CAP);
-            Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step: total - was, total, unpicked: true, reset: None }
+            Change { champion: c.name.to_string(), win: c.win, evidence: c.evidence, step: total - was, total, unpicked: true, reset: None, theme: None }
         })
         .collect();
     (out, n)
@@ -661,7 +670,7 @@ pub fn make_round_with(
     let mut skipped: Vec<(&String, &i32)> = before.iter().filter(|(c, p)| **p != 0 && skip.champions.contains(*c)).collect();
     skipped.sort();
     for (c, was) in skipped {
-        changes.push(Change { champion: c.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(Reset::Skip) });
+        changes.push(Change { champion: c.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(Reset::Skip), theme: None });
     }
     let mut power = before;
     for c in &changes {
@@ -705,6 +714,7 @@ pub fn make_round_with(
         objectives: Vec::new(),
         objective_power: last.map(|r| r.objective_power.clone()).unwrap_or_default(),
         objective_summary: String::new(),
+        theme: None,
     }
 }
 
@@ -729,7 +739,7 @@ pub fn make_reset(
             continue;
         }
         power.remove(champion);
-        changes.push(Change { champion: champion.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(*why) });
+        changes.push(Change { champion: champion.clone(), win: 0.0, evidence: 0.0, step: -was, total: 0, unpicked: false, reset: Some(*why), theme: None });
     }
     let mut item_power = last.item_power.clone();
     let mut item_changes = Vec::new();
@@ -773,6 +783,7 @@ pub fn make_reset(
         objectives: objective_changes,
         objective_power,
         objective_summary: String::new(),
+        theme: None,
     })
 }
 
@@ -926,6 +937,20 @@ pub fn reason(c: &Change, rules: Rules) -> String {
         }];
         if c.step != 0 {
             codes.push(format!("pma_power_{}", signed_code(c.step)));
+        }
+        return codes.join(",");
+    }
+    // 主题版本（2.14.0）：这一类一起加强，不是因为胜率
+    if let Some(category) = c.theme {
+        let mut codes = vec![format!("pma_theme_{category}")];
+        if c.step != 0 {
+            codes.push(format!("pma_power_{}", signed_code(c.step)));
+        }
+        if c.total != 0 && c.total != c.step {
+            codes.push(format!("pma_sum_{}", signed_code(c.total)));
+        }
+        if c.total.abs() >= CAP {
+            codes.push(format!("pma_total_{CAP}"));
         }
         return codes.join(",");
     }
@@ -1160,6 +1185,14 @@ pub fn news(round: &Round, label: &dyn Fn(&str) -> String) -> (String, String) {
     let name = if round.label.is_empty() { round.version.as_str() } else { round.label.as_str() };
     let title = if chinese { format!("电竞大脑平衡补丁 {name}") } else { format!("Patch Meta AI balance patch {name}") };
     let mut lines = Vec::new();
+    if let Some(category) = round.theme {
+        let step = round.changes.iter().find(|c| c.theme.is_some()).map_or(0, |c| c.step);
+        lines.push(if chinese {
+            format!("本版本是主题版本「{}版本」：所有{}一起加强（最多 {step:+}%），之后照常按胜率调整。", crate::theme::name(category, true), crate::theme::name(category, true))
+        } else {
+            format!("A theme patch - {}: every one of them is buffed (up to {step:+}%); later patches judge them by win rate as usual.", crate::theme::name(category, false))
+        });
+    }
     if round.changes.is_empty() {
         lines.push(if chinese {
             "这一轮没有英雄胜率超出 48%–52%（场次够的英雄里），不改动。".to_string()
@@ -1177,11 +1210,13 @@ pub fn news(round: &Round, label: &dyn Fn(&str) -> String) -> (String, String) {
             let damage = c.step / 2;
             let health = c.step - damage;
             // why: its win rate, or (an unpicked buff, 2.10.0) its few games
-            let why = match (chinese, c.unpicked) {
-                (true, false) => format!("胜率 {:.1}%（目标 48%–52%）", c.win),
-                (true, true) => format!("近几个版本很少有人选（近期 {:.0} 场）", c.evidence),
-                (false, false) => format!("win rate {:.1}% (target 48-52%)", c.win),
-                (false, true) => format!("rarely picked lately ({:.0} recent games)", c.evidence),
+            let why = match (chinese, c.unpicked, c.theme) {
+                (true, _, Some(cat)) => format!("主题版本（{}）", crate::theme::name(cat, true)),
+                (false, _, Some(cat)) => format!("theme patch ({})", crate::theme::name(cat, false)),
+                (true, false, None) => format!("胜率 {:.1}%（目标 48%–52%）", c.win),
+                (true, true, None) => format!("近几个版本很少有人选（近期 {:.0} 场）", c.evidence),
+                (false, false, None) => format!("win rate {:.1}% (target 48-52%)", c.win),
+                (false, true, None) => format!("rarely picked lately ({:.0} recent games)", c.evidence),
             };
             lines.push(if chinese {
                 format!(
@@ -1458,7 +1493,7 @@ pub fn due_now(patch: Option<&str>, today: Option<(i32, u32, u32)>) -> Option<Du
 }
 
 /// The round `due` asks for on this save ([`make_round`]); not in the book until [`publish`]ed.
-pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>, skip: &Skip) -> Round {
+pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>, skip: &Skip, categories: &HashMap<String, u8>) -> Round {
     let items = if rules.items { crate::items::inputs() } else { None };
     if rules.items && items.is_none() {
         diag::log_once("items-no-inputs", "[items] item_balance is on but the 4+6 builds or catalog are not read (yet): this round changes no item");
@@ -1480,8 +1515,125 @@ pub fn make(meta: &Meta, rules: Rules, due: &Due, today: Option<(i32, u32, u32)>
         round.objectives = changes;
         round.objective_summary = format!("{said} ({} matches watched)", watched.len());
     }
+    apply_theme(&mut round, &st.rounds, rules, categories, meta, skip);
     round
 }
+
+/// 主题版本（2.14.0，`crate::theme`）：该出主题的游戏版本里，挑出来的那一类英雄全部加强 `theme_step`%。这一轮按胜率
+/// 给它们的改动不算，下一轮再照常判断；`balance_skip` 列的不加，已经到上限的不动。
+fn apply_theme(round: &mut Round, rounds: &[Round], rules: Rules, categories: &HashMap<String, u8>, meta: &Meta, skip: &Skip) {
+    if !round.merged || round.reset || rules.theme_step == 0 || !crate::theme::due(rounds, rules.theme_every) {
+        return;
+    }
+    let pool: Vec<(String, u8)> = meta
+        .champions
+        .iter()
+        .filter(|c| !skip.champions.contains(&c.name))
+        .filter_map(|c| Some((c.name.clone(), *categories.get(&c.name)?)))
+        .collect();
+    let available: Vec<u8> = crate::theme::CATEGORIES
+        .iter()
+        .copied()
+        .filter(|cat| pool.iter().filter(|(_, c)| c == cat).count() >= crate::theme::MIN_CHAMPIONS)
+        .collect();
+    let Some(category) = crate::theme::pick(rounds, &round.version, &available) else { return };
+    let before = rounds.last().map(|r| r.power.clone()).unwrap_or_default();
+    let mut buffed = 0;
+    for (name, _) in pool.iter().filter(|(_, c)| *c == category) {
+        let was = before.get(name).copied().unwrap_or(0);
+        let total = (was + rules.theme_step).clamp(-CAP, CAP);
+        let mut win = (0.0, 0.0);
+        if let Some(at) = round.changes.iter().position(|c| c.champion == *name) {
+            win = (round.changes[at].win, round.changes[at].evidence);
+            round.changes.remove(at);
+        }
+        if total == 0 {
+            round.power.remove(name);
+        } else {
+            round.power.insert(name.clone(), total);
+        }
+        if total != was {
+            buffed += 1;
+            round.changes.push(Change {
+                champion: name.clone(),
+                win: win.0,
+                evidence: win.1,
+                step: total - was,
+                total,
+                unpicked: false,
+                reset: None,
+                theme: Some(category),
+            });
+        }
+    }
+    round.theme = Some(category);
+    round.summary.push_str(&format!("; theme patch: category {category}, {buffed} champions +{}%", rules.theme_step));
+}
+
+/// 补丁预告（2.14.0）：提前做好的那一轮，补丁日前发一条新闻说计划改什么（以正式补丁为准）。每边最多列 `PREVIEW_LINES`
+/// 个，主题版本那一类只写一句；`label` 是英雄在游戏里的名字。
+pub fn preview_news(round: &Round, day: (i32, u32, u32), chinese: bool, label: &dyn Fn(&str) -> String) -> (String, String) {
+    let date = format!("{}-{:02}-{:02}", day.0, day.1, day.2);
+    let title = if chinese { format!("电竞大脑补丁预告：{date} 的版本") } else { format!("Patch Meta AI patch preview: the patch of {date}") };
+    let mut lines = vec![if chinese {
+        format!("电竞大脑计划在 {date} 的版本里做这些调整（之后的比赛还可能让它变，以正式补丁为准）：")
+    } else {
+        format!("What Patch Meta AI plans for the patch of {date} (the matches until then may still change it; the patch notes decide):")
+    }];
+    if let Some(category) = round.theme {
+        let n = round.changes.iter().filter(|c| c.theme.is_some()).count();
+        let step = round.changes.iter().find(|c| c.theme.is_some()).map_or(0, |c| c.step);
+        lines.push(if chinese {
+            format!("【主题版本】{}版本：{n} 个{}一起加强（最多 {step:+}%）", crate::theme::name(category, true), crate::theme::name(category, true))
+        } else {
+            format!("[Theme patch] {}: {n} of them buffed together (up to {step:+}%)", crate::theme::name(category, false))
+        });
+    }
+    let mut any = round.theme.is_some();
+    for (nerf, zh, en) in [(true, "削弱", "Nerfs"), (false, "加强", "Buffs")] {
+        let mut list: Vec<&Change> = round.changes.iter().filter(|c| c.theme.is_none() && c.step != 0 && (c.step < 0) == nerf).collect();
+        if list.is_empty() {
+            continue;
+        }
+        any = true;
+        list.sort_by_key(|c| -c.step.abs());
+        let shown: Vec<String> = list
+            .iter()
+            .take(PREVIEW_LINES)
+            .map(|c| match (chinese, c.unpicked, c.reset.is_some()) {
+                (_, _, true) => format!("{} {:+}%", label(&c.champion), c.step),
+                (true, true, false) => format!("{} {:+}%（很少有人选）", label(&c.champion), c.step),
+                (false, true, false) => format!("{} {:+}% (rarely picked)", label(&c.champion), c.step),
+                (true, false, false) => format!("{} {:+}%（胜率 {:.1}%）", label(&c.champion), c.step, c.win),
+                (false, false, false) => format!("{} {:+}% (win rate {:.1}%)", label(&c.champion), c.step, c.win),
+            })
+            .collect();
+        let more = list.len().saturating_sub(PREVIEW_LINES);
+        let tail = match (more, chinese) {
+            (0, _) => String::new(),
+            (n, true) => format!("，还有 {n} 个"),
+            (n, false) => format!(", and {n} more"),
+        };
+        lines.push(if chinese { format!("【{zh}】{}{tail}", shown.join("，")) } else { format!("[{en}] {}{tail}", shown.join(", ")) });
+    }
+    if !round.items.is_empty() {
+        any = true;
+        let items: Vec<String> = round.items.iter().take(PREVIEW_LINES).map(|c| format!("{} {:+}%", c.name, c.step)).collect();
+        lines.push(if chinese { format!("【装备】{}", items.join("，")) } else { format!("[Items] {}", items.join(", ")) });
+    }
+    if !round.objectives.is_empty() {
+        any = true;
+        let list: Vec<String> = round.objectives.iter().map(|c| format!("{} {:+}%", c.objective.name(chinese), c.step)).collect();
+        lines.push(if chinese { format!("【防御塔和大小龙】{}", list.join("，")) } else { format!("[Towers and epic monsters] {}", list.join(", ")) });
+    }
+    if !any {
+        lines.push(if chinese { "这一次没有计划中的调整。".to_string() } else { "No changes are planned this time.".to_string() });
+    }
+    (title, lines.join("\n"))
+}
+
+/// 预告里每边最多列几个英雄
+pub const PREVIEW_LINES: usize = 10;
 
 /// The round of resets due on this save now ([`make_reset`]); not in the book until [`publish`]ed.
 pub fn reset_now(
@@ -1935,6 +2087,8 @@ mod tests {
         item_band: DEFAULT_ITEM_BAND,
         item_per_point: DEFAULT_ITEM_PER_POINT,
         objectives: None,
+        theme_every: 0,
+        theme_step: 0,
     };
 
     fn cand(name: &str, win: f32, evidence: f32) -> Candidate<'_> {
@@ -2123,7 +2277,7 @@ mod tests {
 
     #[test]
     fn the_reason_is_the_win_rate_and_the_limits() {
-        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false, reset: None };
+        let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false, reset: None, theme: None };
         assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
         assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
         assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
@@ -2145,9 +2299,9 @@ mod tests {
             merged: true,
             date: Some((2027, 10, 1)),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None },
-                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20, unpicked: false, reset: None },
-                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10, unpicked: false, reset: None },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None, theme: None },
+                Change { champion: "league_warwick".into(), win: 60.0, evidence: 90.0, step: -10, total: -20, unpicked: false, reset: None, theme: None },
+                Change { champion: "league_kaisa".into(), win: 35.9, evidence: 80.0, step: 10, total: 10, unpicked: false, reset: None, theme: None },
             ],
             ..Round::default()
         };
@@ -2219,7 +2373,7 @@ mod tests {
             id: 2,
             version: "1.2".into(),
             power: power2.clone(),
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20, unpicked: false, reset: None }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 99.0, step: -10, total: -20, unpicked: false, reset: None, theme: None }],
             ..Round::default()
         });
         assert_eq!(view().map(|v| v.steps.get("maddie").copied()), Some(Some(-10)));
@@ -2288,13 +2442,13 @@ mod tests {
         open_book_file(career.clone(), legacy.clone(), 0);
         assert!(rounds().is_empty() && view().is_none() && !career.exists());
         assert_eq!(due_now(Some("1.1"), None), Some(Due::First("1.1".into())));
-        assert_eq!(make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default()).id, 1);
+        assert_eq!(make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default(), &HashMap::new()).id, 1);
         close();
         // a save whose book was lost (its news has two rounds, no file anywhere): the ids go on after them
         let _ = std::fs::remove_file(&legacy);
         open_book_file(career.clone(), legacy.clone(), 2);
         assert!(rounds().is_empty());
-        let next = make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default());
+        let next = make(&meta(), RULES, &Due::First("1.1".into()), None, &Skip::default(), &HashMap::new());
         assert_eq!(next.id, 3);
         assert_eq!(publish_prepared(next, &book().unwrap()), Ok(()));
         assert_eq!(rounds().iter().map(|r| r.id).collect::<Vec<_>>(), [3]);
@@ -2338,7 +2492,7 @@ mod tests {
             version: version.into(),
             changes: changes
                 .into_iter()
-                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s, unpicked: false, reset: None })
+                .map(|(c, s)| Change { champion: c.into(), win: 50.0, evidence: 50.0, step: s, total: s, unpicked: false, reset: None, theme: None })
                 .collect(),
             ..Round::default()
         };
@@ -2356,8 +2510,8 @@ mod tests {
             version: "2027.4.1".into(),
             label: "2027.4.1b".into(),
             changes: vec![
-                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None },
-                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6, unpicked: false, reset: None },
+                Change { champion: "tft_maddie".into(), win: 73.3, evidence: 221.0, step: -10, total: -10, unpicked: false, reset: None, theme: None },
+                Change { champion: "weak".into(), win: 44.0, evidence: 80.0, step: 6, total: 6, unpicked: false, reset: None, theme: None },
             ],
             ..Round::default()
         };
@@ -2598,7 +2752,7 @@ mod tests {
             version: "2027.4.1".into(),
             merged: false,
             matches: 586,
-            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10, unpicked: false, reset: None }],
+            changes: vec![Change { champion: "maddie".into(), win: 70.0, evidence: 150.0, step: -10, total: -10, unpicked: false, reset: None, theme: None }],
             ..Round::default()
         };
         let got = model_rounds_of(&[round]);
@@ -2939,13 +3093,13 @@ mod tests {
         keep_watch("39.0", watch(1));
         let targets = crate::objectives::Targets { base: [3713, 5000, 10000], ..crate::objectives::DEFAULT_TARGETS };
         let rules = Rules { objectives: Some(targets), ..RULES };
-        let round = make(&meta(), rules, &Due::Patch("1.2".into()), None, &Skip::default());
+        let round = make(&meta(), rules, &Due::Patch("1.2".into()), None, &Skip::default(), &HashMap::new());
         let got: Vec<(Objective, i32, i64)> = round.objectives.iter().map(|c| (c.objective, c.step, c.base)).collect();
         assert_eq!(got, [(Objective::Tower, 15, 3713), (Objective::Drake, 15, 5000), (Objective::Baron, 15, 10000)]);
         assert_eq!(round.objective_power.get(&Objective::Tower), Some(&15));
         assert!(round.objective_summary.contains("tower: 12.5 min on 40") && round.objective_summary.contains("40 matches watched"), "{}", round.objective_summary);
         // 关着 objective_balance：上一轮的照抄，不判断
-        let off = make(&meta(), RULES, &Due::Patch("1.2".into()), None, &Skip::default());
+        let off = make(&meta(), RULES, &Due::Patch("1.2".into()), None, &Skip::default(), &HashMap::new());
         assert!(off.objectives.is_empty() && off.objective_power.is_empty());
         publish(round);
         // 账本写下了记录和百分比，再读回来一样
@@ -2959,7 +3113,7 @@ mod tests {
         assert!(round_for("n".into(), true, true, true, false).unwrap().objectives.is_none());
         assert!(round_for("n".into(), false, true, true, true).unwrap().objectives.is_none(), "its replays follow the server run");
         // 下一轮：改过以后的比赛还不够 30 场，不动
-        let next = make(&meta(), rules, &Due::Patch("1.3".into()), None, &Skip::default());
+        let next = make(&meta(), rules, &Due::Patch("1.3".into()), None, &Skip::default(), &HashMap::new());
         assert!(next.objectives.is_empty(), "{:?}", next.objectives);
         assert_eq!(next.objective_power.get(&Objective::Tower), Some(&15), "carried");
         close();
@@ -3004,5 +3158,66 @@ mod tests {
         close();
         let _ = std::fs::remove_file(&file);
         reset_for_tests();
+    }
+
+    // ===================== 2.14.0：主题版本、补丁预告 =====================
+
+    #[test]
+    fn a_theme_patch_buffs_one_class_together_and_says_so() {
+        reset_for_tests();
+        let mut m = meta();
+        m.champions.push(champ("other", 50.0, 300.0));
+        let categories: HashMap<String, u8> = ["maddie", "fine", "weak", "other"].iter().map(|c| (c.to_string(), 4u8)).collect();
+        let rules = Rules { theme_every: 1, theme_step: 8, ..RULES };
+        let round = make(&m, rules, &Due::Patch("1.2".into()), None, &Skip::default(), &categories);
+        assert_eq!(round.theme, Some(4));
+        // 四个刺客都 +8，原来按胜率给 maddie 的削弱这一轮不算
+        let steps: Vec<(&str, i32, Option<u8>)> = round.changes.iter().map(|c| (c.champion.as_str(), c.step, c.theme)).collect();
+        assert_eq!(steps.len(), 4, "{steps:?}");
+        assert!(steps.iter().all(|(_, step, theme)| *step == 8 && *theme == Some(4)), "{steps:?}");
+        assert_eq!(round.power.get("maddie"), Some(&8));
+        let maddie = round.changes.iter().find(|c| c.champion == "maddie").unwrap();
+        assert!(reason(maddie, rules).starts_with("pma_theme_4,pma_power_p8"), "{}", reason(maddie, rules));
+        let (_, body) = news(&round, &|c: &str| if c == "maddie" { "麦迪".to_string() } else { c.to_string() });
+        assert!(body.starts_with("本版本是主题版本「刺客版本」"), "{body}");
+        assert!(body.contains("麦迪：主题版本（刺客）"), "{body}");
+        // 热修复不出主题；关掉也不出
+        assert_eq!(make(&m, rules, &Due::First("1.2".into()), None, &Skip::default(), &categories).theme, None);
+        assert_eq!(make(&m, Rules { theme_every: 0, ..rules }, &Due::Patch("1.2".into()), None, &Skip::default(), &categories).theme, None);
+        // 一类不够 3 个英雄不做主题
+        let few: HashMap<String, u8> = [("maddie".to_string(), 1u8)].into_iter().collect();
+        assert_eq!(make(&m, rules, &Due::Patch("1.2".into()), None, &Skip::default(), &few).theme, None);
+        reset_for_tests();
+    }
+
+    #[test]
+    fn the_preview_lists_what_is_planned() {
+        let ch = |c: &str, step: i32, win: f32, theme: Option<u8>| Change {
+            champion: c.into(),
+            win,
+            evidence: 99.0,
+            step,
+            total: step,
+            unpicked: false,
+            reset: None,
+            theme,
+        };
+        let round = Round {
+            theme: Some(1),
+            changes: vec![ch("jinx", 8, 0.0, Some(1)), ch("zeri", 8, 0.0, Some(1)), ch("tryn", -10, 58.4, None), ch("weak", 6, 44.0, None)],
+            items: vec![ItemChange { item: "ie".into(), name: "无尽之刃".into(), users: 4, win: 56.0, step: -5, total: -5, reset: None }],
+            ..Round::default()
+        };
+        let label = |c: &str| if c == "tryn" { "泰达米尔".to_string() } else { c.to_string() };
+        let (title, body) = preview_news(&round, (2028, 7, 1), true, &label);
+        assert_eq!(title, "电竞大脑补丁预告：2028-07-01 的版本");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines[0].contains("以正式补丁为准"), "{body}");
+        assert_eq!(lines[1], "【主题版本】射手版本：2 个射手一起加强（最多 +8%）");
+        assert_eq!(lines[2], "【削弱】泰达米尔 -10%（胜率 58.4%）");
+        assert_eq!(lines[3], "【加强】weak +6%（胜率 44.0%）");
+        assert_eq!(lines[4], "【装备】无尽之刃 -5%");
+        let (_, empty) = preview_news(&Round::default(), (2028, 7, 1), true, &label);
+        assert!(empty.contains("没有计划中的调整"), "{empty}");
     }
 }

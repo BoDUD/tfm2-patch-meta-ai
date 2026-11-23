@@ -1875,6 +1875,8 @@ struct BalanceSync {
     /// of the last frame.
     near_patch: Option<(Date, bool)>,
     watching: bool,
+    /// 发过补丁预告的补丁日（2.14.0）
+    previewed: Option<Date>,
     /// 塔和龙（2.13.0）：下次读游戏设置的时候，读到的基础生命（塔、小龙、大龙；0 = 没读到），一秒几个 tick（0 = 没读到）
     objectives_at: Option<Instant>,
     objective_base: [i64; 3],
@@ -1961,6 +1963,7 @@ fn next_patch_day(schedule: &str, today: Date) -> Option<Date> {
 /// made later reach the screens only with a later day: the inbox showed the game's own empty notes first). Withdrawn
 /// when no patch is near.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn prepare_next(
     st: &mut State,
     game: &mut impl Game,
@@ -1969,6 +1972,8 @@ fn prepare_next(
     rules: crate::balance::Rules,
     patch: Option<&str>,
     skip: &crate::balance::Skip,
+    categories: &HashMap<String, u8>,
+    preview: bool,
 ) {
     let today = game.game_date();
     let next = match (today, st.balance.next_patch) {
@@ -1993,7 +1998,18 @@ fn prepare_next(
         return;
     }
     st.balance.prepared_from = Some(from);
-    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day), skip);
+    let round = crate::balance::make(&snapshot.meta, rules, &crate::balance::Due::Patch(crate::server::NEXT_PATCH.into()), Some(day), skip, categories);
+    // 补丁预告（2.14.0）：这个补丁日第一次做好时发一条，存档里同一个补丁日只发一次
+    if preview && st.balance.previewed != Some(day) {
+        let label = |n: &str| st.labels.champion(n);
+        let (title, content) = crate::balance::preview_news(&round, day, game_in_chinese(st), &label);
+        let key = format!("preview-{}-{:02}-{:02}", day.0, day.1, day.2);
+        let req = crate::server::NewsRequest { team, key, title, content };
+        if game.send_command(crate::server::PUSH_NEWS, req.encode().as_bytes()) {
+            st.balance.previewed = Some(day);
+            diag::log(&format!("[balance] patch preview for {} sent ({} champion changes planned)", req.key, round.changes.len()));
+        }
+    }
     // the patch it is for: the first newer than every patch known (the book's, the news', the matches')
     let mut after = crate::balance::latest().map(|r| r.version).unwrap_or_default();
     if let Some(p) = patch.filter(|p| compare_versions(p, &after) == std::cmp::Ordering::Greater) {
@@ -2138,7 +2154,10 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
             tps: if st.balance.tps > 0.0 { st.balance.tps } else { crate::objectives::DEFAULT_TARGETS.tps },
             base: st.balance.objective_base,
         }),
+        theme_every: cfg.balance_theme_every,
+        theme_step: cfg.balance_theme_step,
     };
+    let categories = champion_categories(st);
     let skip = skip_lists(st, cfg);
     // the champions' numbers against what the book saw (2.11.0): the player's changes take the balance's power off
     let edited = look_at_numbers(st, cfg.balance);
@@ -2176,7 +2195,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     (notes, played) => notes.or(played),
                 };
                 if let Some(due) = crate::balance::due_now(patch.as_deref(), today) {
-                    let round = crate::balance::make(&snapshot.meta, rules, &due, today, &skip);
+                    let round = crate::balance::make(&snapshot.meta, rules, &due, today, &skip, &categories);
                     let list: Vec<String> = round
                         .changes
                         .iter()
@@ -2208,7 +2227,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
                     st.dirty = true;
                     st.balance.prepared_from = None;
                 }
-                prepare_next(st, game, team, &snapshot, rules, patch.as_deref(), &skip);
+                prepare_next(st, game, team, &snapshot, rules, patch.as_deref(), &skip, &categories, cfg.patch_preview);
             }
         }
     } else {
@@ -2395,6 +2414,17 @@ fn make_resets(
     st.balance.prepared_from = None;
 }
 
+/// 游戏是不是中文（看英雄在游戏里的名字有没有汉字）
+fn game_in_chinese(st: &State) -> bool {
+    let cjk = |t: &str| t.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+    st.labels.champions.values().take(20).any(|l| cjk(l))
+}
+
+/// 每个英雄的职业（主题版本用，从游戏读到的英雄数据里来）
+fn champion_categories(st: &State) -> HashMap<String, u8> {
+    st.stats.iter().filter_map(|(k, s)| Some((k.clone(), s.category?))).collect()
+}
+
 /// The champions a round left for later (outside the band, too few games with their new numbers), in the log.
 fn log_held(round: &crate::balance::Round) {
     if !round.held.is_empty() {
@@ -2441,9 +2471,7 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
     };
     let items_news = crate::balance::item_news(round, chinese, &item_lines, &item_icon);
     // 塔和龙（2.13.0）：游戏是中文就写中文（看英雄的名字）
-    let cjk = |t: &str| t.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
-    let chinese_game = st.labels.champions.values().take(20).any(|l| cjk(l));
-    let objectives_news = crate::objectives::news(&name, &round.objectives, chinese_game);
+    let objectives_news = crate::objectives::news(&name, &round.objectives, game_in_chinese(st));
     BalanceRequest {
         team,
         off: true,
