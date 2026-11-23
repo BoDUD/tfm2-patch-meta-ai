@@ -194,11 +194,22 @@ pub fn lane_probabilities(meta: &Meta, picks: &[u16]) -> Vec<[f32; 5]> {
     out
 }
 
-/// Whether `champ` is a real option in one of `open` (not off-role there; a champion whose lanes
-/// are not known fits anywhere).
+/// Whether `champ` is a real option in one of `open` ([`plays`] one of them).
 pub fn fits_lanes(meta: &Meta, champ: u16, open: &[Role]) -> bool {
+    open.iter().any(|r| plays(meta, champ, *r))
+}
+
+/// 一个英雄能不能打这一路（2.13.3；用户：「选完ADC后在3+2模式下 后两手继续ban ADC 自动托管模式下 压根不像一个职业顶级
+/// 教练干出来的BP」）。位置锁列了它（没装就看内置的英雄联盟位置）就只看列的那几路：AI 队伍的选人被位置锁管着，下路有人了
+/// 就不可能再选一个只打下路的。没列的看它在这个存档里打这一路的比例够不够 [`OFF_ROLE_SHARE`]；位置不知道的哪路都算。
+/// 以前算对方每一路的候选时所有英雄都放进去、不打这一路的只扣 [`OFF_ROLE_COST`]，又强又常用的射手扣完还能挤进对方中路
+/// 候选的前几名，对方下路有人了还去禁射手。
+pub fn plays(meta: &Meta, champ: u16, role: Role) -> bool {
+    if let Some(lanes) = crate::knowledge::positions_of(meta.names.name(champ)).filter(|l| !l.is_empty()) {
+        return lanes.contains(&role);
+    }
     match lane_shares(meta, champ) {
-        Some(shares) => open.iter().any(|r| shares[r.index()] >= OFF_ROLE_SHARE),
+        Some(shares) => shares[role.index()] >= OFF_ROLE_SHARE,
         None => true,
     }
 }
@@ -598,8 +609,10 @@ fn lane_options(
     open_lanes(meta, team.picks)
         .into_iter()
         .map(|role| {
+            // 只有能打这一路的才算这一路的候选（2.13.3，[`plays`]）
             let mut options: Vec<PickValue> = offer
                 .iter()
+                .filter(|c| plays(meta, **c, role))
                 .map(|c| {
                     let mut v = pick_value_weighted(meta, *c, team.picks, other, team.players, mastery, damage, &[role]);
                     v.total += likely(*c);
@@ -788,10 +801,12 @@ pub fn simulate(
         } else if own.len() < 5 {
             let open = open_lanes(meta, own);
             let mine = kept.filter(|_| actor == Some(s.blue));
-            offer
-                .iter()
-                .copied()
-                .chain(mine)
+            // 推演里双方也只选能打还空着的那几路的（2.13.3）；一个都没有才随便选
+            let all: Vec<u16> = offer.iter().copied().chain(mine).collect();
+            let fitting: Vec<u16> = all.iter().copied().filter(|c| fits_lanes(meta, *c, &open)).collect();
+            let choices = if fitting.is_empty() { all } else { fitting };
+            choices
+                .into_iter()
                 .map(|c| (c, pick_value_weighted(meta, c, own, other, own_team.players, none, damage, &open).total + own_team.habit(c)))
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(c, _)| c)
@@ -1270,6 +1285,41 @@ mod tests {
         let pick = plan_turn(&m, &TurnInput { banning: false, bans_made: 6, ..turn }, &none);
         let strong: Vec<u16> = ["c", "d", "e", "f", "g", "h"].iter().map(|n| m.names.get(n).unwrap()).collect();
         assert!(strong.contains(&pick.ranked(false)[0]), "{}", m.names.name(pick.ranked(false)[0]));
+    }
+
+    #[test]
+    fn a_champion_that_only_plays_a_filled_lane_takes_nothing_from_them() {
+        // c 是最强的，但只打下路；d 也只打下路。对方已经拿了 d：c 拿不走对方任何东西，不该禁
+        let mut m = meta();
+        let id = |m: &Meta, n: &str| m.names.get(n).unwrap();
+        let (c, d) = (id(&m, "c"), id(&m, "d"));
+        for name in ["c", "d"] {
+            let champ = m.champions.iter_mut().find(|x| x.name == name).unwrap();
+            for (i, role) in champ.roles.iter_mut().enumerate() {
+                role.tally.games = if i == Role::Bottom.index() { 300 } else { 0 };
+            }
+        }
+        for champ in [c, d] {
+            if let Some(p) = m.lane_priors.get_mut(champ as usize) {
+                *p = None;
+            }
+        }
+        assert!(plays(&m, c, Role::Bottom) && !plays(&m, c, Role::Mid));
+        let none = |_: u16| None;
+        let offer: Vec<u16> = (0..NAMES.len() as u16).filter(|x| *x != d).collect();
+        let us = Team::new(&[], &[]);
+        let deny_of = |board: &[BanValue], champ: u16| board.iter().find(|b| b.champ == champ).unwrap().deny;
+        // 对方下路还空着：c 是威胁
+        let open = ban_board(&m, us, Team::new(&[], &[]), Mastery::FULL, &none, &offer, None);
+        assert!(deny_of(&open, c) > 0.05, "{}", deny_of(&open, c));
+        // 对方下路有人了：c 不拿走任何东西
+        let filled = [d];
+        let board = ban_board(&m, us, Team::new(&filled, &[]), Mastery::FULL, &none, &offer, None);
+        assert_eq!(deny_of(&board, c), 0.0);
+        assert_ne!(board[0].champ, c);
+        // 推测对方下一手也不会是 c
+        let likely = likely_picks(&m, Team::new(&filled, &[]), &[], Mastery::FULL, &none, &offer);
+        assert!(!likely.iter().any(|v| v.champ == c));
     }
 
     #[test]
