@@ -998,14 +998,14 @@ struct Stories {
     day: Option<Date>,
     pending: Vec<usize>,
     fixtures: Vec<crate::stories::Fixture>,
-    table: Vec<(u32, u32, u32, i64)>,
+    table: Vec<crate::stories::Row>,
     recheck_at: Option<Instant>,
     /// 这次游戏里发过的（存档里服务端也会再查一遍）
     sent: std::collections::HashSet<String>,
 }
 
 /// 你所在联赛这个赛季的积分榜和全部系列赛（常规赛加季后赛）：从最新的联赛记录往前找有你的那一个
-fn current_league(game: &mut impl Game, us: u32) -> Option<(Vec<(u32, u32, u32, i64)>, Vec<usize>)> {
+fn current_league(game: &mut impl Game, us: u32) -> Option<(Vec<crate::stories::Row>, Vec<usize>)> {
     let mut ids = game.record_ids(RecordKindV1::LeagueCompetition);
     ids.sort_unstable();
     for id in ids.iter().rev().take(12) {
@@ -1135,9 +1135,8 @@ fn story_review(st: &mut State, game: &mut impl Game, us: u32, f: &crate::storie
     let them_name = team_label(st, game, them);
     let mut names: HashMap<u32, String> = HashMap::new();
     for a in games.iter().flat_map(|g| g.sides.iter()).flat_map(|s| s.players.iter()).filter_map(|p| p.athlete) {
-        if !names.contains_key(&a) {
-            let n = game.athlete_name(a).or_else(|| st.labels.athletes.get(&a).cloned()).unwrap_or_else(|| format!("#{a}"));
-            names.insert(a, n);
+        if let std::collections::hash_map::Entry::Vacant(slot) = names.entry(a) {
+            slot.insert(game.athlete_name(a).or_else(|| st.labels.athletes.get(&a).cloned()).unwrap_or_else(|| format!("#{a}")));
         }
     }
     let athlete = |a: u32| names.get(&a).cloned().unwrap_or_default();
@@ -2234,7 +2233,6 @@ fn next_patch_day(schedule: &str, today: Date) -> Option<Date> {
 /// and handed to the server, which writes it in the management tick the game's patch notes appear in (its changes
 /// made later reach the screens only with a later day: the inbox showed the game's own empty notes first). Withdrawn
 /// when no patch is near.
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn prepare_next(
     st: &mut State,

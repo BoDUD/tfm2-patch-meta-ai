@@ -901,9 +901,10 @@ balance_theme_step=8
 ; patch_preview : 补丁日前两天左右发一条「补丁预告」新闻，写平衡补丁计划改什么（之后的比赛还可能让它变）。
 patch_preview=on
 ; match_stories : a preview news item on the day of each of your matches (form, head to head, the
-;                opponent's style and likely bans) and a review after it (score, draft, MVP, objectives).
+;                opponent's style and likely bans) and a review after it (score, each game's kills, gold,
+;                drakes and Baron, the MVP).
 ; match_stories : 你的每场比赛当天发一条赛前前瞻（近况、交手记录、对方风格、可能针对你的禁用），打完发一条赛后复盘
-;                （比分、BP、MVP、小龙大龙）。
+;                （比分、每局的击杀经济和小龙大龙、MVP）。
 match_stories=on
 ; ai_style : with ai_bp, every AI team keeps a style of its own from its matches (dive, poke,
 ;                late game, its favourite classes ...) and picks toward it, giving up at most this many

@@ -106,12 +106,15 @@ pub fn form(fixtures: &[Fixture], team: u32, before: (i32, u32, u32), n: usize) 
         .collect()
 }
 
-/// 联赛积分榜（LeagueCompetition 记录的 standings）：(队, 胜, 负, 小局净胜)，排好名次
-pub fn standings(json: &str) -> Vec<(u32, u32, u32, i64)> {
+/// 积分榜的一行：(队, 胜, 负, 小局净胜)
+pub type Row = (u32, u32, u32, i64);
+
+/// 联赛积分榜（LeagueCompetition 记录的 standings），排好名次
+pub fn standings(json: &str) -> Vec<Row> {
     let Ok(v) = serde_json::from_str::<Value>(json) else { return Vec::new() };
     let Some(map) = v.get("standings").and_then(Value::as_object) else { return Vec::new() };
     let num = |e: &Value, k: &str| e.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let mut out: Vec<(u32, u32, u32, i64)> = map
+    let mut out: Vec<Row> = map
         .iter()
         .filter_map(|(team, e)| {
             let team = team.parse::<u32>().ok()?;
@@ -123,7 +126,7 @@ pub fn standings(json: &str) -> Vec<(u32, u32, u32, i64)> {
 }
 
 /// 名次（从 1 数）、一共几队、胜、负
-pub fn rank_of(table: &[(u32, u32, u32, i64)], team: u32) -> Option<(usize, usize, u32, u32)> {
+pub fn rank_of(table: &[Row], team: u32) -> Option<(usize, usize, u32, u32)> {
     let at = table.iter().position(|t| t.0 == team)?;
     Some((at + 1, table.len(), table[at].1, table[at].2))
 }
