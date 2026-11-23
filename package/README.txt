@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.14.0 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.14.1 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,11 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.14.1：3+2 第二轮禁人时，游戏交给 Mod 的选人列表会漏掉几手（那一把托管以为对方上路、下路、辅助都还空着，
+所以照样禁射手）。现在同一场 BP 里记下每次看到的选人和电竞大脑自己替两边定的选人，游戏漏给的补上，托管和
+AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写一行 [coach] the draft as the game lists it，
+能看到游戏给了什么、补了几个。
 
 2.14.0：玩起来更有比赛味。① 赛前前瞻和赛后复盘（match_stories，默认开）：联赛里你的每场比赛当天，收件箱
 来一条前瞻（积分榜、近况、交手、对方风格和招牌英雄、可能先禁谁、关键选手、赛前胜率），打完来一条复盘
@@ -499,6 +504,11 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.14.1: in the second ban phase of a 3+2 draft the game hands the mods an incomplete
+pick list, so the coach and AI BP banned marksmen against a filled bottom lane. Each
+draft's picks (seen, and decided by this mod for either team) are now remembered and
+the missing ones filled in; diag.log shows what the game listed at each coach ban.
 
 2.14.0: a match preview in your inbox on the day of each of your league matches and a
 review after it (match_stories); a patch preview two days before each game patch and a
