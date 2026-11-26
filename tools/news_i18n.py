@@ -10,6 +10,12 @@ unpicked buff (2.10.0, `balance::UNPICKED_STEP`) gives `pma_unpicked` instead of
 cannot carry a number of its own, so there is one per number. `patch.pma_none` (2.8.2) is what patch notes without a
 champion change say (`server::UNCHANGED_TEXT`).
 
+2.14.2 (the user: 「现在英雄平衡补丁的文字说明太僵硬 没有之前官方的那种文字的味道」): a change's reason starts with the game's
+own `patch.reason.*` line (too_much_damage_2, buff_meta_1, ...: the game's texts, every language) and these texts follow it
+as a short second line (the win rate, or too few games); the power is a line of the notes (`patch.pma_power_stat`, as a
+stat: before -> after), so `pma_power_*` / `pma_sum_*` / `pma_cap` / `pma_total*` are read by older notes only. The texts
+of the languages written here are short and plain, the way the game's own notes talk.
+
     python tools/news_i18n.py
 """
 import json
@@ -21,39 +27,39 @@ LEGACY_CAP = 50  # 2.9.0's, in `pma_total`: the notes it wrote at its limit keep
 # (above the band, below it, near it, the round's limit, the overall limit); {n} is the win rate
 TEXTS = {
     "zh-hans": (
-        "近期胜率约 {n}%，高于 48%–52% 的目标区间。",
-        "近期胜率约 {n}%，低于 48%–52% 的目标区间。",
-        "近期胜率约 {n}%，在 48%–52% 的目标区间附近。",
-        "本次已调到单版上限；如果胜率仍然偏离，下个版本会继续调整。",
-        "累计调整已到 ±{cap}% 的上限。",
+        "近期胜率 {n}%，明显偏高。",
+        "近期胜率 {n}%，明显偏低。",
+        "近期胜率 {n}%。",
+        "这已经是一个版本能调的上限，如果还不够，下个版本继续。",
+        "累计调整已经到顶（±{cap}%）。",
     ),
     "zh-hant": (
-        "近期勝率約 {n}%，高於 48%–52% 的目標區間。",
-        "近期勝率約 {n}%，低於 48%–52% 的目標區間。",
-        "近期勝率約 {n}%，在 48%–52% 的目標區間附近。",
-        "本次已調到單版上限；如果勝率仍然偏離，下個版本會繼續調整。",
-        "累計調整已到 ±{cap}% 的上限。",
+        "近期勝率 {n}%，明顯偏高。",
+        "近期勝率 {n}%，明顯偏低。",
+        "近期勝率 {n}%。",
+        "這已經是一個版本能調的上限，如果還不夠，下個版本繼續。",
+        "累計調整已經到頂（±{cap}%）。",
     ),
     "en": (
-        "Its recent win rate is about {n}%, above the 48–52% target.",
-        "Its recent win rate is about {n}%, below the 48–52% target.",
-        "Its recent win rate is about {n}%, close to the 48–52% target.",
-        "This is the most one patch changes; if the win rate stays off, the next patch adjusts it again.",
-        "Its total adjustment has reached the ±{cap}% limit.",
+        "Recent win rate: {n}%, clearly too high.",
+        "Recent win rate: {n}%, clearly too low.",
+        "Recent win rate: {n}%.",
+        "That is as far as one patch goes; if it is not enough, the next one goes on.",
+        "Its total adjustment has reached its limit (±{cap}%).",
     ),
     "ko": (
-        "최근 승률이 약 {n}%로 목표 구간(48~52%)보다 높습니다.",
-        "최근 승률이 약 {n}%로 목표 구간(48~52%)보다 낮습니다.",
-        "최근 승률이 약 {n}%로 목표 구간(48~52%)에 가깝습니다.",
-        "한 패치에서 조정할 수 있는 최대치입니다. 승률이 계속 벗어나면 다음 패치에서 다시 조정합니다.",
-        "누적 조정이 ±{cap}% 상한에 도달했습니다.",
+        "최근 승률 {n}%, 확실히 높습니다.",
+        "최근 승률 {n}%, 확실히 낮습니다.",
+        "최근 승률 {n}%.",
+        "한 패치에서 조정할 수 있는 최대치입니다. 부족하면 다음 패치에서 이어서 조정합니다.",
+        "누적 조정이 상한(±{cap}%)에 도달했습니다.",
     ),
     "ja": (
-        "最近の勝率は約{n}%で、目標の48〜52%を上回っています。",
-        "最近の勝率は約{n}%で、目標の48〜52%を下回っています。",
-        "最近の勝率は約{n}%で、目標の48〜52%に近い水準です。",
-        "1回のパッチでの調整上限です。勝率が外れたままなら、次のパッチでも調整します。",
-        "累計の調整が±{cap}%の上限に達しました。",
+        "最近の勝率は{n}%と明らかに高め。",
+        "最近の勝率は{n}%と明らかに低め。",
+        "最近の勝率は{n}%。",
+        "1回のパッチで調整できる上限です。足りなければ次のパッチでも続けます。",
+        "累計の調整が上限（±{cap}%）に達しました。",
     ),
     "de": (
         "Die jüngste Siegquote liegt bei etwa {n} % und damit über dem Zielbereich von 48–52 %.",
@@ -135,9 +141,9 @@ TEXTS = {
 }
 # what patch notes say when no champion changed
 NONE = {
-    "zh-hans": "本次版本没有英雄改动：场次足够的英雄，胜率都在 48%–52% 的目标区间内，或者刚调整过、还在等新数值下的比赛。",
-    "zh-hant": "本次版本沒有英雄改動：場次足夠的英雄，勝率都在 48%–52% 的目標區間內，或者剛調整過、還在等新數值下的比賽。",
-    "en": "No champion changes this patch: every champion with enough games is inside the 48–52% win-rate target, or was changed recently and is still gathering games with its new numbers.",
+    "zh-hans": "本次版本没有英雄调整：各位英雄的表现都在合理范围内，或者刚调整过，还在观察新数值下的表现。",
+    "zh-hant": "本次版本沒有英雄調整：各位英雄的表現都在合理範圍內，或者剛調整過，還在觀察新數值下的表現。",
+    "en": "No champion changes this patch: everyone is performing within a healthy range, or was adjusted recently and is still being watched with the new numbers.",
     "ko": "이번 패치에는 챔피언 변경이 없습니다. 경기 수가 충분한 챔피언은 모두 목표 승률 구간(48~52%) 안에 있거나, 최근에 조정되어 새 수치로 치른 경기를 더 기다리고 있습니다.",
     "ja": "今回のパッチではチャンピオンの変更はありません。試合数が十分なチャンピオンはすべて目標勝率（48〜52%）の範囲内にあるか、最近調整されたばかりで新しい数値での試合を待っています。",
     "de": "In diesem Patch gibt es keine Champion-Änderungen: Alle Champions mit genügend Spielen liegen im Zielbereich von 48–52 % Siegquote oder wurden kürzlich angepasst und sammeln noch Spiele mit ihren neuen Werten.",
@@ -155,8 +161,8 @@ NONE = {
 # the power of a change (2.9.0, `balance::reason`: pma_power_<m|p><n>, pma_sum_<m|p><n>): (this patch, this patch
 # when the damage half is 0, in all); {s} {d} {h} {t} are signed numbers (+9, -11), d = s / 2 toward zero, h = s - d
 POWER = {
-    "zh-hans": ("本次强度 {s}%（攻击力、法术强度 {d}%，生命值 {h}%）。", "本次强度 {s}%（生命值 {h}%）。", "累计强度 {t}%。"),
-    "zh-hant": ("本次強度 {s}%（攻擊力、法術強度 {d}%，生命值 {h}%）。", "本次強度 {s}%（生命值 {h}%）。", "累計強度 {t}%。"),
+    "zh-hans": ("这次整体强度 {s}%（攻击、法强 {d}%，生命 {h}%）。", "这次整体强度 {s}%（生命 {h}%）。", "累计 {t}%。"),
+    "zh-hant": ("這次整體強度 {s}%（攻擊、法強 {d}%，生命 {h}%）。", "這次整體強度 {s}%（生命 {h}%）。", "累計 {t}%。"),
     "en": (
         "Power {s}% this patch ({d}% attack and magic power, {h}% health).",
         "Power {s}% this patch ({h}% health).",
@@ -223,11 +229,11 @@ POWER = {
 # an unpicked buff's reason (2.10.0, `balance::reason`: `pma_unpicked`, before its power codes): too few games (fewer
 # than balance::MIN_EVIDENCE) for its win rate to count, a small buff to bring it into play
 UNPICKED = {
-    "zh-hans": "近几个版本很少有人选（场次不到 30 场），先小幅加强，等有了比赛数据再按胜率调整。",
-    "zh-hant": "近幾個版本很少有人選（場次不到 30 場），先小幅加強，等有了比賽數據再按勝率調整。",
-    "en": "Rarely picked in recent patches (fewer than 30 games): a small buff for now; once it has games, its win rate decides.",
-    "ko": "최근 몇 패치 동안 거의 선택되지 않았습니다(30경기 미만). 우선 소폭 상향하고, 경기 데이터가 쌓이면 승률에 따라 조정합니다.",
-    "ja": "ここ数パッチほとんど選ばれていません（30試合未満）。まず小幅に強化し、試合データが集まったら勝率に応じて調整します。",
+    "zh-hans": "近期场次不到 30 场，还看不出真实强度。",
+    "zh-hant": "近期場次不到 30 場，還看不出真實強度。",
+    "en": "Fewer than 30 games lately - too few to judge it yet.",
+    "ko": "최근 경기 수가 30경기 미만이라 아직 판단하기 어렵습니다.",
+    "ja": "最近の試合数は30未満で、まだ実力を判断できません。",
     "de": "In den letzten Patches kaum gewählt (weniger als 30 Spiele): vorerst eine kleine Verstärkung; sobald Spiele vorliegen, entscheidet die Siegquote.",
     "fr": "Rarement choisi lors des derniers patchs (moins de 30 parties) : un petit renforcement pour l'instant ; une fois les parties jouées, son taux de victoire décidera.",
     "es-ES": "Apenas elegido en los últimos parches (menos de 30 partidas): por ahora una pequeña mejora; cuando tenga partidas, decidirá su tasa de victorias.",
@@ -243,9 +249,9 @@ UNPICKED = {
 # a champion whose numbers the player changed in the database (2.11.0, `balance::Reset::Edit`: `pma_custom`, before
 # its power code): this mod's changes come off, it plays the player's numbers and is judged again from its games
 CUSTOM = {
-    "zh-hans": "玩家在数据库里改了它的数值：电竞大脑之前的调整取消，完全按玩家的数值来；之后按新数值打出来的比赛重新判断，正常加强削弱。",
-    "zh-hant": "玩家在資料庫裡改了它的數值：電競大腦之前的調整取消，完全按玩家的數值來；之後按新數值打出來的比賽重新判斷，正常加強削弱。",
-    "en": "The player changed its numbers in the database: this mod's earlier changes are taken off and it plays exactly the player's numbers; the games it plays with them decide its next changes.",
+    "zh-hans": "你在数据库里改过它的数值，之前的平衡调整全部撤回，按你的数值来；之后用新数值打出的比赛会重新评估。",
+    "zh-hant": "你在資料庫裡改過它的數值，之前的平衡調整全部撤回，按你的數值來；之後用新數值打出的比賽會重新評估。",
+    "en": "You changed its numbers in the database: the earlier balance changes are taken back and yours apply; the games it plays with them decide what comes next.",
     "ko": "플레이어가 데이터베이스에서 수치를 바꿨습니다. 이 모드의 이전 조정은 취소되고 플레이어의 수치 그대로 적용되며, 새 수치로 치른 경기에 따라 다시 조정합니다.",
     "ja": "プレイヤーがデータベースで数値を変更しました。このModのこれまでの調整は取り消され、プレイヤーの数値どおりになります。新しい数値での試合をもとに改めて調整します。",
     "de": "Der Spieler hat seine Werte in der Datenbank geändert: Die bisherigen Anpassungen dieses Mods entfallen, es gelten genau die Werte des Spielers; die Spiele damit entscheiden über die nächsten Änderungen.",
@@ -262,9 +268,9 @@ CUSTOM = {
 }
 # a champion `balance_skip` lists (2.11.0, `balance::Reset::Skip`: `pma_skip`): never changed, this mod's changes off
 SKIP = {
-    "zh-hans": "设置里列为不调整（balance_skip）：电竞大脑之前的调整取消，以后也不再调整它。",
-    "zh-hant": "設定裡列為不調整（balance_skip）：電競大腦之前的調整取消，以後也不再調整它。",
-    "en": "Listed as not to be changed (balance_skip): this mod's earlier changes are taken off, and it changes it no more.",
+    "zh-hans": "按你的设置（balance_skip），它之前的调整全部撤回，之后也不会再动它。",
+    "zh-hant": "按你的設定（balance_skip），它之前的調整全部撤回，之後也不會再動它。",
+    "en": "As your settings ask (balance_skip), its earlier changes are taken back and it is left alone from now on.",
     "ko": "설정에서 조정하지 않도록 지정됨(balance_skip): 이 모드의 이전 조정은 취소되고 앞으로도 조정하지 않습니다.",
     "ja": "設定で調整しないよう指定されています（balance_skip）：このModのこれまでの調整は取り消され、今後も調整しません。",
     "de": "Als nicht zu ändern eingetragen (balance_skip): Die bisherigen Anpassungen dieses Mods entfallen, und er ändert ihn nicht mehr.",
@@ -287,9 +293,28 @@ THEME_NAMES = {
     "en": ["fighters", "marksmen", "mages", "supports", "assassins", "tanks"],
 }
 THEME = {
-    "zh-hans": "主题版本「{name}版本」：所有{name}一起加强，之后照常按胜率调整。",
-    "zh-hant": "主題版本「{name}版本」：所有{name}一起加強，之後照常按勝率調整。",
-    "en": "Theme patch, {name}: every one of them is buffed together; later patches judge them by win rate as usual.",
+    "zh-hans": "「{name}版本」到来！所有{name}一同加强，看看这个版本谁能脱颖而出。",
+    "zh-hant": "「{name}版本」到來！所有{name}一同加強，看看這個版本誰能脫穎而出。",
+    "en": "A patch for {name}! Every one of them gets stronger together - let's see who rises to the top.",
+}
+# the power as a line of the notes (2.14.2, `balance::power_row`: `patch.pma_power_stat` is its name, like 攻击力)
+POWER_STAT = {
+    "zh-hans": "整体强度",
+    "zh-hant": "整體強度",
+    "en": "Overall power",
+    "ko": "전체 강도",
+    "ja": "総合的な強さ",
+    "de": "Gesamtstärke",
+    "fr": "Puissance globale",
+    "es-ES": "Fuerza general",
+    "pt-BR": "Força geral",
+    "it": "Potenza complessiva",
+    "ru": "Общая сила",
+    "pl": "Ogólna siła",
+    "tr": "Genel güç",
+    "nl": "Totale kracht",
+    "vi": "Sức mạnh tổng thể",
+    "th": "พลังโดยรวม",
 }
 # the game's languages (as package/text/ui.i18n); the ones without their own texts take English
 LANGUAGES = ["ko", "en", "ja", "de", "vi", "pt-BR", "tr", "nl", "ru", "es-ES", "fr", "it", "zh-hans", "zh-hant", "pl", "th", "haw"]
@@ -327,7 +352,10 @@ def reasons(lang):
 
 def main():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-    doc = {lang: {"patch": {"pma_none": NONE.get(lang, NONE["en"]), "reason": reasons(lang)}} for lang in LANGUAGES}
+    doc = {
+        lang: {"patch": {"pma_none": NONE.get(lang, NONE["en"]), "pma_power_stat": POWER_STAT.get(lang, POWER_STAT["en"]), "reason": reasons(lang)}}
+        for lang in LANGUAGES
+    }
     path = os.path.join(root, "package", "text", "news.i18n")
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)

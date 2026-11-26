@@ -47,12 +47,45 @@ pub const ICON_SHEET: &str = "asset/base/aseprite_resources/ingame/item_icons_18
 /// An item's icon in a text, drawn the way the game's texts draw its stat icons (`<i#sheet:frame>`). Empty when the
 /// item names no icon (or a name a text tag cannot hold).
 pub fn icon_text(icon: &str) -> String {
-    let fits = !icon.is_empty() && icon.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if fits {
+    if icon_fits(icon) {
         format!("<i#{ICON_SHEET}:{icon}>")
     } else {
         String::new()
     }
+}
+
+/// 图标的帧名能不能直接写进界面（字母、数字、下划线、减号）
+pub fn icon_fits(icon: &str) -> bool {
+    !icon.is_empty() && icon.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 选人界面的属性图标（4+6 的那张图集）：补丁里每行数值前面画它
+pub const STAT_ICONS: &str = "asset/base/ui/banpick/champion_stat_icon";
+
+/// 一个数值字段在 [`STAT_ICONS`] 里的帧，没有就是 None
+pub fn stat_icon(field: &str) -> Option<&'static str> {
+    Some(match field {
+        "attack" => "ad_0",
+        "magic_power" => "ap_0",
+        "defence" => "armor_0",
+        "hp" => "hp_0",
+        "hp_regen" => "hp_regen_0",
+        "attack_speed_mult" => "attack_speed_0",
+        "skill_cooldown_mult" => "cdr_0",
+        "crit_chance" => "crit_chance_0",
+        "move_speed_mult" => "speed_0",
+        "vamp" => "vamp_0",
+        "defence_penetration" => "armor_pen_0",
+        "magic_resistance_penetration" => "magic_pen_0",
+        "toughness" => "tenacity_0",
+        "range" => "range_0",
+        _ => return None,
+    })
+}
+
+/// 属性图标写成富文本（放在一行数值前面），没有图标就是空的
+pub fn stat_icon_text(field: &str) -> String {
+    stat_icon(field).map_or(String::new(), |f| format!("<i#{STAT_ICONS}:{f}>"))
 }
 
 macro_rules! stat_table {
@@ -473,14 +506,21 @@ pub struct Inputs {
     pub names: BTreeMap<String, String>,
 }
 
+/// 一件装备的数值改不改得动：至少有一个能加能减的（[`STATS`] 里 signed 的）
+pub fn changeable(item: &Item) -> bool {
+    item.stats.iter().any(|(i, _)| STATS[*i].1)
+}
+
 /// The inputs from the builds and the catalog (None: either missing).
 pub fn inputs() -> Option<Inputs> {
     let (builds, cat) = (builds()?, catalog()?);
     let used: HashSet<&String> = builds.values().flatten().collect();
+    // 改得动的才算（2.14.2）：至少有一个能加能减的数值。「不朽之路」一个数值都没有、「灵能使之靴」只有只能加的，
+    // 以前也会被挑中，补丁里写了 +20% 其实什么都没变
     let names = used
         .into_iter()
         .filter(|k| cat.identifiable(k))
-        .filter_map(|k| Some((k.clone(), cat.item(k)?.1.name.clone())))
+        .filter_map(|k| cat.item(k).filter(|(_, item)| changeable(item)).map(|(_, item)| (k.clone(), item.name.clone())))
         .collect();
     Some(Inputs { builds, names })
 }
@@ -523,14 +563,19 @@ pub fn at(v: f64, p: i32, signed: bool) -> f64 {
 /// An item's numbers before and after a change (`before` -> `after` percent of power), as the notes give them:
 /// (label, from, to) for each number that moves - an unsigned one only while it is above the item's own.
 pub fn lines(item: &Item, before: i32, after: i32, chinese: bool) -> Vec<Line> {
+    field_lines(item, before, after, chinese).into_iter().map(|(_, label, from, to)| (label, from, to)).collect()
+}
+
+/// [`lines`] 带上数值的字段名（找属性图标用，[`stat_icon`]）：(字段, 名字, 改前, 改后)
+pub fn field_lines(item: &Item, before: i32, after: i32, chinese: bool) -> Vec<(&'static str, String, String, String)> {
     let mut out = Vec::new();
     for (i, v) in &item.stats {
-        let (_, signed, zh, en) = STATS[*i];
+        let (field, signed, zh, en) = STATS[*i];
         let (from, to) = (at(*v, before, signed), at(*v, after, signed));
         if (from - to).abs() < 0.5 {
             continue;
         }
-        out.push(((if chinese { zh } else { en }).to_string(), crate::balance::number(from), crate::balance::number(to)));
+        out.push((field, (if chinese { zh } else { en }).to_string(), crate::balance::number(from), crate::balance::number(to)));
     }
     out
 }
@@ -558,6 +603,18 @@ mod tests {
         let mut b = BuffV1::named(name);
         f(&mut b);
         (name.to_string(), b)
+    }
+
+    #[test]
+    fn an_item_without_a_number_that_can_move_is_no_candidate() {
+        let cat = Catalog::parse(r#"{"version": 1, "sourceModId": "alele_runes_and_items", "items": [
+            {"gameKey": "a", "name": "无数值", "tier": 5, "itemKind": "equipment", "packageValues": {"stats": {}}},
+            {"gameKey": "b", "name": "只能加", "tier": 5, "itemKind": "equipment", "packageValues": {"stats": {"toughness": 25}}},
+            {"gameKey": "c", "name": "能改", "tier": 5, "itemKind": "equipment", "packageValues": {"stats": {"attack": 40, "toughness": 25}}}
+        ]}"#)
+        .unwrap();
+        let ok: Vec<bool> = ["a", "b", "c"].iter().map(|k| cat.item(k).is_some_and(|(_, item)| changeable(item))).collect();
+        assert_eq!(ok, [false, false, true]);
     }
 
     #[test]

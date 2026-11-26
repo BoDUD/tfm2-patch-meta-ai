@@ -54,6 +54,16 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.14.2：补丁说明照官方的写法
+
+用户：「现在英雄平衡补丁的文字说明太僵硬没有之前官方的那种文字的味道 装备的平衡补丁现在文字显示排版很差 而且数值在局内能改了 你还写上去 排版参考官方英雄补丁那种排版是不是更美观」。
+
+- **英雄的理由**：以前每个英雄的理由是三四行统计腔（「近期胜率约 56%，高于 48%–52% 的目标区间。」「本次强度 -10%（攻击力、法术强度 -5%，生命值 -5%）。」「累计强度 -30%。」「本次已调到单版上限……」），游戏把每个代码排成一行，堆在属性前面。现在第一行是游戏自己的理由（`patch.reason.*`，游戏里 17 种语言都有）：削弱按定位挑「输出过强 / 坦度过高 / 回复过强 / 后期过强」，加强挑「输出不足 / 太脆 / 回复不足 / 后期乏力」，上一两轮也往同一个方向调的用「强势太久 / 一直萎靡」，冷门加强用「几乎看不到身影」（连着两轮就是「阔别竞技舞台太久」），每样三种说法按英雄和轮次挑一种（`balance::official_reason`）。只挑和电竞大脑知道的事对得上的：没统计禁选率，就不用「长期占据ban/pick榜首」「无人问津」。定位看英雄联盟的阵容画像（前排、保护、后期大核），没有画像的看游戏职业（坦克、辅助），其余算输出（`balance::kind_of`）。第二行是短的「近期胜率 56%，明显偏高。」（冷门加强是「近期场次不到 30 场」）。
+- **整体强度是一行**：不再写在理由里，而是和攻击力一样写成补丁的第一行「整体强度: -10% → -20%」（`balance::power_row`，`patch.pma_power_stat`）。撤回调整、主题版本照旧写自己的话，文字改得更口语。
+- **装备**：收件箱的装备新闻照官方英雄补丁排版——先「增强」后「削弱」，每件装备一段：图标和粗体名字、一句官方口吻的理由（带上出它的英雄的胜率）、一行一个数值「攻击力: 75 → 69」（属性图标，改后的数字带颜色）、最后整体强度。删掉了「装备说明里显示的仍是原来的数值」（2.12.1 起百科和战术界面就显示改后的数值）。百科「补丁历史」里电竞大脑那一块也照官方英雄条目画：左增强右削弱两栏，36×36 的图标格子和名字、竖线边上的理由（官方理由行的灰）和一行行改动，尺寸和颜色抄游戏的 `news_component/patch_*` 布局；块还在英雄列表下面，项多了块里自己滚动。
+- **改不动的装备不再挑**：「不朽之路」一个数值都没有、「灵能使之靴」只有只能加的数值，以前也会被挑来调整（补丁写了 +20%，其实什么都没变）；现在至少有一个能加能减的数值才算候选（`items::changeable`）。
+- 已经写进存档的旧补丁公告不改结构，旧代码的文字换成了更短的说法；新写法从下一个平衡补丁开始。百科里的装备块是按账本画的，装上就是新排版。`balance::tests::preview_notes_on_a_book`（`--ignored`，PMA_BOOK / PMA_ITEMS / PMA_PREVIEW_OUT）用真实账本预览新写法。
+
 ## 2.14.1：第二轮禁人补上游戏漏给的选人
 
 用户：「还有这问题 我新开的一把明显还是选了ADC 还在 ban」。2.14.0 的那一把：我们前三手里有卡莎，对方前三手希瓦娜、阿克尚、奎因，托管第二轮还是禁了克格莫和赛娜，对方 AI 第二轮禁了射手麦迪。
@@ -384,6 +394,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.14.2 (the user: the balance notes read "stiff, without the official notes' flavour", and the item patch is laid out badly): each changed champion's reason starts with one of the game's own `patch.reason.*` lines (every language), chosen by direction, role (`balance::kind_of`: League's composition profile - frontline, peel, late carry - else the game's class) and whether the last one or two rounds changed it the same way (`nerf_meta` / `buff_meta`, only the lines that match what the mod knows), then a short win-rate line; the overall power is a line of the notes (`patch.pma_power_stat`, before -> after), so the old power and limit codes stay for older notes only. The item news is laid out like the champions' notes (buffs, nerfs, each item: icon and bold name, a reason, one number a line, the overall power) without the stale "the tooltips still show the old numbers"; the encyclopedia's patch-history block draws the items as the game draws champions (two columns, an icon box, a rule, reason and change rows; the game's `news_component/patch_*` sizes and colours) in a scroll view of its own. Items with no number that can move (no stats, or unsigned ones only) are no candidates any more.
 
 2.14.1 (the user: "still this - in the new game it clearly took an ADC and still bans them"): the coach's second-phase ban board in that draft treated the enemy's top, bottom and support as open with three enemy picks in (Shyvana, Akshan, Quinn), and banning Kog'Maw "took 0.040 from us" with Kai'Sa already ours - the draft context the game passes to the hooks in the second ban phase of a 3+2 draft misses picks (the phase-1 turns and the later picks always matched the panel, "as on the panel"; the second ban phase never did). `draft::picks_seen` keeps each draft's picks per pair of teams - every pick the game listed at any call plus the picks the coach / AI BP decided for either side (the game takes a hook's decision) - and adds the ones a call's lists leave out (five a team at most), for the coach and AI BP alike. A draft starts over with no bans and no picks, when the ban count falls below half the most seen, or after three minutes without a call, so one game's picks never carry into the next. diag.log: each coach ban writes `[coach] the draft as the game lists it: ours [...], theirs [...], N bans` and what was put back; AI BP in the player's match writes a line when it put something back.
 
