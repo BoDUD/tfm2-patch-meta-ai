@@ -152,6 +152,53 @@ pub fn dir() -> Option<PathBuf> {
     Some(crate::paths::mod_dir().parent()?.join(MOD_ID))
 }
 
+/// 锁位置的分路文件（锁位置 1.3.78 起写）：屏幕上这一局它给每支队排的分路
+pub const SEATED: &str = "seated.json";
+
+/// 锁位置在屏幕上这一局给一支队排的分路：按选人顺序的英雄，和每个位置（`Role::index`）坐的是第几手；
+/// `by_lane` 是 `None` 时锁位置没排，留给了游戏（看不到怎么排的）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seated {
+    pub picks: Vec<String>,
+    pub by_lane: Option<[usize; 5]>,
+}
+
+/// 每个分路格子（位置 `slots[j]`）坐第几手（`order[j]`）换成每个位置坐第几手；五个格子、五手都得齐，不重复
+pub fn by_lane_of(slots: &[usize], order: &[usize]) -> Option<[usize; 5]> {
+    if slots.len() != 5 || order.len() != 5 {
+        return None;
+    }
+    let mut out = [usize::MAX; 5];
+    for (lane, pick) in slots.iter().zip(order) {
+        if *lane >= 5 || *pick >= 5 || out[*lane] != usize::MAX || out.contains(pick) {
+            return None;
+        }
+        out[*lane] = *pick;
+    }
+    Some(out)
+}
+
+/// `seated.json` 的内容：`{"seated": [{"team", "picks", "slots", "order"}]}`，`order` 是 null 就是没排
+pub fn parse_seated(text: &str) -> Vec<Seated> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Vec::new() };
+    let Some(list) = v.get("seated").and_then(|l| l.as_array()) else { return Vec::new() };
+    let numbers = |e: &serde_json::Value, key: &str| -> Option<Vec<usize>> {
+        e.get(key)?.as_array()?.iter().map(|n| n.as_u64().and_then(|n| usize::try_from(n).ok())).collect()
+    };
+    list.iter()
+        .filter_map(|e| {
+            let picks: Vec<String> = e.get("picks")?.as_array()?.iter().map(|p| p.as_str().map(str::to_string)).collect::<Option<_>>()?;
+            let by_lane = numbers(e, "slots").zip(numbers(e, "order")).and_then(|(slots, order)| by_lane_of(&slots, &order));
+            Some(Seated { picks, by_lane })
+        })
+        .collect()
+}
+
+/// 读锁位置文件夹里的 `seated.json`（没有这个文件就是空的）
+pub fn seated() -> Vec<Seated> {
+    dir().and_then(|d| std::fs::read(d.join(SEATED)).ok()).map(|b| parse_seated(&String::from_utf8_lossy(&b))).unwrap_or_default()
+}
+
 fn read(dir: &Path) -> Option<Table> {
     let text = |name: &str| std::fs::read(dir.join(name)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
     let settings = text("settings.ini")?;
@@ -225,6 +272,25 @@ pub fn set(table: Option<Table>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2.14.5：锁位置写的分路，按位置读回来；没排的、不是五个一组的都当作不知道
+    #[test]
+    fn reads_the_locks_seating_by_lane() {
+        let text = r#"{"seated": [
+            {"team": 12, "picks": ["a", "b", "c", "d", "e"], "slots": [0, 1, 2, 3, 4], "order": [1, 0, 2, 4, 3]},
+            {"team": 19, "picks": ["f", "g", "h", "i", "j"], "slots": [0, 1, 2, 3, 4], "order": null},
+            {"team": 7, "picks": ["k", "l", "m", "n", "o"], "slots": [0, 1, 2, 3, 4], "order": [0, 0, 1, 2, 3]},
+            {"team": 8, "picks": ["p", "q", "r", "s", "t"], "slots": [4, 3, 2, 1, 0], "order": [0, 1, 2, 3, 4]}]}"#;
+        let s = parse_seated(text);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0].picks[0], "a");
+        assert_eq!(s[0].by_lane, Some([1, 0, 2, 4, 3]));
+        assert_eq!(s[1].by_lane, None, "left to the game");
+        assert_eq!(s[2].by_lane, None, "the same pick twice");
+        assert_eq!(s[3].by_lane, Some([4, 3, 2, 1, 0]), "slots in another order: by lane");
+        assert!(parse_seated("not json").is_empty());
+        assert!(parse_seated("{}").is_empty());
+    }
 
     #[test]
     fn reads_the_locks_table_and_switches() {

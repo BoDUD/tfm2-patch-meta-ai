@@ -278,6 +278,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     let keys = ui.keys_pressed();
     let snapshot = crate::shared::get();
     time(Part::Explore, || st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"), &keys));
+    // 这一帧的点击：选人界面的换位也要看（2.14.5），所以先取
+    let clicks = take_clicks();
     if cfg.draft_overlay {
         let view = draft_screen::View {
             team_name: &st.context.team_name,
@@ -288,13 +290,16 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             lane_tags: cfg.lane_tags,
             panel_opacity: cfg.panel_opacity,
         };
-        time(Part::Draft, || st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view));
+        time(Part::Draft, || {
+            // 换位阶段跟着玩家的点击记谁坐哪（2.14.5）
+            st.draft.follow_swaps(ui, &clicks);
+            st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view)
+        });
     } else {
         crate::draft::set_live(ui.exists(draft_screen::GRID));
     }
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
-    let clicks = take_clicks();
     let f = Frame {
         frame,
         snapshot: snapshot.as_deref(),

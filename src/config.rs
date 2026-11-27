@@ -98,12 +98,9 @@ pub struct Config {
     pub objective_baron: (f32, f32),
     pub objective_step: i32,
     pub objective_max: i32,
-    /// 主题版本（2.14.0，`crate::theme`）：每几个游戏版本出一次（0 = 不出），那一类加强多少（百分比）；补丁日前发预告
+    /// 主题版本（2.14.0，`crate::theme`）：每几个游戏版本出一次（0 = 不出），那一类加强多少（百分比）
     pub balance_theme_every: u32,
     pub balance_theme_step: i32,
-    pub patch_preview: bool,
-    /// 你的比赛前后的前瞻和复盘新闻（2.14.0，`crate::stories`）
-    pub match_stories: bool,
     /// AI 战队的风格（2.14.0，`crate::styles`）：照风格选人每一手最多让出多少胜率点（0 = 不用风格）
     pub ai_style: f32,
     pub tier_list: Switch,
@@ -211,8 +208,6 @@ impl Default for Config {
             objective_max: crate::objectives::DEFAULT_TARGETS.max,
             balance_theme_every: 3,
             balance_theme_step: 8,
-            patch_preview: true,
-            match_stories: true,
             ai_style: 1.0,
             tier_list: Switch::Auto,
             patches: 12.0,
@@ -382,11 +377,9 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "objective_baron" => cfg.objective_baron = range(value, 5.0, 900.0)?,
         "objective_step" => cfg.objective_step = number(value)?.round().clamp(1.0, 50.0) as i32,
         "objective_max" => cfg.objective_max = number(value)?.round().clamp(0.0, 300.0) as i32,
-        // 2.14.0：主题版本、补丁预告、比赛新闻、AI 风格
+        // 2.14.0：主题版本、AI 风格（补丁预告、比赛新闻 2.14.5 删了）
         "balance_theme_every" => cfg.balance_theme_every = number(value)?.round().clamp(0.0, 20.0) as u32,
         "balance_theme_step" => cfg.balance_theme_step = number(value)?.round().clamp(1.0, 30.0) as i32,
-        "patch_preview" => cfg.patch_preview = flag(value)?,
-        "match_stories" => cfg.match_stories = flag(value)?,
         "ai_style" => cfg.ai_style = number(value)?.clamp(0.0, 5.0),
         "item_balance_skip" => cfg.item_balance_skip = crate::edits::list(value),
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
@@ -638,7 +631,7 @@ pub fn summary(c: &Config) -> String {
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
          item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}] \
          objective_balance={} objective_length={}-{} objective_drake={}-{} objective_baron={}-{} objective_step={} objective_max={} \
-         balance_theme_every={} balance_theme_step={} patch_preview={} match_stories={} ai_style={}",
+         balance_theme_every={} balance_theme_step={} ai_style={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -713,8 +706,6 @@ pub fn summary(c: &Config) -> String {
         c.objective_max,
         c.balance_theme_every,
         c.balance_theme_step,
-        if c.patch_preview { "on" } else { "off" },
-        if c.match_stories { "on" } else { "off" },
         c.ai_style
     )
 }
@@ -896,22 +887,12 @@ objective_max=100
 ;                调整，版本风向隔一段时间变一次。0 = 不出主题。要先开 balance。
 balance_theme_every=3
 balance_theme_step=8
-; patch_preview : a news item a couple of game days before each game patch with what the balance
-;                patch plans to change (the matches until then may still change it).
-; patch_preview : 补丁日前两天左右发一条「补丁预告」新闻，写平衡补丁计划改什么（之后的比赛还可能让它变）。
-patch_preview=on
-; match_stories : a preview news item on the day of each of your matches (form, head to head, the
-;                opponent's style and likely bans) and a review after it (score, each game's kills, gold,
-;                drakes and Baron, the MVP).
-; match_stories : 你的每场比赛当天发一条赛前前瞻（近况、交手记录、对方风格、可能针对你的禁用），打完发一条赛后复盘
-;                （比分、每局的击杀经济和小龙大龙、MVP）。
-match_stories=on
 ; ai_style : with ai_bp, every AI team keeps a style of its own from its matches (dive, poke,
 ;                late game, its favourite classes ...) and picks toward it, giving up at most this many
-;                win-rate points a pick for it. 0 = no styles, up to 5. Its style shows in the previews
-;                and on the ban/pick screen.
+;                win-rate points a pick for it. 0 = no styles, up to 5. Its style shows on the ban/pick
+;                screen.
 ; ai_style : 开着 ai_bp 时，每支 AI 队按自己过去的比赛形成固定的风格（开团、消耗、后期、偏爱哪类英雄……），选人往
-;                风格上靠，每一手最多为此让出这么多胜率点。0 = 不用风格，最大 5。对方风格写在赛前前瞻和 BP 界面上。
+;                风格上靠，每一手最多为此让出这么多胜率点。0 = 不用风格，最大 5。对方风格写在 BP 界面上。
 ai_style=1
 tier_list=auto
 

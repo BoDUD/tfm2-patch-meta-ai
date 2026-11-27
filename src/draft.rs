@@ -28,9 +28,10 @@
 //! Position locks are another mod's job (Smart Position Lock): its "out of reach" score
 //! (`Replace`, at priority 10000 - after this hook, [`PRIORITY`]) replaces whatever was added
 //! here. Game 0.6.4 also adds a `Position` phase after an AI team's last pick, where a hook's
-//! `decide_positions` may reassign the lanes and the last hook that decides wins: this hook
-//! keeps the trait's default (`None`), so the lanes stay with the game or Smart Position Lock.
-//! The score hooks never see that phase.
+//! `decide_positions` may reassign the lanes and the last hook that decides wins. 2.14.5: the
+//! coach hook ([`seat_decide`]) seats an AI team itself when `ai_bp` is on and no position lock
+//! seats it (Smart Position Lock with its AI switch on keeps doing it), and notes for the ban/pick
+//! screen where each team's champions sit. The score hooks never see that phase.
 //!
 //! `diag.log` gets the first decisions of a game session (`[draft]` lines): the line-ups the
 //! game handed over, and for the best candidates their value, the players' part of it and what
@@ -105,6 +106,10 @@ impl StableDraftHook for CoachHook {
 
     fn decide_pick(&self, ctx: &StableDraftContext<'_>) -> Option<usize> {
         coach_decide(ctx, false).or_else(|| ai_decide(ctx, false))
+    }
+
+    fn decide_positions(&self, ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
+        seat_decide(ctx)
     }
 }
 
@@ -831,6 +836,104 @@ pub fn decision(v: f32) -> StableDraftDecision {
     } else {
         StableDraftDecision::Pass
     }
+}
+
+// ---------------------------------------------------------------------------------- 分路
+
+/// 别的比赛（不在屏幕上）的分路最多写这么多行日志（每次启动游戏）；屏幕上这一局全写
+const SEAT_OFF_SCREEN_LINES: u32 = 6;
+static SEAT_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+/// 谁给这支队排分路
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Seater {
+    /// 锁位置（开着 AI 分路，它的钩子在这个前面）
+    Lock,
+    /// 别的位置锁 Mod：不知道它怎么排
+    OtherLock(&'static str),
+    /// 电竞大脑自己
+    This,
+    /// 游戏自己
+    Game,
+}
+
+/// 选完人以后的分路（2.14.5，游戏 0.6.4 起的 `Position` 阶段）。游戏把每支队的英雄按分路挪到各个选手的格子
+/// （上单、打野、中单、下路、辅助）里，选人界面上的原画就跟着挪了；以前电竞大脑的标签按选人顺序对格子，挪过以后
+/// 写的就是别的英雄（用户：「我移动到哪个位置后应该显示当前位置的胜率吧」）。所以屏幕上这一局每次分路都记下谁坐哪
+/// （[`shared::set_seated`]），选人界面照着画：
+/// - 锁位置排（开着它的 AI 分路）：不插手，读它刚写的 `seated.json`（锁位置 1.3.78 起写）；
+/// - 没有位置锁排、开着 `ai_bp` 的 AI 队：电竞大脑自己排（用户选的「电竞大脑来排」），按模型最好的坐法
+///   （[`crate::plan::best_seating`]：这一路的强度，加上这名选手对它的熟练度）；
+/// - 其他（玩家自己的队、`ai_bp` 关着、别的位置锁）：留给游戏或那个 Mod，记下「不知道」。
+pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
+    if ctx.is_explore() {
+        return None;
+    }
+    let names: Vec<String> = ctx.ally_picks().iter().map(|g| ctx.champion_name(*g).map(str::to_string)).collect::<Option<_>>()?;
+    let slots: Vec<usize> = ctx.slot_lanes().iter().map(|l| l.code() as usize).collect();
+    let team = ctx.ally_team();
+    let player_team = shared::player_team();
+    let player = team.is_some() && team == player_team;
+    // 屏幕上这一局：玩家的队或它的对手
+    let live = LIVE.load(Ordering::Relaxed) && player_team.is_some() && (player || ctx.enemy_team() == player_team);
+    let cfg = config::get();
+    let seater = if crate::lock::get().is_some_and(|t| t.ai) {
+        Seater::Lock
+    } else if let Some(other) = crate::compat::get().position_lock().filter(|m| *m != "Smart Position Lock") {
+        Seater::OtherLock(other)
+    } else if !player && cfg.ai_bp {
+        Seater::This
+    } else {
+        Seater::Game
+    };
+    let order = if seater == Seater::This { own_seating(ctx, &names, &slots) } else { None };
+    let by_lane = match seater {
+        Seater::This => order.as_deref().and_then(|o| crate::lock::by_lane_of(&slots, o)),
+        // 锁位置的钩子在前面，已经写好了
+        Seater::Lock if live => crate::lock::seated().into_iter().rev().find(|s| s.picks == names).and_then(|s| s.by_lane),
+        _ => None,
+    };
+    if live {
+        shared::set_seated(names.clone(), by_lane);
+    }
+    let logged = SEAT_LOGGED.load(Ordering::Relaxed);
+    if live || logged < SEAT_OFF_SCREEN_LINES {
+        if !live {
+            SEAT_LOGGED.fetch_add(1, Ordering::Relaxed);
+        }
+        let seats = |b: &[usize; 5]| {
+            b.iter().enumerate().map(|(lane, p)| format!("{} {}", Role::ALL[lane].name(), names.get(*p).map_or("?", String::as_str))).collect::<Vec<_>>().join(", ")
+        };
+        let how = match (seater, by_lane) {
+            (Seater::This, Some(b)) => format!("seated by this mod: {}", seats(&b)),
+            (Seater::This, None) => "left to the game (the model does not know every champion)".to_string(),
+            (Seater::Lock, Some(b)) => format!("Smart Position Lock seats it: {}", seats(&b)),
+            (Seater::Lock, None) if live => "Smart Position Lock seats it, but its seated.json does not say how (a lock before 1.3.78?): the tags under these picks are off".to_string(),
+            (Seater::Lock, None) => "Smart Position Lock seats it".to_string(),
+            (Seater::OtherLock(m), _) => format!("{m} seats it: not known how"),
+            (Seater::Game, _) => "left to the game: not known how".to_string(),
+        };
+        let place = if live { "" } else { "(off screen) " };
+        let who = team.map_or_else(|| "a team".to_string(), |t| format!("team #{t}{}", if player { " (yours)" } else { "" }));
+        diag::log(&format!("[seat] {place}{who}: picks {} -> {how}", names.join(", ")));
+    }
+    order
+}
+
+/// 电竞大脑给一支 AI 队排的分路：每个分路格子坐第几手（`ctx.ally_picks` 的下标）；模型不认识的英雄就不排
+fn own_seating(ctx: &StableDraftContext<'_>, names: &[String], slots: &[usize]) -> Option<Vec<usize>> {
+    let snapshot = shared::get()?;
+    let meta = &snapshot.meta;
+    let champs: Vec<u16> = names.iter().map(|n| meta.names.get(n)).collect::<Option<_>>()?;
+    if slots.len() != champs.len() || slots.iter().any(|l| *l >= Role::ALL.len()) {
+        return None;
+    }
+    // 选手按分路格子的顺序；不知道的就只看这一路的强度
+    let athletes = ctx.ally_athletes();
+    let seats: Vec<crate::plan::Seat> =
+        slots.iter().enumerate().map(|(j, lane)| (Role::ALL[*lane], athletes.get(j).and_then(|a| u32::try_from(*a).ok()))).collect();
+    let (perm, _) = crate::plan::best_seating(meta, &champs, &seats, &crate::ui::athlete_infos())?;
+    perm.iter().map(|c| champs.iter().position(|x| x == c)).collect()
 }
 
 // ---------------------------------------------------------------------------------- diag.log
@@ -1588,6 +1691,81 @@ mod tests {
         shared::set_player_team(None);
         shared::clear();
         crate::reset_for_tests();
+    }
+
+    /// 2.14.5：分路。开着 ai_bp、没有位置锁时 AI 队由电竞大脑排（模型最好的坐法），记下谁坐哪；玩家的队留给游戏
+    /// （记「不知道」）；锁位置开着 AI 分路时不插手，照它写的 seated.json 记
+    #[test]
+    fn ai_teams_are_seated_and_noted() {
+        use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
+        let _serial = crate::tests::serial();
+        let root = std::env::temp_dir().join(format!("patch_meta_ai_seat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(crate::MOD_ID);
+        let lock_dir = root.join(crate::lock::MOD_ID);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&lock_dir);
+        std::env::set_var(crate::paths::DIR_ENV, &dir);
+        crate::reset_for_tests();
+        let names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
+        let briefs: Vec<ChampionBriefV1> =
+            names.iter().map(|n| ChampionBriefV1 { name: StrV1::from_str(n), ..Default::default() }).collect();
+        let game_id = |n: &str| names.iter().position(|x| x == n).unwrap();
+        let theirs: Vec<usize> = ["a", "b", "c", "d", "e"].iter().map(|n| game_id(n)).collect();
+        let ours: Vec<usize> = ["f", "g", "h", "i", "j"].iter().map(|n| game_id(n)).collect();
+        let lanes: Vec<u32> = vec![0, 1, 2, 3, 4];
+        let ctx_for = |team: usize, enemy: usize, picks: &[usize]| {
+            // SAFETY: a plain C struct; every pointer set below outlives the calls
+            let mut raw: DraftCtxV1 = unsafe { std::mem::zeroed() };
+            raw.size = std::mem::size_of::<DraftCtxV1>();
+            raw.phase = DraftPhaseV1::Position.code();
+            raw.ally_pick_ptr = picks.as_ptr();
+            raw.ally_pick_len = picks.len();
+            raw.slot_lanes_ptr = lanes.as_ptr();
+            raw.slot_lanes_len = lanes.len();
+            raw.champion_briefs_ptr = briefs.as_ptr();
+            raw.champion_briefs_len = briefs.len();
+            raw.ally_team = team;
+            raw.enemy_team = enemy;
+            raw
+        };
+        let seat = |raw: &DraftCtxV1| {
+            // SAFETY: `raw` lives for the call
+            CoachHook.decide_positions(&unsafe { StableDraftContext::from_raw(raw) }.unwrap())
+        };
+        let ai_picks = ["a", "b", "c", "d", "e"];
+        shared::publish(snapshot());
+        shared::set_player_team(Some(19));
+        set_live(true);
+        let ai = ctx_for(12, 19, &theirs);
+        assert_eq!(seat(&ai), None, "ai_bp off: the game seats them");
+        assert_eq!(shared::seated(&ai_picks), Some(None), "noted: not known how");
+        config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
+        let order = seat(&ai).expect("seated by the model");
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4], "one pick a slot");
+        assert_eq!(shared::seated(&ai_picks), Some(crate::lock::by_lane_of(&[0, 1, 2, 3, 4], &order)), "noted by lane");
+        // the player's own team: never seated by this mod
+        assert_eq!(seat(&ctx_for(19, 12, &ours)), None);
+        assert_eq!(shared::seated(&["f", "g", "h", "i", "j"]), Some(None));
+        // Smart Position Lock seats AI teams: left to it, and its seated.json says how
+        crate::lock::set(Some(crate::lock::Table { ai: true, ..Default::default() }));
+        std::fs::write(
+            lock_dir.join(crate::lock::SEATED),
+            r#"{"seated": [{"team": 12, "picks": ["a", "b", "c", "d", "e"], "slots": [0, 1, 2, 3, 4], "order": [4, 3, 2, 1, 0]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(seat(&ai), None, "the lock's seating stands");
+        assert_eq!(shared::seated(&ai_picks), Some(Some([4, 3, 2, 1, 0])));
+        set_live(false);
+        let log = std::fs::read_to_string(dir.join(diag::LOG_FILE)).unwrap();
+        assert!(log.contains("[seat] team #12: picks a, b, c, d, e -> seated by this mod: Top"), "{log}");
+        assert!(log.contains("Smart Position Lock seats it: Top e, Jungle d, Mid c, Bottom b, Support a"), "{log}");
+        shared::set_player_team(None);
+        shared::clear();
+        crate::reset_for_tests();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 2.14.0：风格只在差不多好的几个里挑。给一个弱一点的英雄风格加分：margin 够大就选它，0 就还是最强的

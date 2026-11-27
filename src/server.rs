@@ -43,12 +43,6 @@ pub const NEXT_PATCH: &str = "{NEXT_PATCH}";
 /// (2.8.3, [`save_id`]) names its files in the mod folder.
 pub const BALANCE_BOOK: &str = "balance_book";
 pub const BOOK_RESULT: &str = "balance_book_result";
-/// 发一条新闻（2.14.0：补丁预告、赛前前瞻、赛后复盘），同一个 key 一个存档只发一次；回 `<key>\t<ok|fail>\t<说明>`
-pub const PUSH_NEWS: &str = "pma_push_news";
-pub const NEWS_RESULT: &str = "pma_push_news_result";
-/// 存档里记着发过的新闻 key（最近 [`STORIES_KEPT`] 个）
-const STORIES_DONE: &str = "pma_stories_done";
-const STORIES_KEPT: usize = 400;
 /// The save's own auto-patcher values while the balance has them off, the newest round put in the news, the author
 /// the mod's news items were last renamed to, the id of the save's book, and the news fix-ups done.
 const AUTOPATCH_KEPT: &str = "pma_balance_autopatch";
@@ -90,18 +84,6 @@ impl StableServerExtension for ServerExt {
             let save = save_id(ctx);
             let message = format!("{}\t{done}\t{}", id.unwrap_or_default(), save.unwrap_or_default());
             ctx.emit_event(cmd.reply_target(), BOOK_RESULT, message.as_bytes());
-            return CommandResultV1::Handled;
-        }
-        if cmd.command == PUSH_NEWS {
-            let (key, ok, said) = match NewsRequest::parse(cmd.payload) {
-                Ok(req) => {
-                    let (ok, said) = push_story(ctx, &req);
-                    (req.key, ok, said)
-                }
-                Err(why) => (String::new(), false, why),
-            };
-            let message = format!("{key}\t{}\t{said}", if ok { "ok" } else { "fail" });
-            ctx.emit_event(cmd.reply_target(), NEWS_RESULT, message.as_bytes());
             return CommandResultV1::Handled;
         }
         if cmd.command == PREPARE_BALANCE {
@@ -351,41 +333,6 @@ pub struct BalanceRequest {
     /// 塔和龙的改动也单独一条新闻（2.13.0，`objectives::news`）
     #[serde(default)]
     pub objectives_news: Option<(String, String)>,
-}
-
-/// 一条新闻（2.14.0）：发给哪支队、存档里认它的 key、标题和内容
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct NewsRequest {
-    pub team: usize,
-    pub key: String,
-    pub title: String,
-    pub content: String,
-}
-
-impl NewsRequest {
-    pub fn encode(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
-    }
-
-    pub fn parse(payload: &[u8]) -> Result<NewsRequest, String> {
-        serde_json::from_slice(payload).map_err(|e| format!("not a news request: {e}"))
-    }
-}
-
-/// 发一条新闻：这个存档发过同一个 key 就不再发
-pub fn push_story(host: &mut impl BalanceHost, req: &NewsRequest) -> (bool, String) {
-    let done = host.saved(STORIES_DONE).unwrap_or_default();
-    if done.lines().any(|k| k == req.key) {
-        return (true, "sent before".to_string());
-    }
-    if !host.push_news(req.team, &req.title, &req.content, crate::balance::AUTHOR) {
-        return (false, "the game refused the news".to_string());
-    }
-    let mut keys: Vec<&str> = done.lines().filter(|k| !k.is_empty()).collect();
-    keys.push(&req.key);
-    let from = keys.len().saturating_sub(STORIES_KEPT);
-    host.set_saved(STORIES_DONE, Some(&keys[from..].join("\n")));
-    (true, "written".to_string())
 }
 
 /// A round's notes: for the game's patch `version`, named `label`; `merge`d into the game's own notes of that patch
@@ -1341,27 +1288,6 @@ mod tests {
         let off = champion_patches_off(&zeros).unwrap();
         assert_eq!(off["repeat_high_streak_threshold"], 99);
         assert!(champion_patches_off(&Value::from(3)).is_none());
-    }
-
-    #[test]
-    fn a_story_is_written_once_a_save() {
-        let mut host = Host::default();
-        let req = NewsRequest { team: 3, key: "preview-2028-07-01".into(), title: "电竞大脑补丁预告".into(), content: "【削弱】".into() };
-        assert_eq!(NewsRequest::parse(req.encode().as_bytes()).unwrap(), req);
-        let (ok, said) = push_story(&mut host, &req);
-        assert!(ok && said == "written", "{said}");
-        assert_eq!(host.news.len(), 1);
-        assert_eq!(host.news[0]["author"], crate::balance::AUTHOR);
-        let (ok, said) = push_story(&mut host, &req);
-        assert!(ok && said == "sent before");
-        assert_eq!(host.news.len(), 1, "once");
-        // 记着的 key 只留最近的
-        for i in 0..STORIES_KEPT + 5 {
-            push_story(&mut host, &NewsRequest { key: format!("k{i}"), ..req.clone() });
-        }
-        let kept = host.saved.get(STORIES_DONE).unwrap();
-        assert_eq!(kept.lines().count(), STORIES_KEPT);
-        assert!(!kept.lines().any(|k| k == "preview-2028-07-01"));
     }
 
     #[test]

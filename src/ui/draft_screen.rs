@@ -102,6 +102,12 @@ const BREAKDOWN: &str = "main.pma_info";
 const SERIES: &str = "main.bottom.need_win";
 const TURN_ARROWS: [&str; 2] = ["main.header.desc.blue_arrow", "main.header.desc.red_arrow"];
 const SWAP_TABLES: [&str; 2] = ["main.swap.blue_table", "main.swap.red_table"];
+/// 换位阶段「交给主教练」的按钮
+const SWAP_COACH: &str = "main.swap.bottom.coach";
+/// 游戏的选中框和记下的对不上这么多帧，就算不知道谁坐哪了（选中框可能晚一两帧才变）
+const ODD_FRAMES: u32 = 3;
+/// 换位阶段的点击每次选人最多写这么多行日志
+const SWAP_LINES: u32 = 40;
 
 /// What the overlay shows besides the model.
 pub struct View<'a> {
@@ -234,6 +240,50 @@ fn ban_phase(step: &str) -> bool {
     step.contains("ban_phase")
 }
 
+/// 一边五个格子里坐的是谁（2.14.5）。游戏把每个格子固定给一名选手（从上到下：上单、打野、中单、下路、辅助），英雄在
+/// 格子之间挪：AI 队选完以后被排好分路（[`crate::draft::seat_decide`] 记下谁坐哪），玩家在换位阶段自己换
+/// （[`DraftScreen::follow_swaps`]）。以前标签按选人顺序对格子，挪过以后就写成了别的英雄。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+enum Seating {
+    /// 还按选人顺序：第 k 个格子是第 k 手（选人阶段），标签写电竞大脑读的它那一路
+    #[default]
+    Picks,
+    /// 第 k 个格子（位置 `Role::ALL[k]`）坐的是第几手，标签写这一格的位置
+    Seated(Vec<usize>),
+    /// 不知道谁坐哪：这一边的标签不画，免得写成别的英雄
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Seats {
+    /// 这一边的选人（按选人顺序）和它们的名字；变了就从选人顺序重来
+    picks: Vec<u16>,
+    names: Vec<String>,
+    seating: Seating,
+    /// 上次照着画的分路记录（同一份不再重来，免得盖掉玩家后来的换位）
+    applied: Option<Option<[usize; 5]>>,
+    /// 换位表里先点的那一行，等第二下
+    pending: Option<usize>,
+    /// 游戏的选中框和记下的对不上几帧了
+    odd: u32,
+}
+
+impl Seats {
+    /// 「Top a, Jungle b, …」（日志用）
+    fn describe(&self) -> String {
+        match &self.seating {
+            Seating::Picks => format!("in pick order ({})", self.names.join(", ")),
+            Seating::Unknown => "not known".to_string(),
+            Seating::Seated(order) => order
+                .iter()
+                .enumerate()
+                .map(|(lane, p)| format!("{} {}", Role::ALL.get(lane).map_or("?", |r| r.name()), self.names.get(*p).map_or("?", String::as_str)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct DraftScreen {
     /// The other team on the last ban/pick screen ([`team_key`]), for scouting.
@@ -268,6 +318,14 @@ pub struct DraftScreen {
     player_side: Option<usize>,
     /// The panels' background as last drawn (the breakdown line is added later, in it).
     back: Option<u32>,
+    /// 两边格子里坐的是谁（2.14.5，蓝方、红方）
+    seats: [Seats; 2],
+    /// 这一场选人登记过换位表的点击
+    swap_hooked: bool,
+    /// 上一帧在换位阶段
+    swapping: bool,
+    /// 这一场选人写了几行换位点击的日志
+    swap_lines: u32,
 }
 
 /// What the last drawing worked out.
@@ -571,6 +629,25 @@ fn lane_icon(r: Role) -> &'static str {
     }
 }
 
+/// 一边按选人顺序的英雄（卡片上的选人角标）
+fn picks_of(cards: &[Card], meta: &crate::meta::Meta, blue: bool) -> Vec<u16> {
+    let mut list: Vec<(u32, u16)> =
+        cards.iter().filter_map(|c| Some((if blue { c.blue? } else { c.red? }, meta.names.get(c.champ.as_deref()?)?))).collect();
+    list.sort_unstable();
+    list.into_iter().map(|(_, c)| c).collect()
+}
+
+/// 点的是哪一边的第几格：换位表的一行，或者选人栏的一格
+fn seat_clicked(path: &str) -> Option<(usize, usize)> {
+    (0..2).find_map(|s| {
+        let k = path
+            .strip_prefix(SWAP_TABLES[s])
+            .and_then(|r| r.strip_prefix(".swap_slot_"))
+            .or_else(|| path.strip_prefix(PICK_COLUMNS[s]).and_then(|r| r.strip_prefix(".pick_slot_")))?;
+        k.parse::<usize>().ok().filter(|k| *k < 5).map(|k| (s, k))
+    })
+}
+
 /// Why a pick or ban is worth what it is, in a few words.
 fn why(v: &PickValue) -> String {
     let mut parts = Vec::new();
@@ -686,12 +763,16 @@ impl DraftScreen {
                 crate::shared::set_coach_plan(None);
                 self.hell = None;
                 self.hell_lean = None;
+                self.reset_seats();
             }
             return;
         }
         if !self.on {
             self.on = true;
             diag::log("[ui] ban/pick screen");
+            // 上一场的分路不要了（2.14.5）
+            self.reset_seats();
+            crate::shared::clear_seated();
             // the AI's decisions from now on are the player's own match (diag.log)
             crate::draft::set_live(true);
             crate::shared::take_coach_choices();
@@ -774,6 +855,8 @@ impl DraftScreen {
             self.review.enemy = names[1 - side].clone();
         }
         self.track(&cards, side_known.then_some(side), meta, acting);
+        // 两边格子里坐的是谁（2.14.5）
+        self.update_seats(&cards, meta);
 
         // what changed since the last drawing: the draft, the model, or our nodes went missing
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -781,6 +864,7 @@ impl DraftScreen {
             (&c.champ, c.blue, c.red, c.banned, c.fearless, c.locked, c.held).hash(&mut h);
         }
         (side, Arc::as_ptr(snapshot) as usize, swap_phase, banning, acting, view.panel_opacity.to_bits()).hash(&mut h);
+        (&self.seats[0].seating, &self.seats[1].seating).hash(&mut h);
         let key = h.finish() | 1 << 63;
         // our nodes still there? the overlay, and the chips of the first and last card (a rebuilt
         // grid loses all of them; asking every card each time would be 131 more calls)
@@ -805,6 +889,133 @@ impl DraftScreen {
         let turn = Turn { side, side_known, swapping: swap_phase && side_known, banning, acting };
         self.draw(ui, snapshot, &cards, turn, &rosters, view);
         self.breakdown(ui, meta);
+    }
+
+    /// 新的一场选人：两边都从选人顺序算起
+    fn reset_seats(&mut self) {
+        self.seats = Default::default();
+        self.swap_hooked = false;
+        self.swapping = false;
+        self.swap_lines = 0;
+    }
+
+    /// 换位阶段（2.14.5）：玩家在换位表里先点一行、再点另一行，两行的英雄就对调（选人栏的格子也算）。照着记下来，
+    /// 再用游戏自己的选中框（那一行的 `selected`）核对：对不上、或者交给了主教练换位，就算不知道谁坐哪，玩家这边的
+    /// 标签先不画（免得写成别的英雄）。点击只在当帧，所以每帧都看。
+    pub fn follow_swaps(&mut self, ui: &mut impl Ui, clicks: &[String]) {
+        if !self.on {
+            return;
+        }
+        let swapping = ui.visible(SWAP) == Some(true);
+        let (started, ended) = (swapping && !self.swapping, !swapping && self.swapping);
+        self.swapping = swapping;
+        let Some(side) = self.player_side else { return };
+        if ended {
+            diag::log(&format!("[swap] the swap phase is over: blue {}; red {}", self.seats[0].describe(), self.seats[1].describe()));
+        }
+        if !swapping {
+            return;
+        }
+        if !self.swap_hooked {
+            self.swap_hooked = true;
+            let rows = SWAP_TABLES.iter().flat_map(|t| (0..5).map(move |k| format!("{t}.swap_slot_{k}"))).filter(|p| ui.on_click(p)).count();
+            let slots = PICK_COLUMNS.iter().flat_map(|c| (0..5).map(move |k| format!("{c}.pick_slot_{k}"))).filter(|p| ui.on_click(p)).count();
+            let coach = ui.on_click(SWAP_COACH);
+            diag::log(&format!(
+                "[swap] the swap phase: following {rows} swap-table rows, {slots} pick slots and the head-coach button ({coach}); the player's side {}",
+                if side == 0 { "blue" } else { "red" }
+            ));
+        }
+        let mut lines = self.swap_lines;
+        let seats = &mut self.seats[side];
+        // 玩家这边从选人顺序算起（分路没被别人排过的话）
+        if seats.seating == Seating::Picks && seats.picks.len() == 5 {
+            seats.seating = Seating::Seated((0..5).collect());
+        }
+        if started {
+            seats.pending = None;
+            seats.odd = 0;
+            diag::log(&format!("[swap] the player's team at the start: {}", seats.describe()));
+        }
+        for path in clicks {
+            if path == SWAP_COACH {
+                if seats.seating != Seating::Unknown {
+                    diag::log("[swap] the swap is left to the head coach: whose champion sits where is not known now (the player's tags are off)");
+                }
+                seats.seating = Seating::Unknown;
+                seats.pending = None;
+                continue;
+            }
+            let Some((s, k)) = seat_clicked(path) else { continue };
+            if s != side {
+                continue;
+            }
+            let Seating::Seated(order) = &mut seats.seating else { continue };
+            let swapped = match seats.pending {
+                None => {
+                    seats.pending = Some(k);
+                    None
+                }
+                Some(a) if a == k => {
+                    seats.pending = None;
+                    None
+                }
+                Some(a) => {
+                    order.swap(a, k);
+                    seats.pending = None;
+                    Some(format!("{} <-> {}", Role::ALL[a].name(), Role::ALL[k].name()))
+                }
+            };
+            if lines < SWAP_LINES {
+                lines += 1;
+                let now = swapped.map(|w| format!(": {w}, now {}", seats.describe())).unwrap_or_default();
+                diag::log(&format!("[swap] click on {path}{now}"));
+            }
+        }
+        self.swap_lines = lines;
+        // 核对：游戏的选中框应该正好在记下的那一行（一个都没有就没法核对，当作对得上）
+        let table = SWAP_TABLES[side];
+        let shown: Vec<usize> = (0..5).filter(|k| ui.visible(&format!("{table}.swap_slot_{k}.selected")) == Some(true)).collect();
+        let seats = &mut self.seats[side];
+        let agrees = shown.is_empty() || (shown.len() == 1 && seats.pending == Some(shown[0]));
+        if agrees || !matches!(seats.seating, Seating::Seated(_)) {
+            seats.odd = 0;
+            return;
+        }
+        seats.odd += 1;
+        if seats.odd >= ODD_FRAMES {
+            diag::log(&format!(
+                "[swap] lost track: the game shows rows {shown:?} selected, followed {:?}; the player's tags are off until the next ban/pick",
+                seats.pending
+            ));
+            seats.seating = Seating::Unknown;
+            seats.pending = None;
+        }
+    }
+
+    /// 每边的选人变了就从选人顺序重来；分路排好以后（[`crate::draft::seat_decide`] 记下的）照着画，不知道怎么排的
+    /// 就不画。同一份记录只照着排一次，玩家之后在换位阶段换的不会被盖掉。
+    fn update_seats(&mut self, cards: &[Card], meta: &crate::meta::Meta) {
+        for (s, blue) in [(0usize, true), (1, false)] {
+            let picks = picks_of(cards, meta, blue);
+            let seats = &mut self.seats[s];
+            if seats.picks != picks {
+                let names = picks.iter().map(|c| meta.names.name(*c).to_string()).collect();
+                *seats = Seats { picks, names, ..Seats::default() };
+            }
+            if seats.picks.len() != 5 {
+                continue;
+            }
+            let names: Vec<&str> = seats.names.iter().map(String::as_str).collect();
+            let Some(found) = crate::shared::seated(&names) else { continue };
+            if seats.applied == Some(found) {
+                continue;
+            }
+            seats.applied = Some(found);
+            seats.pending = None;
+            seats.seating = found.map_or(Seating::Unknown, |b| Seating::Seated(b.to_vec()));
+            diag::log(&format!("[swap] {} side seated: {}", if blue { "blue" } else { "red" }, seats.describe()));
+        }
     }
 
     /// Notes every pick and ban since the last read for the review: who made it (a pick by its
@@ -1298,14 +1509,25 @@ impl DraftScreen {
                 let column = PICK_COLUMNS[s];
                 let lanes = advisor::lanes(meta, picks);
                 let probs = advisor::lane_probabilities(meta, picks);
+                // 2.14.5：分路排好以后英雄在格子之间挪了，第 i 格写坐在这里的英雄和这一格的位置；不知道谁坐哪就不画
+                let seating = self.seats[s].seating.clone();
+                let seated = self.seats[s].picks.clone();
                 for (i, slot) in ui.children(column).iter().enumerate() {
                     let done = format!("{column}.{slot}.done");
                     let tag = format!("{done}.{RATE_TAG}");
-                    let read = picks.get(i).zip(lanes.roles.get(i)).and_then(|(c, r)| {
-                        let champ = meta.by_id(*c)?;
-                        let sure = probs.get(i).map_or(1.0, |row| row[r.index()]);
-                        Some((*r, champ.role_rate(*r), s != side && sure < RATE_SURE))
-                    });
+                    let read = match &seating {
+                        Seating::Picks => picks.get(i).zip(lanes.roles.get(i)).and_then(|(c, r)| {
+                            let champ = meta.by_id(*c)?;
+                            let sure = probs.get(i).map_or(1.0, |row| row[r.index()]);
+                            Some((*r, champ.role_rate(*r), s != side && sure < RATE_SURE))
+                        }),
+                        Seating::Seated(order) => order
+                            .get(i)
+                            .and_then(|p| seated.get(*p))
+                            .zip(Role::ALL.get(i).copied())
+                            .and_then(|(c, r)| Some((r, meta.by_id(*c)?.role_rate(r), false))),
+                        Seating::Unknown => None,
+                    };
                     if !ui.exists(&tag) && (read.is_none() || !ui.exists(&done) || !ui.spawn(&done, &rate_source(s))) {
                         continue;
                     }
@@ -1618,6 +1840,112 @@ mod tests {
         ui.nodes.get_mut(SWAP).unwrap().visible = false;
         screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
         assert_eq!(ui.visible("main.pma.advice.seating"), Some(false));
+    }
+
+    /// 2.14.5：换位阶段英雄在格子之间挪。玩家这边从选人顺序算起，跟着换位表里的两下点击对调，标签写这一格的位置和
+    /// 坐在这里的英雄在这一路的胜率；游戏的选中框对不上就不画（用户：「我移动到哪个位置后应该显示当前位置的胜率吧」）
+    #[test]
+    fn the_tags_follow_the_players_swaps() {
+        let _serial = crate::tests::serial();
+        crate::shared::clear_seated();
+        let snapshot = snapshot(1500);
+        let meta = &snapshot.meta;
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
+        let mut ui = screen();
+        for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            pick(&mut ui, n, "blue", i as u32 + 1);
+        }
+        for (i, n) in ["f", "g", "h", "i", "j"].iter().enumerate() {
+            pick(&mut ui, n, "red", i as u32 + 1);
+        }
+        let tag = |ui: &FakeUi, k: usize| ui.text(&format!("{}.pick_slot_{k}.done.{RATE_TAG}.text", PICK_COLUMNS[0])).unwrap_or_default();
+        let rate = |n: &str, r: Role| rate_text(r, meta.by_id(meta.names.get(n).unwrap()).unwrap().role_rate(r), false);
+        let mut screen = DraftScreen::default();
+        let mut frame = 0;
+        let mut step = |screen: &mut DraftScreen, ui: &mut FakeUi, clicks: &[String]| {
+            screen.follow_swaps(ui, clicks);
+            screen.tick(ui, frame, Some(&snapshot), &book, &view);
+            frame += READ_EVERY;
+        };
+        step(&mut screen, &mut ui, &[]);
+        assert!(!tag(&ui, 0).is_empty(), "picks: the lane read per champion (2.14.3)");
+        // the swap phase: from pick order, each slot's own lane
+        ui.add(SWAP, "empty");
+        for t in SWAP_TABLES {
+            for k in 0..5 {
+                ui.add(&format!("{t}.swap_slot_{k}"), "color_icon_button");
+                ui.add(&format!("{t}.swap_slot_{k}.selected"), "color").visible = false;
+            }
+        }
+        ui.add(SWAP_COACH, "color_icon_button");
+        step(&mut screen, &mut ui, &[]);
+        assert_eq!(tag(&ui, 0), rate("a", Role::Top), "a sits with the top player");
+        assert_eq!(tag(&ui, 2), rate("c", Role::Mid));
+        assert!(ui.handlers.iter().any(|h| h == "main.swap.blue_table.swap_slot_0"), "the rows' clicks are followed");
+        // row 0, then row 2: a and c trade places (the game shows row 0 selected in between)
+        let row = |k: usize| format!("{}.swap_slot_{k}", SWAP_TABLES[0]);
+        step(&mut screen, &mut ui, &[row(0)]);
+        ui.nodes.get_mut(&format!("{}.selected", row(0))).unwrap().visible = true;
+        step(&mut screen, &mut ui, &[]);
+        ui.nodes.get_mut(&format!("{}.selected", row(0))).unwrap().visible = false;
+        step(&mut screen, &mut ui, &[row(2)]);
+        assert_eq!(tag(&ui, 0), rate("c", Role::Top), "c moved up to the top player");
+        assert_eq!(tag(&ui, 2), rate("a", Role::Mid), "a to the mid player");
+        assert_eq!(tag(&ui, 1), rate("b", Role::Jungle), "the others stay");
+        // the other team's rows are not the player's to swap
+        step(&mut screen, &mut ui, &[format!("{}.swap_slot_0", SWAP_TABLES[1])]);
+        assert_eq!(tag(&ui, 0), rate("c", Role::Top));
+        // a row selected that was not clicked as followed: lost track, so no tag rather than a wrong one
+        ui.nodes.get_mut(&format!("{}.selected", row(3))).unwrap().visible = true;
+        for _ in 0..ODD_FRAMES {
+            step(&mut screen, &mut ui, &[]);
+        }
+        assert_eq!(ui.visible(&format!("{}.pick_slot_0.done.{RATE_TAG}", PICK_COLUMNS[0])), Some(false));
+        // a new ban/pick starts from pick order again; the head coach's swap is not followed
+        ui.nodes.get_mut(&format!("{}.selected", row(3))).unwrap().visible = false;
+        screen.reset_seats();
+        step(&mut screen, &mut ui, &[]);
+        step(&mut screen, &mut ui, &[]);
+        assert_eq!(tag(&ui, 0), rate("a", Role::Top));
+        step(&mut screen, &mut ui, &[SWAP_COACH.to_string()]);
+        assert_eq!(ui.visible(&format!("{}.pick_slot_0.done.{RATE_TAG}", PICK_COLUMNS[0])), Some(false));
+    }
+
+    /// 2.14.5：对方排好分路（`draft::seat_decide` 记下的）以后照着画；记的是「不知道」就不画
+    #[test]
+    fn the_other_team_follows_its_seating() {
+        let _serial = crate::tests::serial();
+        crate::shared::clear_seated();
+        let snapshot = snapshot(1500);
+        let meta = &snapshot.meta;
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: true, panel_opacity: 60.0 };
+        let mut ui = screen();
+        for (i, n) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+            pick(&mut ui, n, "blue", i as u32 + 1);
+        }
+        for (i, n) in ["f", "g", "h", "i", "j"].iter().enumerate() {
+            pick(&mut ui, n, "red", i as u32 + 1);
+        }
+        let tag = |ui: &FakeUi, k: usize| ui.text(&format!("{}.pick_slot_{k}.done.{RATE_TAG}.text", PICK_COLUMNS[1])).unwrap_or_default();
+        let rate = |n: &str, r: Role| rate_text(r, meta.by_id(meta.names.get(n).unwrap()).unwrap().role_rate(r), false);
+        let mut screen = DraftScreen::default();
+        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
+        assert!(tag(&ui, 0).contains("胜率"), "in pick order before their seating");
+        let theirs: Vec<String> = ["f", "g", "h", "i", "j"].iter().map(|n| n.to_string()).collect();
+        crate::shared::set_seated(theirs.clone(), Some([4, 3, 2, 1, 0]));
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        assert_eq!(tag(&ui, 0), rate("j", Role::Top), "j sits with their top player");
+        assert_eq!(tag(&ui, 4), rate("f", Role::Support));
+        crate::shared::set_seated(theirs, None);
+        screen.tick(&mut ui, 2 * READ_EVERY, Some(&snapshot), &book, &view);
+        assert_eq!(ui.visible(&format!("{}.pick_slot_0.done.{RATE_TAG}", PICK_COLUMNS[1])), Some(false), "not known how: no tags");
+        crate::shared::clear_seated();
     }
 
     #[test]

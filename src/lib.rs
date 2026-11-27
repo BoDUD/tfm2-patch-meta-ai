@@ -45,7 +45,6 @@ pub mod records;
 pub mod report;
 pub mod scan;
 pub mod series;
-pub mod stories;
 pub mod styles;
 pub mod theme;
 pub mod stats;
@@ -95,6 +94,7 @@ pub fn reset_for_tests() {
     compat::set(compat::Others::default());
     client::reset_for_tests();
     shared::clear();
+    shared::clear_seated();
     lock::set(None);
     ai_tactics::reset_for_tests();
     balance::reset_for_tests();

@@ -1685,71 +1685,6 @@ fn apply_theme(round: &mut Round, rounds: &[Round], rules: Rules, categories: &H
     round.summary.push_str(&format!("; theme patch: category {category}, {buffed} champions +{}%", rules.theme_step));
 }
 
-/// 补丁预告（2.14.0）：提前做好的那一轮，补丁日前发一条新闻说计划改什么（以正式补丁为准）。每边最多列 `PREVIEW_LINES`
-/// 个，主题版本那一类只写一句；`label` 是英雄在游戏里的名字。
-pub fn preview_news(round: &Round, day: (i32, u32, u32), chinese: bool, label: &dyn Fn(&str) -> String) -> (String, String) {
-    let date = format!("{}-{:02}-{:02}", day.0, day.1, day.2);
-    let title = if chinese { format!("电竞大脑补丁预告：{date} 的版本") } else { format!("Patch Meta AI patch preview: the patch of {date}") };
-    let mut lines = vec![if chinese {
-        format!("电竞大脑计划在 {date} 的版本里做这些调整（之后的比赛还可能让它变，以正式补丁为准）：")
-    } else {
-        format!("What Patch Meta AI plans for the patch of {date} (the matches until then may still change it; the patch notes decide):")
-    }];
-    if let Some(category) = round.theme {
-        let n = round.changes.iter().filter(|c| c.theme.is_some()).count();
-        let step = round.changes.iter().find(|c| c.theme.is_some()).map_or(0, |c| c.step);
-        lines.push(if chinese {
-            format!("【主题版本】{}版本：{n} 个{}一起加强（最多 {step:+}%）", crate::theme::name(category, true), crate::theme::name(category, true))
-        } else {
-            format!("[Theme patch] {}: {n} of them buffed together (up to {step:+}%)", crate::theme::name(category, false))
-        });
-    }
-    let mut any = round.theme.is_some();
-    for (nerf, zh, en) in [(true, "削弱", "Nerfs"), (false, "加强", "Buffs")] {
-        let mut list: Vec<&Change> = round.changes.iter().filter(|c| c.theme.is_none() && c.step != 0 && (c.step < 0) == nerf).collect();
-        if list.is_empty() {
-            continue;
-        }
-        any = true;
-        list.sort_by_key(|c| -c.step.abs());
-        let shown: Vec<String> = list
-            .iter()
-            .take(PREVIEW_LINES)
-            .map(|c| match (chinese, c.unpicked, c.reset.is_some()) {
-                (_, _, true) => format!("{} {:+}%", label(&c.champion), c.step),
-                (true, true, false) => format!("{} {:+}%（很少有人选）", label(&c.champion), c.step),
-                (false, true, false) => format!("{} {:+}% (rarely picked)", label(&c.champion), c.step),
-                (true, false, false) => format!("{} {:+}%（胜率 {:.1}%）", label(&c.champion), c.step, c.win),
-                (false, false, false) => format!("{} {:+}% (win rate {:.1}%)", label(&c.champion), c.step, c.win),
-            })
-            .collect();
-        let more = list.len().saturating_sub(PREVIEW_LINES);
-        let tail = match (more, chinese) {
-            (0, _) => String::new(),
-            (n, true) => format!("，还有 {n} 个"),
-            (n, false) => format!(", and {n} more"),
-        };
-        lines.push(if chinese { format!("【{zh}】{}{tail}", shown.join("，")) } else { format!("[{en}] {}{tail}", shown.join(", ")) });
-    }
-    if !round.items.is_empty() {
-        any = true;
-        let items: Vec<String> = round.items.iter().take(PREVIEW_LINES).map(|c| format!("{} {:+}%", c.name, c.step)).collect();
-        lines.push(if chinese { format!("【装备】{}", items.join("，")) } else { format!("[Items] {}", items.join(", ")) });
-    }
-    if !round.objectives.is_empty() {
-        any = true;
-        let list: Vec<String> = round.objectives.iter().map(|c| format!("{} {:+}%", c.objective.name(chinese), c.step)).collect();
-        lines.push(if chinese { format!("【防御塔和大小龙】{}", list.join("，")) } else { format!("[Towers and epic monsters] {}", list.join(", ")) });
-    }
-    if !any {
-        lines.push(if chinese { "这一次没有计划中的调整。".to_string() } else { "No changes are planned this time.".to_string() });
-    }
-    (title, lines.join("\n"))
-}
-
-/// 预告里每边最多列几个英雄
-pub const PREVIEW_LINES: usize = 10;
-
 /// The round of resets due on this save now ([`make_reset`]); not in the book until [`publish`]ed.
 pub fn reset_now(
     champions: &[(String, Reset)],
@@ -3410,34 +3345,4 @@ mod tests {
         reset_for_tests();
     }
 
-    #[test]
-    fn the_preview_lists_what_is_planned() {
-        let ch = |c: &str, step: i32, win: f32, theme: Option<u8>| Change {
-            champion: c.into(),
-            win,
-            evidence: 99.0,
-            step,
-            total: step,
-            unpicked: false,
-            reset: None,
-            theme,
-        };
-        let round = Round {
-            theme: Some(1),
-            changes: vec![ch("jinx", 8, 0.0, Some(1)), ch("zeri", 8, 0.0, Some(1)), ch("tryn", -10, 58.4, None), ch("weak", 6, 44.0, None)],
-            items: vec![ItemChange { item: "ie".into(), name: "无尽之刃".into(), users: 4, win: 56.0, step: -5, total: -5, reset: None }],
-            ..Round::default()
-        };
-        let label = |c: &str| if c == "tryn" { "泰达米尔".to_string() } else { c.to_string() };
-        let (title, body) = preview_news(&round, (2028, 7, 1), true, &label);
-        assert_eq!(title, "电竞大脑补丁预告：2028-07-01 的版本");
-        let lines: Vec<&str> = body.lines().collect();
-        assert!(lines[0].contains("以正式补丁为准"), "{body}");
-        assert_eq!(lines[1], "【主题版本】射手版本：2 个射手一起加强（最多 +8%）");
-        assert_eq!(lines[2], "【削弱】泰达米尔 -10%（胜率 58.4%）");
-        assert_eq!(lines[3], "【加强】weak +6%（胜率 44.0%）");
-        assert_eq!(lines[4], "【装备】无尽之刃 -5%");
-        let (_, empty) = preview_news(&Round::default(), (2028, 7, 1), true, &label);
-        assert!(empty.contains("没有计划中的调整"), "{empty}");
-    }
 }

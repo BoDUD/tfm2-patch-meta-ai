@@ -75,11 +75,6 @@ pub fn get() -> Option<Arc<Styles>> {
     STYLES.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
-/// 一支队的风格叫什么（没算出来就是 None）
-pub fn label_of(team: u32, chinese: bool) -> Option<String> {
-    get()?.teams.get(&team).map(|s| s.label(chinese).to_string())
-}
-
 /// 一个英雄的特征向量：阵容属性（不知道的填全联盟平均）和职业的独热
 fn vector(f: &Features, trait_mean: &[f32; TRAITS]) -> [f32; FEATURES] {
     let mut out = [0.0; FEATURES];
