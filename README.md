@@ -54,6 +54,13 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.14.4：收件箱里的长新闻能往下滚
+
+用户：「装备平衡补丁有点bug 不能往下滚动」（截图：电竞大脑装备平衡 2026.0.1，第四件装备以后被截掉）。
+
+- **原因**：游戏的普通新闻（Simple）正文是 `news_component/simple_content(_d)` 里一个 728 px 高的文字框（20 号字，行高 36），外面没有滚动框，大约 20 行以后就截掉。2.14.2 照官方排版的装备新闻一件装备五六行，八件五十多行。
+- **现在**（`ui::news_scroll`）：右边打开的新闻作者是电竞大脑（`top.author` 是 `balance::AUTHOR`）、正文又放不下时，把游戏的文字框藏起来，在同一个 `contents` 里放一个游戏自己的 scroll_view（补丁内容页那种），里面一样的字、字号和行高，高度按行数算（`height_of`：每行按宽度算折几行，乘行高，多留一行）。换一条新闻或离开就收起来、原来的框显示回去。正文块先按 `main.top.right.<页>.data.right_panel.<块>` 找，找不到就在右边页面里有限地广搜作者那一行（深 7 层、800 个节点以内，约两秒一次），找到时 diag.log 记一行路径。装备平衡、补丁预告、赛前前瞻和赛后复盘这些电竞大脑的长新闻都一样。
+
 ## 2.14.3：已选英雄脚下的位置和胜率
 
 用户发来别的界面的截图（卡片下面写「Top 67%」）：「我们的电竞大脑没有这种胜率显示 能加上去吗」。截图里三张卡按选人顺序排、位置是上路 / 下路 / 中路，那个百分比更像位置的把握；电竞大脑以前只在敌方卡片右上角画位置图标和五格把握条。
@@ -401,6 +408,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.14.4 (the user: "the item balance news has a bug - it does not scroll"): the game's simple news text is a fixed 728 px label with no scroll view (`news_component/simple_content_d`), so 2.14.2's laid-out item news (five or six lines an item) was cut after about 20 lines. `ui::news_scroll`: when the inbox shows a news item of this mod (its `top.author`) whose text needs more room, the game's label is hidden and a scroll view (the patch content page's) with the same text, size and line height takes its place inside the same `contents`; it goes away for another news item. The block is found under `main.top.right.<page>.data.right_panel`, else by a bounded search for the author line (logged once).
 
 2.14.3 (the user sent another screen's pick cards with "Top 67%" under each champion: "our esports brain has no such win-rate display - can it be added?"): every picked card on both sides (`pick_slot_N.done`) gets a bordered tag under the champion art (`pma_rate`): the lane icon and "上单 胜率 52%" - the lane as the mod reads the team (`advisor::lanes`), a "?" when the enemy's lane is under 50% likely, the model's win rate of the champion in that lane this patch (`Champion::role_rate`), green from 52%, red to 48%. It replaces the enemy's lane bar; `lane_tags` turns it off.
 

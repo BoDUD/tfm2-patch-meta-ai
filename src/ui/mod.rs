@@ -13,6 +13,7 @@ pub mod lineup_screen;
 pub mod explore;
 pub mod item_spec;
 pub mod item_view;
+pub mod news_scroll;
 pub mod patch_items;
 pub mod names;
 pub mod page;
@@ -224,6 +225,7 @@ struct State {
     balance: balance_view::BalanceView,
     items: item_view::ItemView,
     patch_items: patch_items::PatchItems,
+    news: news_scroll::NewsScroll,
     context: Context,
 }
 
@@ -323,6 +325,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         // and the item changes in the patch history (2.12.2)
         time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_patch));
     }
+    // 收件箱里电竞大脑的长新闻能往下滚（2.14.4）
+    time(Part::Page, || st.news.tick(ui));
 }
 
 /// A team name as a key: lower case, without the league rank the ban/pick screen appends

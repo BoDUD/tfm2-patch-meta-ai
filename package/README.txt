@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.14.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.14.4 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,10 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.14.4：收件箱里电竞大脑的长新闻可以往下滚了。游戏的普通新闻正文是一个固定高度的框，大约 20 行以后就被截掉、
+也滚不动；2.14.2 照官方排版的装备平衡新闻一件装备五六行，八件就放不下。现在打开电竞大脑发的新闻、字又放不下时，
+正文换成能滚的框（字、字号、行高不变），装备平衡、补丁预告、赛前前瞻都一样。
 
 2.14.3：选人界面双方每个已选英雄的脚下多了一个小标签：位置图标和「上单 胜率 52%」——位置是电竞大脑读的这一队的
 分路，胜率是模型估的这个版本它在这一路的胜率；52% 以上绿、48% 以下红。对方的位置读得没把握时，位置后面带个问号。
@@ -516,6 +520,9 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.14.4: this mod's long news in the inbox scroll (the game's simple news box is a fixed
+728 px with no scroll; the item balance news of 2.14.2 runs past it).
 
 2.14.3: under each picked champion (both teams) a tag with its lane and its estimated
 win rate in that lane (green from 52%, red to 48%; a "?" when the enemy's lane read is
