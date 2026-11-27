@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.14.2 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.14.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,10 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.14.3：选人界面双方每个已选英雄的脚下多了一个小标签：位置图标和「上单 胜率 52%」——位置是电竞大脑读的这一队的
+分路，胜率是模型估的这个版本它在这一路的胜率；52% 以上绿、48% 以下红。对方的位置读得没把握时，位置后面带个问号。
+原来对方卡片右上角的位置进度条由它代替（设置 lane_tags，默认开）。
 
 2.14.2：平衡补丁的说明照游戏官方补丁的口吻写。每个改动的英雄先是一句游戏自己的理由（比如「输出能力远超预期，
 对手几乎没有还手的余地」「很显然，该英雄已经强势得太久了」「在赛场中几乎看不到身影」，按它是输出、坦克、奶妈还是
@@ -259,7 +263,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   grid_values=on     英雄卡片上的数字
   panel_opacity=60   两个面板背景的不透明度（0～100）；面板在屏幕最下面一条的两角，不挡选人位，
                      那一边选满五个后背景再降到三分之一
-  lane_tags=on       敌方英雄的位置推断
+  lane_tags=on       双方已选英雄脚下的位置和胜率
   meta_page=on       "版本分析"页（经典界面左侧菜单 / 新界面标题栏）
 
 其余设置的说明写在 settings.ini 里每一项的上面。
@@ -512,6 +516,10 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.14.3: under each picked champion (both teams) a tag with its lane and its estimated
+win rate in that lane (green from 52%, red to 48%; a "?" when the enemy's lane read is
+unsure); it replaces the enemy's lane bar (lane_tags).
 
 2.14.2: the balance patches talk like the game's own notes: each changed champion gets one
 of the game's reasons (chosen by its role and whether it was changed the same way just

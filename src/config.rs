@@ -1027,7 +1027,7 @@ unranked=keep
 ;                 左下角显示阵容胜率，右下角显示当前最佳选择与禁用
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
-; lane_tags     : on each enemy pick, its most likely lane / 敌方每个已选英雄最可能的位置
+; lane_tags     : under each pick (both teams), its lane and its win rate there / 双方每个已选英雄下面的位置和它在这一路的胜率
 ; panel_opacity : how opaque the two panels' background is, 0-100 (percent); once both teams
 ;                 the panel sits on a pick column's fifth pick: once that pick is in (left panel:
 ;                 blue's, right panel: red's) it drops to a third, so the pick shows through

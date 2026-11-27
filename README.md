@@ -54,6 +54,13 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.14.3：已选英雄脚下的位置和胜率
+
+用户发来别的界面的截图（卡片下面写「Top 67%」）：「我们的电竞大脑没有这种胜率显示 能加上去吗」。截图里三张卡按选人顺序排、位置是上路 / 下路 / 中路，那个百分比更像位置的把握；电竞大脑以前只在敌方卡片右上角画位置图标和五格把握条。
+
+- 选人界面双方每张已选卡片（游戏的 `pick_slot_N.done`）里，英雄图脚下一个带边框的小条（`pma_rate`，128×24，蓝方在卡片右边的英雄图下、红方在左边）：位置图标和「上单 胜率 52%」。位置是电竞大脑读的这一队的分路（`advisor::lanes`，和算胜率、禁用时用的一样），对方的那一路可能不到一半时位置后面打个问号；胜率是模型估的这个版本它在这一路的胜率（`Champion::role_rate`）。52% 以上绿、48% 以下红，边框同色。
+- 代替以前敌方卡片右上角的位置条，开关还是 `lane_tags`（默认开）。字没变就不重写。
+
 ## 2.14.2：补丁说明照官方的写法
 
 用户：「现在英雄平衡补丁的文字说明太僵硬没有之前官方的那种文字的味道 装备的平衡补丁现在文字显示排版很差 而且数值在局内能改了 你还写上去 排版参考官方英雄补丁那种排版是不是更美观」。
@@ -340,7 +347,7 @@
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
-| | `lane_tags` | on | 敌方已选英雄的位置推断 |
+| | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条） |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | | `balance` | off | 由本 Mod 出版本平衡补丁（每版把胜率离 48%–52% 最远的英雄调强/调弱，所有比赛生效；写进游戏自己的补丁公告和补丁历史，BP/百科的属性显示改动后的数值；开着时游戏自带的英雄补丁关掉） |
@@ -394,6 +401,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.14.3 (the user sent another screen's pick cards with "Top 67%" under each champion: "our esports brain has no such win-rate display - can it be added?"): every picked card on both sides (`pick_slot_N.done`) gets a bordered tag under the champion art (`pma_rate`): the lane icon and "上单 胜率 52%" - the lane as the mod reads the team (`advisor::lanes`), a "?" when the enemy's lane is under 50% likely, the model's win rate of the champion in that lane this patch (`Champion::role_rate`), green from 52%, red to 48%. It replaces the enemy's lane bar; `lane_tags` turns it off.
 
 2.14.2 (the user: the balance notes read "stiff, without the official notes' flavour", and the item patch is laid out badly): each changed champion's reason starts with one of the game's own `patch.reason.*` lines (every language), chosen by direction, role (`balance::kind_of`: League's composition profile - frontline, peel, late carry - else the game's class) and whether the last one or two rounds changed it the same way (`nerf_meta` / `buff_meta`, only the lines that match what the mod knows), then a short win-rate line; the overall power is a line of the notes (`patch.pma_power_stat`, before -> after), so the old power and limit codes stay for older notes only. The item news is laid out like the champions' notes (buffs, nerfs, each item: icon and bold name, a reason, one number a line, the overall power) without the stale "the tooltips still show the old numbers"; the encyclopedia's patch-history block draws the items as the game draws champions (two columns, an icon box, a rule, reason and change rows; the game's `news_component/patch_*` sizes and colours) in a scroll view of its own. Items with no number that can move (no stats, or unsigned ones only) are no candidates any more.
 
