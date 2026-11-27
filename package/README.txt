@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.15.2 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,10 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.3：教练托管默认关（coach=off）：新装时点教练托管由游戏自己的教练来选；想让它照面板的建议禁和选，
+在 settings.ini 里写 coach=on。AI 智能BP（ai_bp）和 ban_pick 本来就默认关。已经在用的 settings.ini
+不受影响（里面写着 coach=on）。
 
 2.15.2：收件箱里电竞大脑的长新闻（比如装备平衡）真的能往下滚了：在左边列表里点一下那条新闻，右边就换成能滚的框。
 （2.14.4 认不出游戏里打开的新闻，所以一直没生效。）
@@ -156,10 +160,10 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   · 换位阶段，右下角改为显示五个英雄分给五名选手的最佳方式。
   · 用了 Smart Position Lock（智能位置锁定）时，被锁住的英雄不会出现在推荐里。
 
-■ 教练托管
+■ 教练托管（coach=on，默认关）
   BP 时点游戏的"教练托管"，你自己的队伍会完全照右下角面板的建议来禁和选
   （禁 1 / 选 那一行，推演和位置锁都算在内）。不影响其他队伍。
-  不想要就在 settings.ini 里写 coach=off。
+  2.15.3 起默认关（托管由游戏自己的教练选）；要用就在 settings.ini 里写 coach=on。
   F8 的 BP 复盘和 diag.log 的 [review] 行会写"教练托管决定了几手、实际照做了几手"；
   如果实际照做的少，说明别的 Mod 盖掉了它（见下面"地狱人机"）。
 
@@ -216,7 +220,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   [features]
   ban_pick=off       AI 队伍的 BP 用本 Mod 的估值（默认关；auto = 开，除非装了接管 AI 选人的 Mod）
   tier_list=auto     自动梯队（auto = 开，除非装了写梯队的 Mod）；off = 关
-  coach=on           教练托管时你自己的队伍按建议 BP；off = 关
+  coach=off          on = 教练托管时你自己的队伍按建议 BP（2.15.3 起默认关）
   ai_bp=off          AI BP：on = 所有 AI 队伍都完全按本 Mod 的建议禁和选（和面板同一套
                      排序，含 3+2 推演），盖过地狱人机等其他 BP Mod；AI 也会研究对手的常用英雄
   ai_variety=1       AI BP 每局对英雄的判断会浮动，让更多英雄有机会上场、AI 也不好猜；
@@ -518,9 +522,12 @@ you, in the pick phase the best picks; a fourth row with the enemy's likely next
 In a 3+2 draft the candidates are played out to the end of the draft ("推演 xx%").
 Cards show what banning / picking each champion is worth. Hover a card for a value
 breakdown above the info panel. Coach delegation bans and picks exactly what the panel
-advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
+advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.3: coach delegation is off by default - write coach=on in settings.ini to have it ban and
+pick what the panel advises. AI BP (ai_bp) and ban_pick were off by default already.
 
 2.15.0: in a match, a live win chance under the clock - both sides' numbers, a bar and the
 curve so far, with the reason of a big swing ("Baron +18%"). It reads the draft's win

@@ -1628,6 +1628,9 @@ mod tests {
         assert_eq!(decide(&ours), None, "no save open: no player team");
         shared::set_player_team(Some(19));
         shared::take_coach_choices();
+        assert_eq!(decide(&ours), None, "coach is off by default (2.15.3)");
+        // 托管 2.15.3 起默认关，这里打开再看
+        config::set_for_tests(config::Config { coach: true, ..config::Config::default() });
         assert_eq!(decide(&ours), Some(c as usize));
         assert_eq!(decide(&ctx_for(12)), None, "another team");
         assert_eq!(shared::take_coach_choices(), vec![(false, c)]);

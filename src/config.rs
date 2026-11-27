@@ -51,6 +51,7 @@ pub struct Config {
     pub ban_pick: Switch,
     /// The player's own team's draft when the game's coach drafts for it (coach delegation)
     /// follows the model, even with `ban_pick` off.
+    /// 2.15.3 起默认关（用户打发布包时：「教练和BP的默认都是off」），要用写 `coach=on`
     pub coach: bool,
     /// Every AI team bans and picks outright the way the advice would have it (a hard opponent;
     /// over other draft mods' decisions).
@@ -184,7 +185,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ban_pick: Switch::Off,
-            coach: true,
+            coach: false,
             ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
@@ -735,10 +736,10 @@ pub const TEMPLATE: &str = r#"; ================================================
 ban_pick=off
 ; coach : when you let the game's coach draft for you (coach delegation), your team bans and
 ;         picks exactly what the panel advises - it decides last, over other draft mods - even
-;         with ban_pick=off. Other teams are not touched by this switch.
+;         with ban_pick=off. Other teams are not touched by this switch. Off by default.
 ; coach : 选人时交给游戏的教练托管时，你自己的队伍完全照面板的建议禁用和选人（最后决定，别的 BP Mod
-;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。
-coach=on
+;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。默认关（2.15.3 起）。
+coach=off
 ; ai_bp : every AI team bans and picks the way this mod would advise it - the same ranking,
 ;            3+2 lookahead and players' mastery you see on the panel - decided outright, over
 ;            other draft mods (Hell Draft AI). A hard opponent; also the AI-vs-AI matches.
