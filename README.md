@@ -54,6 +54,18 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.0：比赛中的实时胜率曲线
+
+用户在「电竞大脑还能做什么牛逼的功能」的几个方向里挑了「实时胜率曲线」（转播那种）。
+
+- **在哪看**：比赛画面上，比赛时间下面一块面板（`ui::live`）：上面一行两边的胜率（蓝左红右）；一条蓝红比例条；下面一块胜率曲线，从开局到现在，中线以上蓝方占优、以下红方，越高越大。十秒里起落十个点以上，标题换成原因，比如「蓝方拿下大龙 +18%」「红方推掉 2 座塔 +12%」「蓝方打赢一波团战 +11%」，留十几秒。观看、观战、回放都有；离开比赛画面就收起来。只画不接点击。
+- **怎么算**（`winprob`）：逻辑回归。输入是 BP 完的阵容胜率（电竞大脑模型的，对数几率）加上此刻的局面，都是蓝方减红方：经济（千）、人头、还剩几座塔、平均等级、小龙、大龙增益、活着几个人；每一项的系数随比赛时间变（0、5、10、15、20、30 分钟各一组，中间线性插值）。开局只看阵容，越往后局面越重要。
+- **从哪学**：服务端预演每一场正式比赛（十名选手，包括别的队的比赛）时，每 30 秒记一行局面，比赛结束看哪边水晶还在就知道谁赢，整场一行写进 Mod 文件夹的 `winprob.jsonl`（最近 4000 场）。不到 40 场时用一组先验系数（经济每千约 +0.25、大龙增益 +0.6、塔 +0.15……）；之后每多五十场左右在后台重新拟合一次（往先验靠，牛顿法），拿最近两成的比赛检验，`diag.log` 写一行 `[winprob] fitted on N matches ...`（检验的对数损失、各项在 10 分钟时的系数）。只读场上，不改比赛。
+- **小龙、大龙是谁拿的**：游戏不告诉 Mod。看它死的那一刻离它最近的三个英雄哪队多。大龙增益按拿到以后 150 秒算。
+- **读得省**：后台每天要预演几十场，所以平时每 30 tick 只看认得的几条龙和两个水晶，每 10 秒才全场找一遍新刷出来的；选手和塔只在要记一行、算一次胜率、或者有龙刚死的时候才读。每 tick 只问一次「比赛结束没」。
+- **设置**：`live_win_chance`（默认开）；关掉时不显示，也不再记录比赛。
+- **日志**：`[winprob]`（经济从哪读的、第一场记下、每次拟合）、`[ui] the live win chance is shown under the match clock`。
+
 ## 2.14.5：选人格下面的标签跟着格子里的英雄走；AI 队的分路；删掉比赛新闻和补丁预告
 
 用户（截图：换位阶段，亚索在上单选手的格子里，脚下写「中单 胜率 62%」）：「胜率显示的有点问题吧 我移动到哪个位置后应该显示当前位置的胜率吧」。
@@ -366,6 +378,7 @@
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
 | | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条） |
+| | `live_win_chance` | on | 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；关掉时也不再记录比赛 |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | | `balance` | off | 由本 Mod 出版本平衡补丁（每版把胜率离 48%–52% 最远的英雄调强/调弱，所有比赛生效；写进游戏自己的补丁公告和补丁历史，BP/百科的属性显示改动后的数值；开着时游戏自带的英雄补丁关掉） |
@@ -418,6 +431,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.0 (the user picked "a live win-chance curve" from the shortlist of bigger features): in a match, a panel under the clock (`ui::live`) shows both sides' win chance (blue left, red right), a blue/red bar and the curve so far (above the midline: blue ahead); a swing of ten points within ten seconds puts its reason in the title for a while ("蓝方拿下大龙 +18%"). The model (`winprob`) is a logistic regression on the draft's win chance (this mod's model, log-odds) and the situation, blue minus red: gold (thousands), kills, towers standing, average level, drakes, Baron buff, champions alive - each with coefficients that move with the match time (knots at 0, 5, 10, 15, 20 and 30 minutes, linear in between). The server's run of every ten-player match records a row every 30 s and the winner (whose nexus stands) as a line of `winprob.jsonl` (the newest 4000 matches); under 40 matches the starting values are used, and the model is refitted in the background every fifty or so more (Newton, pulled toward the starting values), checked on the newest fifth (`[winprob] fitted on N matches ...`). Who took a drake or Baron is not told to mods: the team with more of the three champions nearest it when it died; the Baron buff counts for 150 s. The server runs read sparingly (the known objectives every 30 ticks, a full pass every 10 s, players and towers only when a row, a live point or a monster's death needs them). `live_win_chance` (on) switches the panel and the recording.
 
 2.14.5 (the user, with a swap-phase screenshot where Yasuo in the top player's slot read "中单 胜率 62%": "after I move a champion to a position it should show that position's win rate"): the game keeps each pick slot for one player (top to support) and moves the champions between slots - an AI team's when it is seated after its picks, the player's own in the swap phase - while 2.14.3's tags paired slot i with pick i. The coach hook now takes the `Position` phase (`draft::seat_decide`): with Smart Position Lock seating AI teams it stays out and reads the lock's `seated.json` (lock 1.3.78+); an AI team no position lock seats is seated by this mod when `ai_bp` is on (`plan::best_seating`, the user's choice); otherwise the game seats it, noted as unknown. The player's own swaps are followed from the swap table's clicks (`follow_swaps`) and checked against the game's selection box; a mismatch or "delegate to the head coach" turns that side's tags off rather than show another champion's numbers. Once a side is seated, each tag names its slot's lane and its champion's win rate there. The match stories and patch previews of 2.14.0 are gone (the user: "not much use"); theme patches and team styles stay.
 

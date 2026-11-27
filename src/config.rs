@@ -164,6 +164,8 @@ pub struct Config {
     pub grid_values: bool,
     /// ... the likely lane of each enemy pick.
     pub lane_tags: bool,
+    /// 比赛画面上的实时胜率（2.15.0，`crate::winprob`）：比赛时间下面的胜率条和曲线；关掉也不记录比赛
+    pub live_win_chance: bool,
     /// ... how opaque its panels' background is (percent); a third of it once the pick under a
     /// panel (each pick column's fifth) is in, so it shows through.
     pub panel_opacity: f32,
@@ -241,6 +243,7 @@ impl Default for Config {
             draft_overlay: true,
             grid_values: true,
             lane_tags: true,
+            live_win_chance: true,
             panel_opacity: 60.0,
             meta_page: true,
             report: true,
@@ -397,6 +400,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
+        "live_win_chance" => cfg.live_win_chance = flag(value)?,
         "panel_opacity" => cfg.panel_opacity = number(value)?,
         "meta_page" => cfg.meta_page = flag(value)?,
         "explore" => cfg.explore = flag(value)?,
@@ -627,7 +631,7 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} ai_tactics_margin={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} live_win_chance={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
          item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}] \
          objective_balance={} objective_length={}-{} objective_drake={}-{} objective_baron={}-{} objective_step={} objective_max={} \
@@ -679,6 +683,7 @@ pub fn summary(c: &Config) -> String {
         if c.draft_overlay { "on" } else { "off" },
         if c.grid_values { "on" } else { "off" },
         if c.lane_tags { "on" } else { "off" },
+        if c.live_win_chance { "on" } else { "off" },
         c.panel_opacity,
         if c.meta_page { "on" } else { "off" },
         if c.explore { "on" } else { "off" },
@@ -1009,6 +1014,8 @@ unranked=keep
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
 ; lane_tags     : under each pick (both teams), its lane and its win rate there / 双方每个已选英雄下面的位置和它在这一路的胜率
+; live_win_chance : in a match, a win-chance bar and curve under the clock (off: matches are not recorded for it either)
+;                 比赛画面上比赛时间下面的实时胜率条和曲线；关掉时也不再记录比赛
 ; panel_opacity : how opaque the two panels' background is, 0-100 (percent); once both teams
 ;                 the panel sits on a pick column's fifth pick: once that pick is in (left panel:
 ;                 blue's, right panel: red's) it drops to a third, so the pick shows through
@@ -1020,6 +1027,7 @@ unranked=keep
 draft_overlay=on
 grid_values=on
 lane_tags=on
+live_win_chance=on
 panel_opacity=60
 meta_page=on
 

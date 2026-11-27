@@ -7,6 +7,7 @@
 //! its own, so every node this mod adds is checked for every few frames and put back when it
 //! is gone, and nothing assumes a node exists without asking.
 
+pub mod live;
 pub mod balance_view;
 pub mod draft_screen;
 pub mod lineup_screen;
@@ -226,6 +227,8 @@ struct State {
     items: item_view::ItemView,
     patch_items: patch_items::PatchItems,
     news: news_scroll::NewsScroll,
+    /// 比赛画面上的实时胜率（2.15.0）
+    live: live::LiveView,
     context: Context,
 }
 
@@ -332,6 +335,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     }
     // 收件箱里电竞大脑的长新闻能往下滚（2.14.4）
     time(Part::Page, || st.news.tick(ui));
+    // 比赛画面上的实时胜率（2.15.0）
+    time(Part::Page, || st.live.tick(ui, frame, cfg.live_win_chance));
 }
 
 /// A team name as a key: lower case, without the league rank the ban/pick screen appends

@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.14.5 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.0 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,11 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.0：比赛中的实时胜率曲线（像转播里那样）。比赛时间下面多了一块面板：两边的胜率、一条蓝红比例条、从开局到
+现在的胜率曲线；大起落时标题写原因，比如「蓝方拿下大龙 +18%」。胜率按 BP 完的阵容加上此刻的经济、人头、塔、
+等级、小龙、大龙增益、活着几个人算，模型从你存档里每天模拟的比赛自己学（每场记在 Mod 文件夹的 winprob.jsonl，
+攒到 40 场以后开始按自己的数据拟合，之前用一组默认值）。设置 live_win_chance（默认开）。
 
 2.14.5：选人格下面的标签跟着格子里的英雄走了。游戏把每个格子固定给一名选手（上单到辅助），英雄会在格子之间挪
 （AI 队选完被排分路、你在换位阶段换），以前标签按选人顺序对格子，挪过以后就写成了别的英雄。现在排好分路以后，
@@ -158,6 +163,8 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
 
 ----------------------------------------------------------------------
 【其他界面】
+· 比赛画面（2.15.0）：比赛时间下面的实时胜率——两边的胜率、一条蓝红比例条、胜率曲线（中线以上蓝方占优），
+  十秒里起落十个点以上时标题写原因（拿下大龙、拿下小龙、推塔、打赢团战）。观看、观战、回放都有。
 · 战术界面：选完人后，值得改的战术选项上标 ★ 和收益。
 · 首发界面：推荐五名首发（标 ★ 和位置）。
 · "版本分析"页：英雄 / 组合 / 选手 / 补丁变化 / 模型，可按位置筛选、按列排序，
@@ -260,6 +267,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   panel_opacity=60   两个面板背景的不透明度（0～100）；面板在屏幕最下面一条的两角，不挡选人位，
                      那一边选满五个后背景再降到三分之一
   lane_tags=on       双方已选英雄脚下的位置和胜率
+  live_win_chance=on 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；off = 不显示，也不再记录比赛
   meta_page=on       "版本分析"页（经典界面左侧菜单 / 新界面标题栏）
 
 其余设置的说明写在 settings.ini 里每一项的上面。
@@ -507,6 +515,12 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.0: in a match, a live win chance under the clock - both sides' numbers, a bar and the
+curve so far, with the reason of a big swing ("Baron +18%"). It reads the draft's win
+chance and the situation (gold, kills, towers, levels, drakes, Baron buff, champions
+alive) and learns from the matches the game simulates (winprob.jsonl in the mod folder;
+starting values until 40 matches). live_win_chance (on).
 
 2.14.5: once the teams are seated (an AI team after its picks, yours in the swap phase)
 the tag under each pick follows the champion in that player's slot: its lane and its win

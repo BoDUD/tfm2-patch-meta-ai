@@ -393,6 +393,8 @@ struct State {
     team_read_day: Option<Date>,
     /// 各队风格是哪个模型算的（2.14.0）
     styles_from: Option<usize>,
+    /// 下次看实时胜率模型要不要重新拟合（2.15.0）
+    winprob_at: Option<Instant>,
 }
 
 impl State {
@@ -449,6 +451,7 @@ impl State {
             athletes_tried: std::collections::HashSet::new(),
             team_names: HashMap::new(),
             styles_from: None,
+            winprob_at: None,
             probes_written: false,
             records_probed: false,
             starting: Vec::new(),
@@ -964,7 +967,18 @@ fn run_steps(st: &mut State, game: &mut impl Game, cfg: &Arc<Config>, now: Insta
     steps.mark("balance");
     sync_styles(st);
     steps.mark("styles");
+    // 实时胜率（2.15.0）：记录又多了一截就在后台重新拟合；tick 速率照游戏设置
+    if cfg.live_win_chance && due(st.winprob_at, now) {
+        st.winprob_at = Some(now + WINPROB_EVERY);
+        if let Some(tps) = game.game_setting("tick_per_second").filter(|t| *t > 0) {
+            crate::winprob::set_tps(tps as f32);
+        }
+        crate::winprob::maybe_fit();
+    }
 }
+
+/// 隔多久看一次实时胜率的模型要不要重新拟合
+const WINPROB_EVERY: Duration = Duration::from_secs(30);
 
 /// 每次有新的模型就重新算一遍各队的风格（2.14.0，`styles`）
 fn sync_styles(st: &mut State) {

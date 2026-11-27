@@ -47,6 +47,7 @@ pub mod scan;
 pub mod series;
 pub mod styles;
 pub mod theme;
+pub mod winprob;
 pub mod stats;
 pub mod server;
 mod shared;
@@ -95,6 +96,7 @@ pub fn reset_for_tests() {
     client::reset_for_tests();
     shared::clear();
     shared::clear_seated();
+    winprob::reset_for_tests();
     lock::set(None);
     ai_tactics::reset_for_tests();
     balance::reset_for_tests();

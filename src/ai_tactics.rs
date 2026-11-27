@@ -313,6 +313,8 @@ impl StableMatchHook for TacticsHook {
     fn on_match_start(&self, sim: &mut StableSim<'_>) {
         // the balance patches (2.8.0) ride on this hook: one match hook a mod
         crate::balance::on_tick(sim, config::get().balance, config::get().item_balance, config::get().objective_balance);
+        // 实时胜率（2.15.0）：服务端预演记录，客户端看比赛算胜率
+        crate::winprob::on_tick(sim, config::get().live_win_chance);
         if !config::get().ai_tactics {
             return;
         }
@@ -324,6 +326,7 @@ impl StableMatchHook for TacticsHook {
 
     fn on_match_tick(&self, sim: &mut StableSim<'_>, _rng_seed: u64) {
         crate::balance::on_tick(sim, config::get().balance, config::get().item_balance, config::get().objective_balance);
+        crate::winprob::on_tick(sim, config::get().live_win_chance);
         if sim.tick() > TICK_WINDOW || !config::get().ai_tactics {
             return;
         }
