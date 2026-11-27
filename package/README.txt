@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.15.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.4 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,11 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.4：收件箱里电竞大脑的长新闻（装备平衡）这回不用点也能滚了：2.15.2 碰到补丁日同一时刻有好几条电竞大脑的新闻
+就认不出打开的是哪一条。现在电竞大脑的长新闻会挪到一个没有别的新闻的分钟（比如 00:02），已经写下的读档时挪一次。
+装备平衡的说明按装备的定位写（法师装、射手装、坦克装……），说清楚这次调多少、是不是把之前的调整回调一部分，
+出装胜率放在句尾。
 
 2.15.3：教练托管默认关（coach=off）：新装时点教练托管由游戏自己的教练来选；想让它照面板的建议禁和选，
 在 settings.ini 里写 coach=on。AI 智能BP（ai_bp）和 ban_pick 本来就默认关。已经在用的 settings.ini
@@ -525,6 +530,10 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.4: this mod's long news in the inbox (the item balance) scroll without a click - they get a minute
+of their own, so the open news is told apart from the patch day's other news. Item reasons follow the
+item's role (mage, marksman, tank...), say how big the change is and when it rolls an earlier one back.
 
 2.15.3: coach delegation is off by default - write coach=on in settings.ini to have it ban and
 pick what the panel advises. AI BP (ai_bp) and ban_pick were off by default already.

@@ -108,6 +108,10 @@ const SWAP_COACH: &str = "main.swap.bottom.coach";
 const ODD_FRAMES: u32 = 3;
 /// 换位阶段的点击每次选人最多写这么多行日志
 const SWAP_LINES: u32 = 40;
+/// 换位阶段过了这么多帧（一秒左右，表里的字都填好了），把换位表和两边的选人格整棵写进 Mod 文件夹（2.15.4）
+const SWAP_DUMP_AFTER: u32 = 60;
+/// 这次开游戏写过了（只写一次）
+static SWAP_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What the overlay shows besides the model.
 pub struct View<'a> {
@@ -326,6 +330,8 @@ pub struct DraftScreen {
     swapping: bool,
     /// 这一场选人写了几行换位点击的日志
     swap_lines: u32,
+    /// 在换位阶段待了几帧
+    swap_frames: u32,
 }
 
 /// What the last drawing worked out.
@@ -909,6 +915,14 @@ impl DraftScreen {
         let swapping = ui.visible(SWAP) == Some(true);
         let (started, ended) = (swapping && !self.swapping, !swapping && self.swapping);
         self.swapping = swapping;
+        // 换位阶段过一秒：换位表和两边的选人格整棵写下来，每次开游戏一次（2.15.4：找读得出每一格坐的是哪个英雄的节点，
+        // 用户：「直接读选人界面的英雄好了」；全界面导出最多 6000 个节点，英雄卡片一多就轮不到这些）
+        self.swap_frames = if swapping { self.swap_frames.saturating_add(1) } else { 0 };
+        if self.swap_frames == SWAP_DUMP_AFTER && !SWAP_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            for (root, file) in [(SWAP, "ui_dump_swap.txt"), (PICK_COLUMNS[0], "ui_dump_blue_picks.txt"), (PICK_COLUMNS[1], "ui_dump_red_picks.txt")] {
+                super::explore::write_tree(&*ui, root, file, "the swap phase, once a game session");
+            }
+        }
         let Some(side) = self.player_side else { return };
         if ended {
             diag::log(&format!("[swap] the swap phase is over: blue {}; red {}", self.seats[0].describe(), self.seats[1].describe()));

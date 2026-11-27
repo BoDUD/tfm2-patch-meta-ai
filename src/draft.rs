@@ -387,11 +387,16 @@ pub mod variety {
     #[derive(Default)]
     struct State {
         draws: HashMap<(Option<usize>, Option<usize>), Draw>,
-        /// (model, draw, weight) -> the believed snapshot.
-        copies: Vec<((usize, usize, u32), Arc<Snapshot>)>,
+        /// (model, draw, weight) -> the believed snapshot. 2.15.4：拿住模型和这一抽本身、按对象比。以前按地址认，旧的一抽
+        /// 释放以后新的一抽可能分到同一个地址，就拿到了上一局的那份（AI 的多样性偶尔照搬上一局；
+        /// `variety_draws_once_per_draft_and_spreads_the_picks` 时好时坏就是这个）
+        copies: Vec<Believed>,
         clock: u64,
         seed: u64,
     }
+
+    /// 一份信念：模型、这一抽、权重（f32 的位），和照着算出来的那份模型
+    type Believed = (Arc<Snapshot>, Arc<HashMap<u16, f32>>, u32, Arc<Snapshot>);
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -435,8 +440,8 @@ pub mod variety {
         draw.progress = progress;
         draw.used = clock;
         let z = draw.z.clone();
-        let key = (Arc::as_ptr(base) as usize, Arc::as_ptr(&z) as usize, weight.to_bits());
-        if let Some((_, s)) = st.copies.iter().find(|(k, _)| *k == key) {
+        let bits = weight.to_bits();
+        if let Some((.., s)) = st.copies.iter().find(|(b, d, w, _)| Arc::ptr_eq(b, base) && Arc::ptr_eq(d, &z) && *w == bits) {
             return s.clone();
         }
         let mut believed = Snapshot::clone(base);
@@ -447,7 +452,7 @@ pub mod variety {
         if st.copies.len() >= COPIES {
             st.copies.remove(0);
         }
-        st.copies.push((key, believed.clone()));
+        st.copies.push((base.clone(), z, bits, believed.clone()));
         believed
     }
 
