@@ -54,6 +54,14 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.2：收件箱的长新闻真的能滚了
+
+用户（截图：电竞大脑装备平衡 2026.1.0，第四件装备以后被截掉）：「这个还是不能往下滚动」。
+
+- **原因**：2.14.4 靠读右边那条新闻的作者（是不是电竞大脑）和正文来接手。用户在游戏里导出的界面结构（`explore` 临时打开，收件箱开着这条新闻）里，右边打开的新闻是 `main.top.right.news.contents.simple_container`，它的标题、作者、正文三个节点类型是空的、读不出字（只有时间 `top.time` 读得到），2.14.4 原来猜的路径（`data.right_panel`）也不对，所以从来没认出来过。左边列表每一行（`main.top.right.news.background.list.contents.<序号>`）的标题、作者读得到，行的名字就是这条新闻在队伍新闻里的序号。
+- **现在**（`ui::news_scroll`）：打开的是第几条，看你在左边列表里点的那一行（旁听这些行的点击，和换位表一样）；还没点过时，右边的时间对得上电竞大脑的某一条、而且它就在列表最上面才算（同一时刻电竞大脑有好几条时就等你点）；点完以后右边的时间变了（键盘换了一条）就不算了。正文：客户端读新闻时把电竞大脑自己写的普通新闻（序号、标题、日期、正文，按 `content_bind` 填好）记下来（`shared::our_news`），按序号取，放进同一格里的滚动框（2.14.4 那个）。`diag.log` 写 `[ui] a long news of this mod scrolls ... news <序号> 「标题」`。
+- 另外：电竞大脑的界面导出键 Insert 在游戏里没被认到（11-18 那几份都是 F9 按出来的）；临时打开 `explore=on` 会把这次游戏还没见过的界面自动导出一份。
+
 ## 2.15.1：实时胜率的记录修好
 
 2.15.0 在游戏里的第一场：面板挂上了，换位跟得对（记下的分路和开赛时游戏用的阵容一样），对面照锁位置排的分路画；但后台预演的比赛一场都没记进 `winprob.jsonl`。原因：水晶被打掉以后会整个从场上拿掉，2.15.0 只认「还在场上、已经死了」的水晶，判不出胜负就不记（2.13.0 数的是活着的水晶有几个，所以两种都认）。现在认得的水晶不见了也算倒了；比赛结束却没判出胜负时 `diag.log` 写一行 `[winprob] a match ended with no winner seen`。另外比赛统计里的经济和身上的钱差得多时写一行，确认读的是这一场累计的经济。
@@ -435,6 +443,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.2: the inbox's long news of this mod really scroll now. The news open on the right (`main.top.right.news.contents.simple_container`) has title, author and body nodes with no readable text (only `top.time` reads), so 2.14.4, which looked for its author, never found one. The open news is now the list row the player clicked (`...background.list.contents.<news index>`, clicks followed as on the swap table), else - with no click yet - the only news of this mod at the time shown that is also the list's top row; its body comes from this mod's own plain news the client reads with the team's news (`shared::our_news`, `content_bind` filled in).
 
 2.15.1: 2.15.0 recorded no match: a destroyed nexus is taken off the field, and 2.15.0 only knew a nexus that stays there dead, so no match had a winner. A known nexus that is gone now counts as down; a match that ends with no winner seen is logged.
 

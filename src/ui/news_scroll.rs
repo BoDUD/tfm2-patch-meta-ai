@@ -1,18 +1,25 @@
 //! 收件箱里电竞大脑的长新闻能往下滚（2.14.4；用户：「装备平衡补丁有点bug 不能往下滚动」）。
 //!
 //! 游戏的普通新闻（Simple）正文是 `news_component/simple_content(_d)` 里一个 728 px 高的文字框（`contents.text`：20 号字，
-//! 行高 36），外面没有滚动框，大约 20 行以后就被截掉。2.14.2 照官方排版的装备新闻一件装备五六行，八件就有五十多行；补丁
-//! 预告、赛前前瞻也可能超过。这里在右边打开的是电竞大脑发的新闻（作者那一行是 [`crate::balance::AUTHOR`]）、字又放不下时，
-//! 把原来的文字框藏起来，在同一个 `contents` 里放一个游戏自己的 scroll_view（和补丁内容页的滚动框一样），里面一样的字、
-//! 一样的字号和行高，高度按行数算好（[`height_of`]）。换一条新闻或者离开就收起来、把原来的框显示回去。
+//! 行高 36），外面没有滚动框，大约 20 行以后就被截掉。2.14.2 照官方排版的装备新闻一件装备五六行，八件就有五十多行。右边
+//! 打开的是电竞大脑发的新闻、字又放不下时，把原来的文字框藏起来，在同一个 `contents` 里放一个游戏自己的 scroll_view（和补丁
+//! 内容页的滚动框一样），里面一样的字、一样的字号和行高，高度按行数算好（[`height_of`]）。换一条新闻或者离开就收起来、把
+//! 原来的框显示回去。
 //!
-//! 找正文：右边每一页（`main.top.right` 的孩子）的 `data.right_panel` 下面，带 `top.author` 和 `contents.text` 的那一块。
-//! 这一页的路径没在游戏里抓过；第一次找到时 diag.log 记一行路径，找到过电竞大脑的新闻却放不进去也记一行。
+//! 2.15.2：游戏里右边打开的那条新闻，标题、作者、正文三个节点都读不出字（用户按出来的界面结构：`[]` 类型、没有文字），
+//! 2.14.4 靠读作者认新闻，所以从来没认出来（用户：「这个还是不能往下滚动」）。现在：
+//! - 打开的是第几条：你在左边列表里点的那一行（行的名字就是新闻在队伍新闻里的序号）。还没点过时，右边的时间对得上电竞
+//!   大脑的某一条、而且它就在列表最上面，才算是它；点完以后右边的时间变了（用键盘换了一条），就不算了。
+//! - 正文：客户端读新闻时把电竞大脑自己写的那几条记下来（[`crate::shared::our_news`]），按序号取。
+
+use std::collections::HashSet;
 
 use super::Ui;
 
-/// 右边的页面都在这下面（百科、收件箱……）
-pub const RIGHT: &str = "main.top.right";
+/// 收件箱页面、右边打开的那条新闻、左边的列表（每一行的名字是新闻的序号）
+pub const PAGE: &str = "main.top.right.news";
+pub const OPEN: &str = "main.top.right.news.contents.simple_container";
+pub const ROWS: &str = "main.top.right.news.background.list.contents";
 /// 我们放进正文的滚动框
 pub const OURS: &str = "pma_scroll";
 /// 游戏正文框的尺寸、字号、行高（`simple_content_d`）
@@ -24,130 +31,115 @@ const LINE_H: i32 = 36;
 const BAR_ROOM: i32 = 15;
 /// 每隔这么多帧看一次
 const LOOK_EVERY: u64 = 15;
-/// 按路径找不到时，每隔这么多次在右边页面里广搜一遍（深度、节点数都有上限）
-const SEARCH_EVERY: u64 = 8;
-const SEARCH_DEPTH: usize = 7;
-const SEARCH_NODES: usize = 800;
 
 /// 收件箱的滚动框
 #[derive(Default)]
 pub struct NewsScroll {
     frame: u64,
-    /// 正文那一块（`…contents`）和放进滚动框的字
-    shown: Option<(String, String)>,
-    /// 广搜找到过的正文块（下次先看它）
-    seen_at: Option<String>,
+    /// 正在滚的那一条（序号）
+    shown: Option<usize>,
+    /// 点过的那一行（序号），和点完以后右边显示的时间（变了就不算了）
+    clicked: Option<usize>,
+    clicked_time: Option<String>,
+    /// 登记过点击的行
+    hooked: HashSet<String>,
 }
 
 impl NewsScroll {
-    pub fn tick(&mut self, ui: &mut impl Ui) {
+    /// 每帧叫（点击只在当帧）
+    pub fn tick(&mut self, ui: &mut impl Ui, clicks: &[String]) {
+        for c in clicks {
+            if let Some(i) = c.strip_prefix(ROWS).and_then(|r| r.strip_prefix('.')).and_then(|r| r.parse::<usize>().ok()) {
+                self.clicked = Some(i);
+                self.clicked_time = None;
+            }
+        }
         self.frame += 1;
         if !self.frame.is_multiple_of(LOOK_EVERY) {
             return;
         }
-        let mut found = find(ui).or_else(|| self.seen_at.as_deref().and_then(|b| block_text(ui, b)));
-        if found.is_none() && (self.frame / LOOK_EVERY).is_multiple_of(SEARCH_EVERY) {
-            if let Some(block) = search(ui) {
-                crate::diag::log_once(&format!("news-scroll-found-{block}"), &format!("[ui] this mod's news is shown at {block}"));
-                found = block_text(ui, &block);
-                self.seen_at = Some(block);
-            }
-        }
-        if let (Some((was, old)), Some((now, text))) = (&self.shown, &found) {
-            if was == now && old == text && ui.exists(&format!("{was}.{OURS}")) {
-                // 游戏可能又把原来的字显示出来
-                if ui.visible(&format!("{was}.text")) == Some(true) {
-                    ui.set_visible(&format!("{was}.text"), false);
-                }
-                return;
-            }
-        }
-        // 换了一条新闻、离开了：上次的收起来
-        if let Some((was, _)) = self.shown.take() {
-            if ui.exists(&format!("{was}.{OURS}")) {
-                ui.remove(&format!("{was}.{OURS}"));
-            }
-            if ui.exists(&format!("{was}.text")) {
-                ui.set_visible(&format!("{was}.text"), true);
-            }
-        }
-        let Some((contents, text)) = found else { return };
-        let height = height_of(&text);
-        if height <= VIEW_H {
+        if !ui.exists(OPEN) {
+            // 离开收件箱（或者打开的不是普通新闻）：从头来
+            self.restore(ui);
+            self.clicked = None;
+            self.clicked_time = None;
             return;
         }
-        if ui.spawn(&contents, &source(height)) && ui.set_text(&format!("{contents}.{OURS}.contents.text"), &text) {
+        // 列表里的行：登记点击（同一行只登记一次，游戏按路径记）
+        let rows = ui.children(ROWS);
+        for row in rows.iter().filter(|r| r.parse::<usize>().is_ok()) {
+            if self.hooked.insert(row.clone()) {
+                ui.on_click(&format!("{ROWS}.{row}"));
+            }
+        }
+        let time = ui.text(&format!("{OPEN}.top.time")).unwrap_or_default();
+        match &self.clicked_time {
+            None if self.clicked.is_some() => self.clicked_time = Some(time.clone()),
+            Some(t) if *t != time => {
+                self.clicked = None;
+                self.clicked_time = None;
+            }
+            _ => {}
+        }
+        let ours = crate::shared::our_news();
+        let open = self.clicked.or_else(|| {
+            // 还没点过：时间对得上电竞大脑的某一条，而且它在列表最上面
+            let top = rows.iter().find_map(|r| r.parse::<usize>().ok());
+            let matching: Vec<usize> = ours.iter().filter(|n| !time.is_empty() && stamp(&n.date) == time).map(|n| n.index).collect();
+            match matching.as_slice() {
+                [i] if top == Some(*i) => Some(*i),
+                _ => None,
+            }
+        });
+        let contents = format!("{OPEN}.contents");
+        let Some(news) = open.and_then(|i| ours.into_iter().find(|n| n.index == i)).filter(|n| height_of(&n.content) > VIEW_H) else {
+            self.restore(ui);
+            return;
+        };
+        if self.shown == Some(news.index) && ui.exists(&format!("{contents}.{OURS}")) {
+            // 游戏可能又把原来的字显示出来
+            if ui.visible(&format!("{contents}.text")) == Some(true) {
+                ui.set_visible(&format!("{contents}.text"), false);
+            }
+            return;
+        }
+        self.restore(ui);
+        let height = height_of(&news.content);
+        if ui.spawn(&contents, &source(height)) && ui.set_text(&format!("{contents}.{OURS}.contents.text"), &news.content) {
             ui.set_visible(&format!("{contents}.text"), false);
             crate::diag::log_once(
-                &format!("news-scroll-{contents}"),
-                &format!("[ui] a long news of this mod scrolls ({height} px in {VIEW_H}): {contents}"),
+                &format!("news-scroll-{}", news.index),
+                &format!("[ui] a long news of this mod scrolls ({height} px in {VIEW_H}): news {} 「{}」", news.index, news.title),
             );
-            self.shown = Some((contents, text));
+            self.shown = Some(news.index);
         } else {
             crate::diag::log_once("news-scroll-failed", &format!("[ui] a long news of this mod could not be made to scroll: {contents}"));
         }
     }
-}
 
-/// 右边正打开的电竞大脑新闻：(正文那一块 `…contents` 的路径, 正文)
-pub fn find(ui: &impl Ui) -> Option<(String, String)> {
-    for page in ui.children(RIGHT) {
-        let panel = format!("{RIGHT}.{page}.data.right_panel");
-        if !ui.exists(&panel) {
-            continue;
+    /// 收起滚动框，把游戏原来的字放回来
+    fn restore(&mut self, ui: &mut impl Ui) {
+        if self.shown.take().is_none() {
+            return;
         }
-        for block in ui.children(&panel) {
-            let ours = ui.text(&format!("{panel}.{block}.top.author")).is_some_and(|a| crate::balance::is_ours(a.trim()));
-            if !ours {
-                continue;
-            }
-            let contents = format!("{panel}.{block}.contents");
-            if let Some(text) = ui.text(&format!("{contents}.text")) {
-                return Some((contents, text));
-            }
+        let contents = format!("{OPEN}.contents");
+        if ui.exists(&format!("{contents}.{OURS}")) {
+            ui.remove(&format!("{contents}.{OURS}"));
+        }
+        if ui.exists(&format!("{contents}.text")) {
+            ui.set_visible(&format!("{contents}.text"), true);
         }
     }
-    None
 }
 
-/// 一块新闻（有 `top.author`、`contents.text` 的那一块）是电竞大脑的就给 (正文那一块, 正文)
-fn block_text(ui: &impl Ui, block: &str) -> Option<(String, String)> {
-    let author = ui.text(&format!("{block}.top.author"))?;
-    if !crate::balance::is_ours(author.trim()) {
-        return None;
+/// 新闻的日期（`2027-09-20T13:00:00`）写成右边显示的样子（`9/20 13:00`）
+pub fn stamp(date: &str) -> String {
+    let (day, clock) = date.split_once('T').unwrap_or((date, ""));
+    let mut parts = day.split('-').skip(1).map(|x| x.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten(), clock.get(..5)) {
+        (Some(m), Some(d), Some(hm)) => format!("{m}/{d} {hm}"),
+        _ => String::new(),
     }
-    let contents = format!("{block}.contents");
-    Some((contents.clone(), ui.text(&format!("{contents}.text"))?))
-}
-
-/// 在右边页面里一层层找作者是电竞大脑的那一块（`…top.author`），深度和节点数都有上限
-fn search(ui: &impl Ui) -> Option<String> {
-    let mut level = vec![RIGHT.to_string()];
-    let mut seen = 0usize;
-    for _ in 0..SEARCH_DEPTH {
-        let mut next = Vec::new();
-        for node in &level {
-            for child in ui.children(node) {
-                let path = format!("{node}.{child}");
-                seen += 1;
-                if seen > SEARCH_NODES {
-                    return None;
-                }
-                if child == "author" && node.ends_with(".top") {
-                    let block = node.trim_end_matches(".top").to_string();
-                    if block_text(ui, &block).is_some() {
-                        return Some(block);
-                    }
-                }
-                next.push(path);
-            }
-        }
-        if next.is_empty() {
-            break;
-        }
-        level = next;
-    }
-    None
 }
 
 /// 正文要多高：每一行按 [`super::patch_items::text_lines`] 算折几行，乘行高，再多留一行
@@ -171,81 +163,100 @@ fn source(height: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::OurNews;
     use crate::ui::tests::FakeUi;
 
-    /// 收件箱打开了一条新闻：作者、正文
-    fn inbox(ui: &mut FakeUi, author: &str, text: &str) -> String {
-        for p in [RIGHT, "main.top.right.news", "main.top.right.news.data"] {
+    /// 收件箱：左边几行（序号），右边打开了一条（读不出字，只有时间）
+    fn inbox(rows: &[usize], time: &str) -> FakeUi {
+        let mut ui = FakeUi::default();
+        for p in [PAGE, "main.top.right.news.background", "main.top.right.news.background.list", ROWS, "main.top.right.news.contents"] {
             ui.add(p, "empty");
         }
-        let block = "main.top.right.news.data.right_panel.simple_container";
-        for p in ["main.top.right.news.data.right_panel", block, &format!("{block}.top"), &format!("{block}.contents")] {
+        for r in rows {
+            ui.add(&format!("{ROWS}.{r}"), "color_selectable");
+        }
+        ui.add(&format!("{ROWS}.h_20280218"), "empty");
+        for p in [OPEN, &format!("{OPEN}.top"), &format!("{OPEN}.contents")] {
             ui.add(p, "empty");
         }
-        ui.add(&format!("{block}.top.author"), "label").text = Some(author.to_string());
-        ui.add(&format!("{block}.contents.text"), "label").text = Some(text.to_string());
-        format!("{block}.contents")
+        ui.add(&format!("{OPEN}.top.time"), "label").text = Some(time.to_string());
+        ui.add(&format!("{OPEN}.contents.text"), "");
+        ui
     }
 
-    fn ticks(view: &mut NewsScroll, ui: &mut FakeUi) {
-        for _ in 0..LOOK_EVERY {
-            view.tick(ui);
+    fn long() -> String {
+        (0..60).map(|k| format!("第 {k} 行")).collect::<Vec<_>>().join("\n")
+    }
+
+    fn ticks(view: &mut NewsScroll, ui: &mut FakeUi, clicks: &[String]) {
+        view.tick(ui, clicks);
+        for _ in 1..LOOK_EVERY {
+            view.tick(ui, &[]);
         }
+    }
+
+    fn ours(index: usize, date: &str, content: &str) -> OurNews {
+        OurNews { index, title: format!("电竞大脑装备平衡 {index}"), date: date.into(), content: content.into() }
     }
 
     #[test]
-    fn a_long_news_of_ours_scrolls() {
-        let long: String = (0..60).map(|k| format!("第 {k} 行")).collect::<Vec<_>>().join("\n");
-        let mut ui = FakeUi::default();
-        let contents = inbox(&mut ui, crate::balance::AUTHOR, &long);
+    fn the_date_is_written_as_the_inbox_shows_it() {
+        assert_eq!(stamp("2028-02-18T00:00:00"), "2/18 00:00");
+        assert_eq!(stamp("2027-09-05T13:30:00"), "9/5 13:30");
+        assert_eq!(stamp("junk"), "");
+    }
+
+    #[test]
+    fn a_long_news_of_ours_opened_by_a_click_scrolls() {
+        let _serial = crate::tests::serial();
+        // 假界面按名字排孩子：10 在最上面（游戏里是列表的顺序）
+        crate::shared::set_our_news(vec![ours(10, "2028-02-18T00:00:00", &long()), ours(80, "2028-02-01T00:00:00", "短短一条。")]);
+        let mut ui = inbox(&[10, 57, 80], "2/18 00:00");
         let mut view = NewsScroll::default();
-        ticks(&mut view, &mut ui);
-        let ours = format!("{contents}.{OURS}");
-        assert!(ui.exists(&format!("{ours}.contents.text")));
-        assert_eq!(ui.text(&format!("{ours}.contents.text")).as_deref(), Some(long.as_str()));
-        assert_eq!(ui.visible(&format!("{contents}.text")), Some(false), "the game's own box is hidden");
+        ticks(&mut view, &mut ui, &[]);
+        assert!(ui.handlers.iter().any(|h| h == &format!("{ROWS}.10")), "the rows' clicks are followed");
+        assert!(!ui.handlers.iter().any(|h| h.contains("h_2028")), "not the date headers");
+        let ours_box = format!("{OPEN}.contents.{OURS}");
+        assert!(ui.exists(&ours_box), "unclicked: the top row is ours and the time is its own");
+        // 点了一条别人的新闻：收起来，原来的字放回来
+        ticks(&mut view, &mut ui, &[format!("{ROWS}.57")]);
+        assert!(!ui.exists(&ours_box));
+        assert_eq!(ui.visible(&format!("{OPEN}.contents.text")), Some(true));
+        // 点回我们那条：滚动框，原来的字藏起来
+        ticks(&mut view, &mut ui, &[format!("{ROWS}.10")]);
+        assert_eq!(ui.text(&format!("{ours_box}.contents.text")), Some(long()));
+        assert_eq!(ui.visible(&format!("{OPEN}.contents.text")), Some(false));
         assert!(ui.spawned.last().unwrap().1.contains(&format!("height: {}px", 61 * LINE_H)));
-        // 下一帧什么都不再放
         let spawned = ui.spawned.len();
-        ticks(&mut view, &mut ui);
-        assert_eq!(ui.spawned.len(), spawned);
-        // 换成一条短新闻：收起来，原来的框显示回去
-        ui.nodes.get_mut(&format!("{contents}.text")).unwrap().text = Some("短短一条。".into());
-        ticks(&mut view, &mut ui);
-        assert!(!ui.exists(&ours));
-        assert_eq!(ui.visible(&format!("{contents}.text")), Some(true));
+        ticks(&mut view, &mut ui, &[]);
+        assert_eq!(ui.spawned.len(), spawned, "nothing more while it stays");
+        // 我们的短新闻：不用滚
+        ticks(&mut view, &mut ui, &[format!("{ROWS}.80")]);
+        assert!(!ui.exists(&ours_box));
+        crate::shared::set_our_news(Vec::new());
     }
 
     #[test]
-    fn a_news_page_elsewhere_is_found_by_its_author() {
-        let long: String = (0..60).map(|k| format!("第 {k} 行")).collect::<Vec<_>>().join("\n");
-        let mut ui = FakeUi::default();
-        let block = "main.top.right.inbox.view.detail.simple_container";
-        for p in [RIGHT, "main.top.right.inbox", "main.top.right.inbox.view", "main.top.right.inbox.view.detail", block, &format!("{block}.top"), &format!("{block}.contents")] {
-            ui.add(p, "empty");
-        }
-        ui.add(&format!("{block}.top.author"), "label").text = Some(crate::balance::AUTHOR.to_string());
-        ui.add(&format!("{block}.contents.text"), "label").text = Some(long.clone());
+    fn without_a_click_only_a_sure_match_counts() {
+        let _serial = crate::tests::serial();
+        // 最上面一行不是我们的：不接手
+        crate::shared::set_our_news(vec![ours(58, "2028-02-18T00:00:00", &long())]);
+        let mut ui = inbox(&[20, 58], "2/18 00:00");
         let mut view = NewsScroll::default();
-        for _ in 0..(LOOK_EVERY * SEARCH_EVERY) {
-            view.tick(&mut ui);
-        }
-        assert!(ui.exists(&format!("{block}.contents.{OURS}.contents.text")));
-        assert_eq!(view.seen_at.as_deref(), Some(block));
-    }
-
-    #[test]
-    fn other_news_and_short_news_are_left_alone() {
-        let long: String = (0..60).map(|k| format!("第 {k} 行")).collect::<Vec<_>>().join("\n");
-        let mut ui = FakeUi::default();
-        let contents = inbox(&mut ui, "联盟官方", &long);
-        let mut view = NewsScroll::default();
-        ticks(&mut view, &mut ui);
-        assert!(!ui.exists(&format!("{contents}.{OURS}")), "the game's own news");
-        let mut ui = FakeUi::default();
-        let contents = inbox(&mut ui, crate::balance::AUTHOR, "一行\n两行");
-        ticks(&mut view, &mut ui);
-        assert!(!ui.exists(&format!("{contents}.{OURS}")), "it fits");
+        ticks(&mut view, &mut ui, &[]);
+        assert!(!ui.exists(&format!("{OPEN}.contents.{OURS}")));
+        // 我们有两条同一时间的：也不接手
+        crate::shared::set_our_news(vec![ours(58, "2028-02-18T00:00:00", &long()), ours(57, "2028-02-18T00:00:00", &long())]);
+        let mut ui = inbox(&[58, 57], "2/18 00:00");
+        ticks(&mut view, &mut ui, &[]);
+        assert!(!ui.exists(&format!("{OPEN}.contents.{OURS}")));
+        // 点了一条以后用键盘换了别的（右边的时间变了）：点的那条不算了
+        ticks(&mut view, &mut ui, &[format!("{ROWS}.58")]);
+        assert!(ui.exists(&format!("{OPEN}.contents.{OURS}")));
+        ui.nodes.get_mut(&format!("{OPEN}.top.time")).unwrap().text = Some("2/17 00:00".into());
+        ticks(&mut view, &mut ui, &[]);
+        assert!(!ui.exists(&format!("{OPEN}.contents.{OURS}")));
         assert_eq!(height_of("一行\n两行"), 3 * LINE_H);
+        crate::shared::set_our_news(Vec::new());
     }
 }

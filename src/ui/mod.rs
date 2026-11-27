@@ -334,7 +334,7 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_patch));
     }
     // 收件箱里电竞大脑的长新闻能往下滚（2.14.4）
-    time(Part::Page, || st.news.tick(ui));
+    time(Part::Page, || st.news.tick(ui, &clicks));
     // 比赛画面上的实时胜率（2.15.0）
     time(Part::Page, || st.live.tick(ui, frame, cfg.live_win_chance));
 }

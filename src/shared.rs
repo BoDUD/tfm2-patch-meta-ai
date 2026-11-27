@@ -172,3 +172,38 @@ pub fn seated(picks: &[&str]) -> Option<Option<[usize; 5]>> {
 pub fn clear_seated() {
     SEATED.write().unwrap_or_else(PoisonError::into_inner).clear();
 }
+
+/// 电竞大脑自己写的一条普通新闻（2.15.2）：收件箱里打开的新闻读不出正文，长新闻滚动按序号从这里取
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OurNews {
+    /// 在队伍新闻列表里的序号（收件箱列表那一行的名字）
+    pub index: usize,
+    pub title: String,
+    /// `2027-09-20T13:00:00`
+    pub date: String,
+    pub content: String,
+}
+
+static OUR_NEWS: RwLock<Vec<OurNews>> = RwLock::new(Vec::new());
+/// 只留最近这么多条
+const OUR_NEWS_KEPT: usize = 60;
+
+/// 整个新闻列表读过一遍：换掉
+pub fn set_our_news(mut list: Vec<OurNews>) {
+    let extra = list.len().saturating_sub(OUR_NEWS_KEPT);
+    list.drain(..extra);
+    *OUR_NEWS.write().unwrap_or_else(PoisonError::into_inner) = list;
+}
+
+/// 新来了一条（同一个序号的换掉）
+pub fn add_our_news(news: OurNews) {
+    let mut list = OUR_NEWS.write().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|n| n.index != news.index);
+    list.push(news);
+    let extra = list.len().saturating_sub(OUR_NEWS_KEPT);
+    list.drain(..extra);
+}
+
+pub fn our_news() -> Vec<OurNews> {
+    OUR_NEWS.read().unwrap_or_else(PoisonError::into_inner).clone()
+}

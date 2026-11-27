@@ -1402,6 +1402,27 @@ fn pretty(raw: &str) -> String {
 
 /// Reads the team's news: the patch notes (the model's, the balance patches' game patch), how many items it has and
 /// its last one. True when the patch notes changed.
+/// 电竞大脑自己写的普通新闻（2.15.2）：作者是电竞大脑、类型是 Simple 的，正文按 `content_bind` 填好
+pub fn our_news_item(index: usize, item: &Value) -> Option<shared::OurNews> {
+    let author = item.get("author")?.as_str()?;
+    if !crate::balance::is_ours(author) {
+        return None;
+    }
+    let simple = item.get("ty")?.get("Simple")?;
+    let mut content = simple.get("content")?.as_str()?.to_string();
+    for pair in simple.get("content_bind").and_then(Value::as_array).into_iter().flatten() {
+        if let (Some(k), Some(v)) = (pair.get(0).and_then(Value::as_str), pair.get(1).and_then(Value::as_str)) {
+            content = content.replace(&format!("{{{k}}}"), v);
+        }
+    }
+    Some(shared::OurNews {
+        index,
+        title: item.get("title").and_then(Value::as_str).unwrap_or_default().to_string(),
+        date: item.get("date").and_then(Value::as_str).unwrap_or_default().to_string(),
+        content,
+    })
+}
+
 fn read_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
     match game.record_json(RecordKindV1::Team, team, "news") {
         Some(json) => match patchnotes::parse_all(&json) {
@@ -1421,6 +1442,10 @@ fn read_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
                 }
                 st.balance.patch = patch;
                 st.balance.news_len = Some(news.len);
+                // 收件箱里长新闻滚动用：电竞大脑自己写的那几条（2.15.2）
+                if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&json) {
+                    shared::set_our_news(items.iter().enumerate().filter_map(|(i, it)| our_news_item(i, it)).collect());
+                }
                 st.balance.news_tail = news.len.checked_sub(1).and_then(|i| game.record_json(RecordKindV1::Team, team, &format!("news.{i}")));
                 let changed = st.notes != news.notes;
                 st.notes = news.notes;
@@ -1451,6 +1476,9 @@ fn probe_news(st: &mut State, game: &mut impl Game, team: usize) -> bool {
     while let Some(json) = game.record_json(RecordKindV1::Team, team, &format!("news.{at}")) {
         if at >= len + NEW_ITEMS_MAX {
             return read_news(st, game, team);
+        }
+        if let Some(ours) = serde_json::from_str::<Value>(&json).ok().and_then(|v| our_news_item(at, &v)) {
+            shared::add_our_news(ours);
         }
         if let Some(note) = patchnotes::parse_item(&json) {
             st.notes.push(note);
@@ -3522,4 +3550,17 @@ mod tests {
         lock().as_ref().and_then(|st| st.balance.acked)
     }
 
+
+    /// 2.15.2：电竞大脑自己写的普通新闻挑出来，正文按 content_bind 填好；别人的、补丁公告不要
+    #[test]
+    fn our_own_plain_news_are_picked_out() {
+        let ours = serde_json::json!({"author": crate::balance::AUTHOR, "date": "2028-02-18T00:00:00", "title": "电竞大脑装备平衡 2026.1.0",
+            "ty": {"Simple": {"content": "本次 {Patch} 的装备", "content_bind": [["Patch", "2026.1.0"]]}}});
+        let n = our_news_item(58, &ours).unwrap();
+        assert_eq!((n.index, n.title.as_str(), n.date.as_str(), n.content.as_str()), (58, "电竞大脑装备平衡 2026.1.0", "2028-02-18T00:00:00", "本次 2026.1.0 的装备"));
+        let theirs = serde_json::json!({"author": "LPL", "date": "2028-02-18T00:00:00", "title": "x", "ty": {"Simple": {"content": "y"}}});
+        assert!(our_news_item(3, &theirs).is_none());
+        let note = serde_json::json!({"author": crate::balance::AUTHOR, "title": "x", "ty": {"PatchNote": {}}});
+        assert!(our_news_item(4, &note).is_none(), "patch notes have their own page");
+    }
 }
