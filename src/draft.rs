@@ -869,7 +869,10 @@ enum Seater {
 /// - 锁位置排（开着它的 AI 分路）：不插手，读它刚写的 `seated.json`（锁位置 1.3.78 起写）；
 /// - 没有位置锁排、开着 `ai_bp` 的 AI 队：电竞大脑自己排（用户选的「电竞大脑来排」），按模型最好的坐法
 ///   （[`crate::plan::best_seating`]：这一路的强度，加上这名选手对它的熟练度）；
-/// - 其他（玩家自己的队、`ai_bp` 关着、别的位置锁）：留给游戏或那个 Mod，记下「不知道」。
+/// - 2.15.5：`ai_bp` 关着时，屏幕上这一局的对手（开着 `lane_tags`）也由电竞大脑排。游戏 0.7.3 的选人界面读不出哪一格
+///   坐的是哪个英雄（头像是图片，换位表的场次 / KDA 和熟练度加成几乎都是 0），游戏自己排的话标签只能收起来；用户：
+///   「要，替 AI 排」。后台别的比赛照旧交给游戏；
+/// - 其他（玩家自己的队、别的位置锁）：留给游戏或那个 Mod，记下「不知道」。
 pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
     if ctx.is_explore() {
         return None;
@@ -886,7 +889,7 @@ pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
         Seater::Lock
     } else if let Some(other) = crate::compat::get().position_lock().filter(|m| *m != "Smart Position Lock") {
         Seater::OtherLock(other)
-    } else if !player && cfg.ai_bp {
+    } else if !player && (cfg.ai_bp || (cfg.lane_tags && live)) {
         Seater::This
     } else {
         Seater::Game
@@ -910,7 +913,9 @@ pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
             b.iter().enumerate().map(|(lane, p)| format!("{} {}", Role::ALL[lane].name(), names.get(*p).map_or("?", String::as_str))).collect::<Vec<_>>().join(", ")
         };
         let how = match (seater, by_lane) {
-            (Seater::This, Some(b)) => format!("seated by this mod: {}", seats(&b)),
+            (Seater::This, Some(b)) => {
+                format!("seated by this mod{}: {}", if cfg.ai_bp { "" } else { " for the lane tags (ai_bp off, no position lock)" }, seats(&b))
+            }
             (Seater::This, None) => "left to the game (the model does not know every champion)".to_string(),
             (Seater::Lock, Some(b)) => format!("Smart Position Lock seats it: {}", seats(&b)),
             (Seater::Lock, None) if live => "Smart Position Lock seats it, but its seated.json does not say how (a lock before 1.3.78?): the tags under these picks are off".to_string(),
@@ -1746,7 +1751,13 @@ mod tests {
         shared::set_player_team(Some(19));
         set_live(true);
         let ai = ctx_for(12, 19, &theirs);
-        assert_eq!(seat(&ai), None, "ai_bp off: the game seats them");
+        // ai_bp 关着：你这一场的对手照样由电竞大脑排（2.15.5，标签才对得上）；后台别的比赛交给游戏
+        let order = seat(&ai).expect("the player's opponent: seated for the tags");
+        assert_eq!(shared::seated(&ai_picks), Some(crate::lock::by_lane_of(&[0, 1, 2, 3, 4], &order)), "noted by lane");
+        assert_eq!(seat(&ctx_for(12, 33, &theirs)), None, "off screen with ai_bp off: the game seats them");
+        // 标签也关了：交给游戏
+        config::set_for_tests(config::Config { lane_tags: false, ..config::Config::default() });
+        assert_eq!(seat(&ai), None, "no tags, no ai_bp: the game seats them");
         assert_eq!(shared::seated(&ai_picks), Some(None), "noted: not known how");
         config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
         let order = seat(&ai).expect("seated by the model");

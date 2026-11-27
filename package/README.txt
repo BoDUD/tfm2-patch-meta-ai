@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.15.4 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.5 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,10 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.5：没装位置锁也能看到对手每个英雄下面正确的位置和胜率了：你自己的比赛里，对手的 AI 队由电竞大脑来排分路
+（游戏的选人界面读不出哪一格是哪个英雄，游戏自己排的话标签只能收起来）。只管你这一场的对手，别的比赛不动；
+装了位置锁照旧由它排；关掉 lane_tags 就不排。
 
 2.15.4：收件箱里电竞大脑的长新闻（装备平衡）这回不用点也能滚了：2.15.2 碰到补丁日同一时刻有好几条电竞大脑的新闻
 就认不出打开的是哪一条。现在电竞大脑的长新闻会挪到一个没有别的新闻的分钟（比如 00:02），已经写下的读档时挪一次。
@@ -36,7 +40,7 @@
 2.14.5：选人格下面的标签跟着格子里的英雄走了。游戏把每个格子固定给一名选手（上单到辅助），英雄会在格子之间挪
 （AI 队选完被排分路、你在换位阶段换），以前标签按选人顺序对格子，挪过以后就写成了别的英雄。现在排好分路以后，
 每个标签写这一格的位置和坐在这里的英雄在这一路的胜率。AI 队的分路：装了锁位置照旧由它排（要锁位置 1.3.78），
-没有位置锁排时由电竞大脑排（开着 ai_bp 时）。你自己的换位电竞大脑跟着你的点击记；对不上、或者交给主教练换位时，
+没有位置锁排时由电竞大脑排（开着 ai_bp 时；2.15.5 起你这一场的对手总由它排）。你自己的换位电竞大脑跟着你的点击记；对不上、或者交给主教练换位时，
 你这边的标签先收起来，不写错的。另外删掉了赛前前瞻、赛后复盘和补丁预告。
 
 2.14.4：收件箱里电竞大脑的长新闻可以往下滚了。游戏的普通新闻正文是一个固定高度的框，大约 20 行以后就被截掉、
@@ -281,7 +285,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   grid_values=on     英雄卡片上的数字
   panel_opacity=60   两个面板背景的不透明度（0～100）；面板在屏幕最下面一条的两角，不挡选人位，
                      那一边选满五个后背景再降到三分之一
-  lane_tags=on       双方已选英雄脚下的位置和胜率
+  lane_tags=on       双方已选英雄脚下的位置和胜率（没有位置锁时，你这一场对手的分路由电竞大脑来排）
   live_win_chance=on 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；off = 不显示，也不再记录比赛
   meta_page=on       "版本分析"页（经典界面左侧菜单 / 新界面标题栏）
 
@@ -530,6 +534,10 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.5: without a position lock, your opponent's tags are right too: in your own matches this mod seats the
+opponent's champions (the ban/pick screen does not tell which champion sits in which slot). Other matches
+are left alone; a position lock still seats them; lane_tags=off turns it off.
 
 2.15.4: this mod's long news in the inbox (the item balance) scroll without a click - they get a minute
 of their own, so the open news is told apart from the patch day's other news. Item reasons follow the

@@ -1015,6 +1015,8 @@ unranked=keep
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
 ; lane_tags     : under each pick (both teams), its lane and its win rate there / 双方每个已选英雄下面的位置和它在这一路的胜率
+;                 with no position lock seating your opponent, this mod seats it (else its tags could not follow its champions)
+;                 没有位置锁给你的对手排分路时，由电竞大脑来排（游戏自己排的话读不出谁坐哪，标签只能收起来）
 ; live_win_chance : in a match, a win-chance bar and curve under the clock (off: matches are not recorded for it either)
 ;                 比赛画面上比赛时间下面的实时胜率条和曲线；关掉时也不再记录比赛
 ; panel_opacity : how opaque the two panels' background is, 0-100 (percent); once both teams

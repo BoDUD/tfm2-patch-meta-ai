@@ -54,6 +54,14 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.5：没有位置锁时，你对手的 AI 队由电竞大脑排分路
+
+用户：「BP页面的胜率显示现在不打位置锁的玩家也能正确显示吗」→「直接读选人界面的英雄好了」→（读不出）「要，替 AI 排」。
+
+- **查到的**（2.15.4 在换位阶段把换位表和两边选人格整棵写下来，加一份全界面导出；游戏 0.7.3）：没有一个节点说得出某一格坐的是哪个英雄。选人格 `done.champion.icon` 和换位表 `data.champion.icon` 是图片（没有状态）；选人格的「英雄位置」提示框鼠标停上去才填字；选手提示框里的英雄是他的常用英雄；能读的数字（换位表的场次、击杀、死亡、助攻、KDA、等级、评分，选人格的熟练度加成）这一局十个人全是「0 / - / +0%」，拿来反推也分不出来。
+- **现在**（`draft::seat_decide`）：`ai_bp` 关着时，屏幕上这一局的对手（开着 `lane_tags`）也由电竞大脑排分路（`plan::best_seating`，和开着 `ai_bp` 时一样），标签就一直对得上。后台别的比赛照旧交给游戏；装了位置锁的照旧由它排；你自己点「交给主教练」时游戏不经过任何 Mod，你这边的标签照旧收起来。`diag.log`：`[seat] ... seated by this mod for the lane tags (ai_bp off, no position lock)`。
+- 2.15.4 的换位阶段导出删掉了（每次开游戏写约 450 KB）。
+
 ## 2.15.4：收件箱的长新闻按列表的日期和时间认，不用点；装备平衡的文案
 
 用户（截图：电竞大脑装备平衡 2026.1.1，第三件装备以后被截掉）：「装备的滚轮还是没修好啊」「还有文案太过于僵硬」。
@@ -461,6 +469,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.5: with no position lock seating it, the player's opponent is seated by this mod (`plan::best_seating`) even with `ai_bp` off, as long as `lane_tags` is on - game 0.7.3's ban/pick screen tells no slot's champion (portraits are images, the position tooltip fills on hover, the swap table's numbers and the proficiency badges were all 0 / - / +0%), so a seating the game makes leaves the tags off. Other AI matches stay the game's. The 2.15.4 swap-phase dumps are gone.
 
 2.15.4: the inbox's long news of this mod scroll without a click. The open news is the only list row whose day (the nearest date header above it, `h_20260225`, found by position) and time match the time shown on the right; with several rows at that time, the one clicked. The server moves this mod's long news to a minute of their own within the hour (`server::spread_long_news`: a new round's at once, older ones once on the first load, `FIXUPS` 3), so the item balance news is always told apart from the patch day's other news at 00:00. Item reasons are written by the item's role (`ItemRole` from the 4+6 catalog's stats: mage, mage defense, marksman, assassin, fighter, tank, other), two each way, with the step's size and a plain roll-back line when a buff undoes a nerf or the other way; the builders' win rate goes to the end. The swap phase's table and both pick columns are written to `ui_dump_swap.txt` / `ui_dump_blue_picks.txt` / `ui_dump_red_picks.txt` once a game session, to find a node that tells which champion sits in a slot.
 
