@@ -54,6 +54,10 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.1：实时胜率的记录修好
+
+2.15.0 在游戏里的第一场：面板挂上了，换位跟得对（记下的分路和开赛时游戏用的阵容一样），对面照锁位置排的分路画；但后台预演的比赛一场都没记进 `winprob.jsonl`。原因：水晶被打掉以后会整个从场上拿掉，2.15.0 只认「还在场上、已经死了」的水晶，判不出胜负就不记（2.13.0 数的是活着的水晶有几个，所以两种都认）。现在认得的水晶不见了也算倒了；比赛结束却没判出胜负时 `diag.log` 写一行 `[winprob] a match ended with no winner seen`。另外比赛统计里的经济和身上的钱差得多时写一行，确认读的是这一场累计的经济。
+
 ## 2.15.0：比赛中的实时胜率曲线
 
 用户在「电竞大脑还能做什么牛逼的功能」的几个方向里挑了「实时胜率曲线」（转播那种）。
@@ -431,6 +435,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.1: 2.15.0 recorded no match: a destroyed nexus is taken off the field, and 2.15.0 only knew a nexus that stays there dead, so no match had a winner. A known nexus that is gone now counts as down; a match that ends with no winner seen is logged.
 
 2.15.0 (the user picked "a live win-chance curve" from the shortlist of bigger features): in a match, a panel under the clock (`ui::live`) shows both sides' win chance (blue left, red right), a blue/red bar and the curve so far (above the midline: blue ahead); a swing of ten points within ten seconds puts its reason in the title for a while ("蓝方拿下大龙 +18%"). The model (`winprob`) is a logistic regression on the draft's win chance (this mod's model, log-odds) and the situation, blue minus red: gold (thousands), kills, towers standing, average level, drakes, Baron buff, champions alive - each with coefficients that move with the match time (knots at 0, 5, 10, 15, 20 and 30 minutes, linear in between). The server's run of every ten-player match records a row every 30 s and the winner (whose nexus stands) as a line of `winprob.jsonl` (the newest 4000 matches); under 40 matches the starting values are used, and the model is refitted in the background every fifty or so more (Newton, pulled toward the starting values), checked on the newest fifth (`[winprob] fitted on N matches ...`). Who took a drake or Baron is not told to mods: the team with more of the three champions nearest it when it died; the Baron buff counts for 150 s. The server runs read sparingly (the known objectives every 30 ticks, a full pass every 10 s, players and towers only when a row, a live point or a monster's death needs them). `live_win_chance` (on) switches the panel and the recording.
 

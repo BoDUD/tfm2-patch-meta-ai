@@ -203,12 +203,14 @@ impl Tracker {
         // 小龙、大龙、水晶：平时只看认得的，隔一阵全场找一遍（新刷出来的）
         let full = self.known.is_empty() || self.scans.is_multiple_of(FULL_EVERY);
         self.scans += 1;
-        let now: Vec<Objective> = if full {
+        let mut now: Vec<Objective> = if full {
             pitch.objectives()
         } else {
             self.known.values().filter_map(|o| pitch.objective(o.id, o.what)).collect()
         };
         let ids: HashSet<usize> = now.iter().map(|o| o.id).collect();
+        // 水晶被打掉以后可能整个从场上拿掉：认得的水晶不见了，就当它倒了
+        now.extend(self.known.values().filter(|b| matches!(b.what, What::Nexus(_)) && !ids.contains(&b.id)).map(|b| Objective { alive: false, ..*b }));
         let mut died: Vec<Objective> = Vec::new();
         for o in &now {
             if let Some(b) = self.known.get(&o.id).filter(|b| b.alive && !o.alive) {
@@ -768,6 +770,17 @@ pub fn on_tick(sim: &StableSim<'_>, on: bool) {
         publish(key, step.situation.minutes, chance, step.situation);
     }
     let winner = step.winner.or_else(|| ended.then_some(usize::MAX));
+    if record && winner == Some(usize::MAX) {
+        let nexus: Vec<String> = tracker
+            .known
+            .values()
+            .filter_map(|o| match o.what {
+                What::Nexus(t) => Some(format!("team {t} {}", if o.alive { "standing" } else { "down" })),
+                _ => None,
+            })
+            .collect();
+        diag::log_once("winprob-no-winner", &format!("[winprob] a match ended with no winner seen (nexus: {nexus:?}): not recorded"));
+    }
     if let Some(w) = winner {
         if record && w < 2 && !tracker.rows.is_empty() {
             append(&Match { draft: tracker.draft.unwrap_or(0.0), blue_won: w == 0, rows: std::mem::take(&mut tracker.rows) });
@@ -802,6 +815,10 @@ impl Pitch for SimPitch<'_, '_> {
             let earned = p.statistics_json("gold").and_then(|j| j.trim().parse::<f64>().ok());
             let wallet = p.gold() as f64;
             match earned {
+                Some(e) if (e - wallet).abs() > 1000.0 => diag::log_once(
+                    "winprob-gold-earned",
+                    &format!("[winprob] the match statistics' gold runs ahead of the gold on hand ({e:.0} vs {wallet:.0}): it is the gold earned"),
+                ),
                 Some(e) => diag::log_once("winprob-gold", &format!("[winprob] gold from the match statistics (e.g. {e:.0}, on hand {wallet:.0})")),
                 None => diag::log_once("winprob-gold", &format!("[winprob] no gold in the match statistics: gold on hand is used (e.g. {wallet:.0})")),
             }
@@ -964,6 +981,26 @@ mod tests {
         f.objectives[2].alive = false;
         assert_eq!(t.step(&f, 60.0, true, true, &model, &draft).winner, Some(0));
         assert_eq!(t.rows.len(), 2, "not 30 s yet");
+    }
+
+    #[test]
+    fn a_nexus_that_vanishes_has_fallen() {
+        let mut f = Fake {
+            players: (0..5).map(|i| player(0, 100 + i)).chain((0..5).map(|i| player(1, 900 + i))).collect(),
+            objectives: vec![
+                Objective { id: 1, what: What::Nexus(0), alive: true, pos: (0, 0) },
+                Objective { id: 2, what: What::Nexus(1), alive: true, pos: (999, 0) },
+            ],
+            ..Fake::default()
+        };
+        let mut t = Tracker::default();
+        let model = Model::default();
+        let draft = |_: &[Player]| 0.0f32;
+        assert_eq!(t.step(&f, 60.0, true, false, &model, &draft).winner, None);
+        // 蓝方的水晶整个从场上拿掉了：红方赢
+        f.tick = 30;
+        f.objectives.remove(0);
+        assert_eq!(t.step(&f, 60.0, true, false, &model, &draft).winner, Some(1));
     }
 
     #[test]
