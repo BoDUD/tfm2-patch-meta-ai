@@ -233,8 +233,10 @@ pub type EntryFn = unsafe extern "C" fn(*const HostApiV1) -> *mut ModExportV1;
 /// first thing that is wrong.
 pub fn run(required: RequiredFn, entry: EntryFn, dir: &std::path::Path) {
     // the AI nudges below are ban_pick's, off by default: a player who turned it on
+    // 教练托管 2.15.3 起也默认关，下面要看托管的那一段，这里一起打开
     std::fs::write(dir.join("settings.ini"), "[features]
 ban_pick=on
+coach=on
 ").unwrap();
 
     let names = ["alpha", "bravo", "charlie", "delta", "echo", "fox", "golf", "hotel", "india", "juliet"];
@@ -428,7 +430,7 @@ ban_pick=on
         assert!(fielded_alpha > alpha, "alpha with his player {fielded_alpha} vs {alpha}");
         let (_, banned_alpha) = with_lineups(hv.score_ban, 0, &strangers, &alpha_player);
         assert!(banned_alpha > alpha_ban, "alpha against his player {banned_alpha} vs {alpha_ban}");
-        // the save's own team (coach delegation, coach=on by default): the model counts twice
+        // the save's own team (coach delegation, coach=on in the settings above): the model counts twice
         let mut own: DraftCtxV1 = std::ptr::read(&ctx);
         own.ally_team = 7;
         let mut doubled = 0.0f32;

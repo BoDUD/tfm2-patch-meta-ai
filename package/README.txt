@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.14.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.3 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,31 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.3：教练托管默认关（coach=off）：新装时点教练托管由游戏自己的教练来选；想让它照面板的建议禁和选，
+在 settings.ini 里写 coach=on。AI 智能BP（ai_bp）和 ban_pick 本来就默认关。已经在用的 settings.ini
+不受影响（里面写着 coach=on）。
+
+2.15.2：收件箱里电竞大脑的长新闻（比如装备平衡）真的能往下滚了：在左边列表里点一下那条新闻，右边就换成能滚的框。
+（2.14.4 认不出游戏里打开的新闻，所以一直没生效。）
+
+2.15.1：实时胜率的记录修好：2.15.0 判不出后台比赛谁赢（水晶被打掉后会从场上拿掉），一场都没记下，模型就一直
+用默认值。现在能记了，攒够 40 场后就按你存档的比赛来算。
+
+2.15.0：比赛中的实时胜率曲线（像转播里那样）。比赛时间下面多了一块面板：两边的胜率、一条蓝红比例条、从开局到
+现在的胜率曲线；大起落时标题写原因，比如「蓝方拿下大龙 +18%」。胜率按 BP 完的阵容加上此刻的经济、人头、塔、
+等级、小龙、大龙增益、活着几个人算，模型从你存档里每天模拟的比赛自己学（每场记在 Mod 文件夹的 winprob.jsonl，
+攒到 40 场以后开始按自己的数据拟合，之前用一组默认值）。设置 live_win_chance（默认开）。
+
+2.14.5：选人格下面的标签跟着格子里的英雄走了。游戏把每个格子固定给一名选手（上单到辅助），英雄会在格子之间挪
+（AI 队选完被排分路、你在换位阶段换），以前标签按选人顺序对格子，挪过以后就写成了别的英雄。现在排好分路以后，
+每个标签写这一格的位置和坐在这里的英雄在这一路的胜率。AI 队的分路：装了锁位置照旧由它排（要锁位置 1.3.78），
+没有位置锁排时由电竞大脑排（开着 ai_bp 时）。你自己的换位电竞大脑跟着你的点击记；对不上、或者交给主教练换位时，
+你这边的标签先收起来，不写错的。另外删掉了赛前前瞻、赛后复盘和补丁预告。
+
+2.14.4：收件箱里电竞大脑的长新闻可以往下滚了。游戏的普通新闻正文是一个固定高度的框，大约 20 行以后就被截掉、
+也滚不动；2.14.2 照官方排版的装备平衡新闻一件装备五六行，八件就放不下。现在打开电竞大脑发的新闻、字又放不下时，
+正文换成能滚的框（字、字号、行高不变），装备平衡等电竞大脑的新闻都一样。
 
 2.14.3：选人界面双方每个已选英雄的脚下多了一个小标签：位置图标和「上单 胜率 52%」——位置是电竞大脑读的这一队的
 分路，胜率是模型估的这个版本它在这一路的胜率；52% 以上绿、48% 以下红。对方的位置读得没把握时，位置后面带个问号。
@@ -30,13 +55,10 @@
 AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写一行 [coach] the draft as the game lists it，
 能看到游戏给了什么、补了几个。
 
-2.14.0：玩起来更有比赛味。① 赛前前瞻和赛后复盘（match_stories，默认开）：联赛里你的每场比赛当天，收件箱
-来一条前瞻（积分榜、近况、交手、对方风格和招牌英雄、可能先禁谁、关键选手、赛前胜率），打完来一条复盘
-（每局击杀、经济、小龙大龙、MVP，本系列赛你方最佳）。② 补丁预告和主题版本（要先开 balance）：补丁日前两天
-发「补丁预告」，写平衡补丁计划改谁；每隔 3 个游戏版本出一次主题版本，一类英雄（比如射手）一起加强 8%，
-版本风向隔一段时间变一次。③ AI 战队有风格（ai_style，默认 1）：每支队伍按自己的比赛形成风格（如「偏爱刺客
-· 开团型」），开着 ai_bp 时 AI 选人往风格上靠（每手最多让出 1 个胜率点）；对方风格写在 BP 界面左下角和前瞻里。
-详见下面【比赛新闻和 AI 风格】和详解第七⅞条。
+2.14.0：① 主题版本（要先开 balance）：每隔 3 个游戏版本出一次主题版本，一类英雄（比如射手）一起加强 8%，
+版本风向隔一段时间变一次。② AI 战队有风格（ai_style，默认 1）：每支队伍按自己的比赛形成风格（如「偏爱刺客
+· 开团型」），开着 ai_bp 时 AI 选人往风格上靠（每手最多让出 1 个胜率点）；对方风格写在 BP 界面左下角。
+（2.14.0 的赛前前瞻、赛后复盘和补丁预告 2.14.5 删掉了。）详见下面【AI 风格和主题版本】和详解第七⅞条。
 
 2.13.3：禁用只算一个英雄会打的那几路（位置锁的位置，没装就按英雄联盟的）。对方已经拿了射手、下路有人，
 就不会再去禁只打下路的射手；阿克尚、库奇这类真能换路的照样会被当成中路威胁。教练托管自己算的禁人会在 diag.log
@@ -91,7 +113,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   · 大数字：你现在这套阵容的胜率。
   · 下面两行：双方的阵容类型和最大缺口，例如
       我方 开团 · 缺前排        敌方 消耗 · 伤害单一
-    2.14.0 起对方那一行后面还写对方队伍的风格（「敌方 消耗 · 风格 偏爱刺客 · 开团型」，见【比赛新闻和 AI 风格】）。
+    2.14.0 起对方那一行后面还写对方队伍的风格（「敌方 消耗 · 风格 偏爱刺客 · 开团型」，见【AI 风格和主题版本】）。
 
 ■ 右下角：建议面板（四行）
   · 轮到你禁用：  禁 1 / 禁 2 / 禁 3 —— 最该禁的三个英雄
@@ -138,10 +160,10 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   · 换位阶段，右下角改为显示五个英雄分给五名选手的最佳方式。
   · 用了 Smart Position Lock（智能位置锁定）时，被锁住的英雄不会出现在推荐里。
 
-■ 教练托管
+■ 教练托管（coach=on，默认关）
   BP 时点游戏的"教练托管"，你自己的队伍会完全照右下角面板的建议来禁和选
   （禁 1 / 选 那一行，推演和位置锁都算在内）。不影响其他队伍。
-  不想要就在 settings.ini 里写 coach=off。
+  2.15.3 起默认关（托管由游戏自己的教练选）；要用就在 settings.ini 里写 coach=on。
   F8 的 BP 复盘和 diag.log 的 [review] 行会写"教练托管决定了几手、实际照做了几手"；
   如果实际照做的少，说明别的 Mod 盖掉了它（见下面"地狱人机"）。
 
@@ -151,6 +173,8 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
 
 ----------------------------------------------------------------------
 【其他界面】
+· 比赛画面（2.15.0）：比赛时间下面的实时胜率——两边的胜率、一条蓝红比例条、胜率曲线（中线以上蓝方占优），
+  十秒里起落十个点以上时标题写原因（拿下大龙、拿下小龙、推塔、打赢团战）。观看、观战、回放都有。
 · 战术界面：选完人后，值得改的战术选项上标 ★ 和收益。
 · 首发界面：推荐五名首发（标 ★ 和位置）。
 · "版本分析"页：英雄 / 组合 / 选手 / 补丁变化 / 模型，可按位置筛选、按列排序，
@@ -178,23 +202,14 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   5. BP 复盘：上一次 BP 的每一手 —— 哪一方、选还是禁、当时对我方的价值、
      当时的建议、之后的胜率，以及你照建议走了几手
 
-【比赛新闻和 AI 风格（2.14.0）】
-· 赛前前瞻（match_stories=on，默认开）：联赛里你的每场比赛（练习赛不算）当天，收件箱来一条
-  「赛前前瞻：A vs B（BO3）」：积分榜名次和胜负、两队最近 5 个系列赛、这个存档里两队交手的局数、
-  对方的风格和招牌英雄、对方可能先禁的三个英雄（按 AI 替对方禁人的算法，看双方的上场选手）、
-  对方实力最高的两名选手、只看双方选手的赛前胜率（还没算 BP）。
-· 赛后复盘（同一个设置）：打完两天以内来一条「赛后复盘：A 2:1 B」：每局蓝红方、时长、胜负、击杀、
-  经济、小龙、大龙、谁先拿第一条小龙和大龙、MVP（英雄和战绩），最后是本系列赛你方平均评分最高的选手。
-· 每场的前瞻和复盘各只发一次（存档里记着），读档不会重发。杯赛这类不在联赛里的比赛不发。
-· 补丁预告（patch_preview=on，要先开 balance）：补丁日前两天发一条「电竞大脑补丁预告」，写平衡补丁
-  计划削弱、加强谁（各最多 10 个）、装备、防御塔和大小龙；之后两天的比赛还可能让计划变，以正式补丁为准。
+【AI 风格和主题版本（2.14.0）】
 · 主题版本（balance_theme_every=3，要先开 balance）：每隔 3 个游戏版本，平衡补丁挑一类英雄一起加强，
   见详解第七⅞条。
 · AI 战队有风格（ai_style=1）：每支队伍按自己最近 40 局用过的英雄形成风格——阵容偏前排、开团、保护、
   消耗、突进、后期还是控制，偏爱哪类英雄——和其他队伍比明显突出的最多两项，例如「偏爱刺客 · 开团型」，
   都不突出就是「均衡型」（少于 10 局的队伍还没有风格）。开着 ai_bp 时，AI 选人往自己的风格上靠，但只在
   差不多好的几个里挑：每一手最多让出 ai_style 个胜率点（和 ai_variety 取大的，不叠加），不会为了风格变弱。
-  对方的风格也用来推测它的下一手（敌可能、推演），写在 BP 界面左下角对方阵容那一行和赛前前瞻里。
+  对方的风格也用来推测它的下一手（敌可能、推演），写在 BP 界面左下角对方阵容那一行。
   ai_style=0：AI 不照风格选（显示和推测照旧）。
 
 ----------------------------------------------------------------------
@@ -205,14 +220,13 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   [features]
   ban_pick=off       AI 队伍的 BP 用本 Mod 的估值（默认关；auto = 开，除非装了接管 AI 选人的 Mod）
   tier_list=auto     自动梯队（auto = 开，除非装了写梯队的 Mod）；off = 关
-  coach=on           教练托管时你自己的队伍按建议 BP；off = 关
+  coach=off          on = 教练托管时你自己的队伍按建议 BP（2.15.3 起默认关）
   ai_bp=off          AI BP：on = 所有 AI 队伍都完全按本 Mod 的建议禁和选（和面板同一套
                      排序，含 3+2 推演），盖过地狱人机等其他 BP Mod；AI 也会研究对手的常用英雄
   ai_variety=1       AI BP 每局对英雄的判断会浮动，让更多英雄有机会上场、AI 也不好猜；
                      这个数是每一手最多让出多少胜率点（0 = 永远选最佳，最大 5）
   ai_style=1         AI 战队的风格（2.14.0）：开着 ai_bp 时 AI 选人往自己的风格上靠，每一手最多为此
                      让出这么多胜率点（0 = 不照风格选，最大 5）
-  match_stories=on   联赛里你的比赛当天发赛前前瞻、打完发赛后复盘（2.14.0）
   ai_tactics=off     on = 由模型 BP 的 AI 队伍（AI BP）在比赛开始时也按模型选战术（战术界面上
                      ★ 的那些；比原来的好 ai_tactics_margin 以上才换）。你自己的战术不动，自动 BP
                      也一样。「收官」不改，由各队教练自己选（2.7.14 起：模型几乎都选激进，比赛被缩短）
@@ -247,7 +261,6 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   objective_max=100      累计最多加多少（百分比，0～300；最多减到 -50%）
   balance_theme_every=3  每隔几个游戏版本出一次主题版本（热修复不算；0 = 不出；见详解第七⅞条）
   balance_theme_step=8   主题版本那一类英雄加强多少（强度百分比，1～30）
-  patch_preview=on       补丁日前两天发「补丁预告」新闻（要先开 balance）
 
   [model]
   lol_prior=auto     英雄联盟经验的分量：auto = 存档比赛够多后（约 150 场大会比赛）
@@ -264,6 +277,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   panel_opacity=60   两个面板背景的不透明度（0～100）；面板在屏幕最下面一条的两角，不挡选人位，
                      那一边选满五个后背景再降到三分之一
   lane_tags=on       双方已选英雄脚下的位置和胜率
+  live_win_chance=on 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；off = 不显示，也不再记录比赛
   meta_page=on       "版本分析"页（经典界面左侧菜单 / 新界面标题栏）
 
 其余设置的说明写在 settings.ini 里每一项的上面。
@@ -407,7 +421,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   · 你在数据库里改了塔、小龙或大龙的生命值：电竞大脑马上去掉它的百分比，按你的数值来，之后重新判断。
   · 刚装上：之前的比赛没有记录，要攒够比赛（一个版本的比赛一般就够）以后的下一个版本才出第一次调整。
 
-七⅞、主题版本和补丁预告（2.14.0）
+七⅞、主题版本（2.14.0）
   · 主题版本：每隔 balance_theme_every 个游戏版本（默认 3；热修复不算），那个版本的补丁挑一类英雄
     （游戏自己的职业：战士、射手、法师、辅助、刺客、坦克；至少 3 个英雄的类别才挑）全部加强
     balance_theme_step（默认 8%）。最近两次主题用过的类别不再挑；挑哪一类由版本号决定，同一个版本重算
@@ -416,10 +430,6 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
     再慢慢削回来。所以版本风向隔一段时间变一次，不会一直是同一批英雄。
   · 补丁公告里这些英雄的理由写主题版本，补丁新闻开头写「本版本是主题版本「射手版本」……」。
   · 已经出过几轮补丁的存档，装上后的下一个游戏版本就是第一次主题版本；balance_theme_every=0 = 不出。
-  · 补丁预告：补丁日前两天，电竞大脑本来就会提前把下一轮补丁做好（补丁当天写进游戏的公告）。第一次
-    做好时发一条「电竞大脑补丁预告：<日期> 的版本」：计划削弱、加强的英雄（各最多 10 个，带胜率）、装备、
-    防御塔和大小龙，主题版本写是哪一类。之后两天的比赛还可能让计划变，以正式补丁为准。每个补丁日只发
-    一次；不想要就写 patch_preview=off。
 
 八、设置一览（[features]）
   balance=off              on = 本 Mod 出版本平衡补丁（关掉游戏自带的英雄补丁）
@@ -440,7 +450,6 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   objective_max=100        累计最多加多少（0～300；最多减到 -50%）
   balance_theme_every=3    每隔几个游戏版本出一次主题版本（0 = 不出；热修复不算）
   balance_theme_step=8     主题版本那一类英雄加强多少（1～30）
-  patch_preview=on         补丁日前两天发补丁预告
   填超出范围的数会按边界算（比如 balance_count=70 按 60 算）。
   2.10.0 改了默认值（balance_count 10 → 30，balance_max 10 → 20）。settings.ini 里已经写了数的
   照你写的算，升级不会改你的文件；想用新默认值就把那两行删掉或改成 30 / 20。
@@ -513,9 +522,28 @@ you, in the pick phase the best picks; a fourth row with the enemy's likely next
 In a 3+2 draft the candidates are played out to the end of the draft ("推演 xx%").
 Cards show what banning / picking each champion is worth. Hover a card for a value
 breakdown above the info panel. Coach delegation bans and picks exactly what the panel
-advises (coach=on), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
+advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.3: coach delegation is off by default - write coach=on in settings.ini to have it ban and
+pick what the panel advises. AI BP (ai_bp) and ban_pick were off by default already.
+
+2.15.0: in a match, a live win chance under the clock - both sides' numbers, a bar and the
+curve so far, with the reason of a big swing ("Baron +18%"). It reads the draft's win
+chance and the situation (gold, kills, towers, levels, drakes, Baron buff, champions
+alive) and learns from the matches the game simulates (winprob.jsonl in the mod folder;
+starting values until 40 matches). live_win_chance (on).
+
+2.14.5: once the teams are seated (an AI team after its picks, yours in the swap phase)
+the tag under each pick follows the champion in that player's slot: its lane and its win
+rate there. Smart Position Lock's seating is read (lock 1.3.78+); AI teams no position
+lock seats are seated by this mod with ai_bp=on; your own swaps are followed click by
+click (the tags go off rather than show a wrong champion). Match stories and patch
+previews are gone.
+
+2.14.4: this mod's long news in the inbox scroll (the game's simple news box is a fixed
+728 px with no scroll; the item balance news of 2.14.2 runs past it).
 
 2.14.3: under each picked champion (both teams) a tag with its lane and its estimated
 win rate in that lane (green from 52%, red to 48%; a "?" when the enemy's lane read is
@@ -532,11 +560,10 @@ pick list, so the coach and AI BP banned marksmen against a filled bottom lane. 
 draft's picks (seen, and decided by this mod for either team) are now remembered and
 the missing ones filled in; diag.log shows what the game listed at each coach ban.
 
-2.14.0: a match preview in your inbox on the day of each of your league matches and a
-review after it (match_stories); a patch preview two days before each game patch and a
-theme patch every third game patch - one champion class buffed together (patch_preview,
-balance_theme_every, with balance=on); every team keeps a style from its matches, which
-AI BP picks lean toward (ai_style) and which shows on the ban/pick screen.
+2.14.0: a theme patch every third game patch - one champion class buffed together
+(balance_theme_every, with balance=on); every team keeps a style from its matches, which
+AI BP picks lean toward (ai_style) and which shows on the ban/pick screen. (Its match
+stories and patch previews were removed in 2.14.5.)
 
 F8 anywhere: tier list, scouting, your players, the model, and a review of your last
 draft. Settings: settings.ini in the mod folder (hot-reloaded). Problems: send diag.log.

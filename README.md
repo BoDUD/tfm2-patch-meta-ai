@@ -44,7 +44,7 @@
 - **Fearless 系列赛（无畏）**：不用任何设置，开新档时游戏「禁用/选择模式」选的「无畏」或「无畏(硬核)」都会自动识别——读的是 BP 界面上游戏自己画在卡片上的无畏标记（小叉或带局数的圆圈）和它的提示（你的队伍 / 蓝方 / 红方 / 双方无法选择）。你这边不能选的英雄不推荐、不标价值；只有对方不能再选的英雄（普通无畏下对方用过的）你照样可以选，但不建议去禁。面板标题写本系列已锁英雄数（`Fearless N`）。Bo3 / Bo5 还有后续对局时，用掉一个没有替代的英雄会扣一点价值（"留后局"），后面的局越多扣得越多。2.7.9 起才认圆圈标记和提示：之前只认小叉，普通无畏下会推荐本方已经用过的英雄。自动 BP（教练托管）和 AI BP 一直只在游戏给的可选英雄里选，不受影响；2.7.9 起它们也"留后局"：游戏不告诉 BP 这是系列赛第几局，所以 Mod 自己记住同一对队伍上一局各自用了哪些英雄，下一局这些英雄都从可选里消失了，就认出是无畏系列赛的下一局（可选里又出现了就是新系列赛或经典模式）；系列赛长度用你最近一次在选人界面看到的 Bo3 / Bo5（还没看到过按 Bo3 算），同一阶段所有队伍赛制一样。`diag.log` 第一次认出时写一行 `[ai] Fearless series seen: …`。`diag.log` 第一次见到无畏标记时写一行 `[ui] Fearless: …`。
 - **BP 复盘**：离开选人界面后，F8 面板最后一页列出这次 BP 的每一手：哪一方、选还是禁、当时对我方的价值、当时的建议和它的价值、之后的胜率，以及照建议走了几手（`diag.log` 里也有一行 `[review]`）。
 - **AI BP**（`ai_bp=on`，默认关；2.7.9 之前叫 `ai_draft`，旧的 settings.ini 照样认）：所有 AI 队伍的禁和选都**完全按本 Mod 的建议**来——和你在面板上看到的同一套排序（禁用看禁掉后对方损失多少，选人看位置强度、配合、克制、阵容、被克风险、"抢"），双方上场选手的熟练度，3+2 规则下把最好的 5 个候选推演到 BP 结束再定（AI 的蓝红方从 BP 进行到哪一步推出来）。选人只在 AI 还空着的位置能打的英雄里选。和教练托管一样排在所有 Mod 最后决定，盖过地狱人机等。一手在 1～2 毫秒内算完，AI 之间的比赛也照此 BP。`diag.log` 的 `[ai]` 行写 AI 每一手选了什么（你自己的比赛全写，其他比赛写前几手），`[review]` 行写 "ai_bp N decided, M of them made"：M 小于 N 说明被别的 Mod 盖掉了。
-- **教练托管**（`coach=on`，默认开）：选人时交给游戏的教练托管，你自己的队伍**完全照面板的建议**禁和选（2.5 起直接决定，不再只是给游戏评分加分）：轮到你时面板为这一手画出的排序（禁 1 / 选，推演、Fearless、位置锁都算在内）；面板还没为这一手画好时（例如第二轮禁用），用和 AI BP 完全一样的排序（推演、双方习惯、上场选手、位置锁），只是不加多样性——自动 BP 时你这边就是 AI BP 的水平。它排在所有 Mod 的最后决定，所以别的 Mod 整手接管时也以它为准。`diag.log` 的 `[coach]` 行写每一手决定了什么，`[review]` 行写"coach override N decided, M of them made"：M 小于 N 说明被别的 Mod 盖掉了。即使 `ban_pick=off` 也生效，不影响其他队伍。
+- **教练托管**（`coach=on`；2.15.3 起默认关）：选人时交给游戏的教练托管，你自己的队伍**完全照面板的建议**禁和选（2.5 起直接决定，不再只是给游戏评分加分）：轮到你时面板为这一手画出的排序（禁 1 / 选，推演、Fearless、位置锁都算在内）；面板还没为这一手画好时（例如第二轮禁用），用和 AI BP 完全一样的排序（推演、双方习惯、上场选手、位置锁），只是不加多样性——自动 BP 时你这边就是 AI BP 的水平。它排在所有 Mod 的最后决定，所以别的 Mod 整手接管时也以它为准。`diag.log` 的 `[coach]` 行写每一手决定了什么，`[review]` 行写"coach override N decided, M of them made"：M 小于 N 说明被别的 Mod 盖掉了。即使 `ban_pick=off` 也生效，不影响其他队伍。
 - **英雄联盟经验自动校准**（`lol_prior=auto`，默认）：存档比赛够多后（约 150 场大会比赛），用最新的比赛检验 0 / 0.5 / 1 / 2 哪个权重预测最准并自动采用，比赛增加两成后重新检验；F8 模型页显示当前权重和六种阵容缺口各值多少胜率。
 
 ## 2.5：属性先验、胜率校准、地狱人机
@@ -53,6 +53,54 @@
 - **胜率校准**：同一次检验还找出模型的对数几率乘多少最贴近没参与拟合的比赛（0.2～1.2）。小于 1 说明模型偏自信，显示的胜率（左下角、推演、复盘）都按它收缩；排序不受影响。F8 模型页和 `diag.log` 的 `[model] held-out check` 行写着这个系数。
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
+
+## 2.15.3：教练托管默认关
+
+用户（打发布压缩包时）：「教练和BP的默认都是off」。
+
+- `coach` 的默认值改成 off（`Config::default` 和第一次生成的 settings.ini 都是）：新装的玩家点教练托管时由游戏自己的教练（或别的 BP Mod）来选，想让托管照面板的建议选就写 `coach=on`。`ai_bp`、`ban_pick` 本来就默认关，不变。
+- 已经有 settings.ini 的玩家不受影响：以前生成的文件里写着 `coach=on`。文件里没有这一行的（手改过的），装上以后托管就不再照面板选了，要用就补一行 `coach=on`。
+
+## 2.15.2：收件箱的长新闻真的能滚了
+
+用户（截图：电竞大脑装备平衡 2026.1.0，第四件装备以后被截掉）：「这个还是不能往下滚动」。
+
+- **原因**：2.14.4 靠读右边那条新闻的作者（是不是电竞大脑）和正文来接手。用户在游戏里导出的界面结构（`explore` 临时打开，收件箱开着这条新闻）里，右边打开的新闻是 `main.top.right.news.contents.simple_container`，它的标题、作者、正文三个节点类型是空的、读不出字（只有时间 `top.time` 读得到），2.14.4 原来猜的路径（`data.right_panel`）也不对，所以从来没认出来过。左边列表每一行（`main.top.right.news.background.list.contents.<序号>`）的标题、作者读得到，行的名字就是这条新闻在队伍新闻里的序号。
+- **现在**（`ui::news_scroll`）：打开的是第几条，看你在左边列表里点的那一行（旁听这些行的点击，和换位表一样）；还没点过时，右边的时间对得上电竞大脑的某一条、而且它就在列表最上面才算（同一时刻电竞大脑有好几条时就等你点）；点完以后右边的时间变了（键盘换了一条）就不算了。正文：客户端读新闻时把电竞大脑自己写的普通新闻（序号、标题、日期、正文，按 `content_bind` 填好）记下来（`shared::our_news`），按序号取，放进同一格里的滚动框（2.14.4 那个）。`diag.log` 写 `[ui] a long news of this mod scrolls ... news <序号> 「标题」`。
+- 另外：电竞大脑的界面导出键 Insert 在游戏里没被认到（11-18 那几份都是 F9 按出来的）；临时打开 `explore=on` 会把这次游戏还没见过的界面自动导出一份。
+
+## 2.15.1：实时胜率的记录修好
+
+2.15.0 在游戏里的第一场：面板挂上了，换位跟得对（记下的分路和开赛时游戏用的阵容一样），对面照锁位置排的分路画；但后台预演的比赛一场都没记进 `winprob.jsonl`。原因：水晶被打掉以后会整个从场上拿掉，2.15.0 只认「还在场上、已经死了」的水晶，判不出胜负就不记（2.13.0 数的是活着的水晶有几个，所以两种都认）。现在认得的水晶不见了也算倒了；比赛结束却没判出胜负时 `diag.log` 写一行 `[winprob] a match ended with no winner seen`。另外比赛统计里的经济和身上的钱差得多时写一行，确认读的是这一场累计的经济。
+
+## 2.15.0：比赛中的实时胜率曲线
+
+用户在「电竞大脑还能做什么牛逼的功能」的几个方向里挑了「实时胜率曲线」（转播那种）。
+
+- **在哪看**：比赛画面上，比赛时间下面一块面板（`ui::live`）：上面一行两边的胜率（蓝左红右）；一条蓝红比例条；下面一块胜率曲线，从开局到现在，中线以上蓝方占优、以下红方，越高越大。十秒里起落十个点以上，标题换成原因，比如「蓝方拿下大龙 +18%」「红方推掉 2 座塔 +12%」「蓝方打赢一波团战 +11%」，留十几秒。观看、观战、回放都有；离开比赛画面就收起来。只画不接点击。
+- **怎么算**（`winprob`）：逻辑回归。输入是 BP 完的阵容胜率（电竞大脑模型的，对数几率）加上此刻的局面，都是蓝方减红方：经济（千）、人头、还剩几座塔、平均等级、小龙、大龙增益、活着几个人；每一项的系数随比赛时间变（0、5、10、15、20、30 分钟各一组，中间线性插值）。开局只看阵容，越往后局面越重要。
+- **从哪学**：服务端预演每一场正式比赛（十名选手，包括别的队的比赛）时，每 30 秒记一行局面，比赛结束看哪边水晶还在就知道谁赢，整场一行写进 Mod 文件夹的 `winprob.jsonl`（最近 4000 场）。不到 40 场时用一组先验系数（经济每千约 +0.25、大龙增益 +0.6、塔 +0.15……）；之后每多五十场左右在后台重新拟合一次（往先验靠，牛顿法），拿最近两成的比赛检验，`diag.log` 写一行 `[winprob] fitted on N matches ...`（检验的对数损失、各项在 10 分钟时的系数）。只读场上，不改比赛。
+- **小龙、大龙是谁拿的**：游戏不告诉 Mod。看它死的那一刻离它最近的三个英雄哪队多。大龙增益按拿到以后 150 秒算。
+- **读得省**：后台每天要预演几十场，所以平时每 30 tick 只看认得的几条龙和两个水晶，每 10 秒才全场找一遍新刷出来的；选手和塔只在要记一行、算一次胜率、或者有龙刚死的时候才读。每 tick 只问一次「比赛结束没」。
+- **设置**：`live_win_chance`（默认开）；关掉时不显示，也不再记录比赛。
+- **日志**：`[winprob]`（经济从哪读的、第一场记下、每次拟合）、`[ui] the live win chance is shown under the match clock`。
+
+## 2.14.5：选人格下面的标签跟着格子里的英雄走；AI 队的分路；删掉比赛新闻和补丁预告
+
+用户（截图：换位阶段，亚索在上单选手的格子里，脚下写「中单 胜率 62%」）：「胜率显示的有点问题吧 我移动到哪个位置后应该显示当前位置的胜率吧」。
+
+- **原因**：游戏把每个选人格固定给一名选手（从上到下：上单、打野、中单、下路、辅助），英雄在格子之间挪：AI 队选完以后被排好分路，玩家在换位阶段自己换。2.14.3 的标签按选人顺序对格子（第 i 格写第 i 手），挪过以后写的就是别的英雄：截图那一局按标签把维克托挪到中单、亚索挪到上单以后，亚索脚下的「中单 62%」其实是维克托的。游戏不告诉 Mod 格子里的原画是哪个英雄，只能记下谁被挪到了哪。
+- **AI 队**：选完人以后的分路由最后一个决定的钩子说了算（游戏 0.6.4 的 `Position` 阶段）。电竞大脑的教练钩子排在最后（`draft::seat_decide`）：锁位置开着 AI 分路时不插手，读锁位置写的 `seated.json`（锁位置 1.3.78 起写）；没有位置锁排、又开着 `ai_bp` 的 AI 队，由电竞大脑来排（用户选的「电竞大脑来排」），按模型最好的坐法（`plan::best_seating`：这一路的强度加上这名选手对它的熟练度，换位阶段「最佳换位」用的同一套）；别的情况（`ai_bp` 关着、别的位置锁 Mod）留给游戏，记作「不知道」。屏幕上这一局记下每支队谁坐哪（`shared::set_seated`）。`diag.log` 每次分路写一行 `[seat]`。
+- **玩家这边**：换位阶段从选人顺序算起。在换位表里先点一行、再点另一行，两行的英雄就对调（选人栏的格子也算），电竞大脑照着记（`DraftScreen::follow_swaps`），再用游戏自己的选中框（那一行的 `selected`）核对；对不上、或者点了「交给主教练」，这一边的标签就收起来，不写错的。`diag.log` 写 `[swap]` 行：换位开始时、每次点击、结束时谁坐哪。换位怎么点是从游戏界面推出来的，还没在游戏里实际试过：对不上时只会收起标签，日志里看得出来。
+- **标签**：选人阶段照旧（第 i 格是第 i 手，写电竞大脑读的它那一路）；排好分路以后写这一格的位置和坐在这里的英雄在这一路的胜率；不知道谁坐哪就不画。
+- **删掉**（用户：「把之前做的什么赛事回顾 补丁预测的功能删了 没什么用」）：2.14.0 的赛前前瞻、赛后复盘（`match_stories`）和补丁预告（`patch_preview`），连同服务端发这几种新闻的命令。settings.ini 里还写着这两项也没关系，不认识的设置会被忽略。主题版本和 AI 战队风格还在；存档里已经收到的那几条新闻不动。
+
+## 2.14.4：收件箱里的长新闻能往下滚
+
+用户：「装备平衡补丁有点bug 不能往下滚动」（截图：电竞大脑装备平衡 2026.0.1，第四件装备以后被截掉）。
+
+- **原因**：游戏的普通新闻（Simple）正文是 `news_component/simple_content(_d)` 里一个 728 px 高的文字框（20 号字，行高 36），外面没有滚动框，大约 20 行以后就截掉。2.14.2 照官方排版的装备新闻一件装备五六行，八件五十多行。
+- **现在**（`ui::news_scroll`）：右边打开的新闻作者是电竞大脑（`top.author` 是 `balance::AUTHOR`）、正文又放不下时，把游戏的文字框藏起来，在同一个 `contents` 里放一个游戏自己的 scroll_view（补丁内容页那种），里面一样的字、字号和行高，高度按行数算（`height_of`：每行按宽度算折几行，乘行高，多留一行）。换一条新闻或离开就收起来、原来的框显示回去。正文块先按 `main.top.right.<页>.data.right_panel.<块>` 找，找不到就在右边页面里有限地广搜作者那一行（深 7 层、800 个节点以内，约两秒一次），找到时 diag.log 记一行路径。装备平衡、补丁预告、赛前前瞻和赛后复盘这些电竞大脑的长新闻都一样。
 
 ## 2.14.3：已选英雄脚下的位置和胜率
 
@@ -80,6 +128,8 @@
 - **日志**：托管每次禁人写一行 `[coach] the draft as the game lists it: ours [...], theirs [...], N bans`，补了的话接着写补了几个、补成什么样；你这一场里对方 AI 被补过也写一行 `[ai] ...`。补全以后，第二轮禁人和屏幕对得上，托管那一行应该也会变成 `as on the panel`。
 
 ## 2.14.0：赛前前瞻和赛后复盘、补丁预告和主题版本、AI 战队有风格
+
+（赛前前瞻、赛后复盘和补丁预告 2.14.5 删掉了，见上。）
 
 用户：「根据这游戏的内容 电竞大脑还能做什么 现在玩的有点无聊了」，在几个方向里选了这三个。几种新闻都发在你队伍的收件箱里（服务端写进存档，和补丁新闻一样），用游戏的语言（中文或英文）。
 
@@ -324,11 +374,10 @@
 | `[features]` | `ban_pick` / `tier_list` | off / auto | AI 选人（2.7.10 起默认关）、自动梯队：`auto` = 开，除非已启用做同样事情的 Mod；`on` / `off` |
 | | `ai_bp` | off | AI BP：所有 AI 队伍完全按本 Mod 的建议禁和选（含 3+2 推演、对手习惯），盖过其他 BP Mod |
 | | `ai_variety` | 1 | AI BP 的多样性：每局对英雄的判断浮动，每一手最多让出这么多胜率点（0～5，0 = 永远选最佳） |
-| | `ai_style` | 1 | AI 战队的风格（2.14.0）：开着 `ai_bp` 时 AI 选人往自己的风格上靠，每一手最多为此让出这么多胜率点（0～5，0 = 不照风格选）；对方风格写在 BP 界面和赛前前瞻里 |
+| | `ai_style` | 1 | AI 战队的风格（2.14.0）：开着 `ai_bp` 时 AI 选人往自己的风格上靠，每一手最多为此让出这么多胜率点（0～5，0 = 不照风格选）；对方风格写在 BP 界面上 |
 | | `ai_tactics` | off | 由模型 BP 的 AI 队伍开场时按模型选战术（比原来的好 `ai_tactics_margin` 以上才换；你自己的战术不动；「收官」留给各队教练） |
 | | `ai_tactics_margin` | 0 | 模型的战术要比 AI 队伍原来的好多少（对数几率）才换：0 = 只要更好就换（2.13.2 起），0.1 = 明显更好才换（以前），0～1 |
-| | `coach` | on | 教练托管时你自己的队伍完全照面板的建议禁和选（即使 `ban_pick=off`，别的 Mod 接管时也以它为准） |
-| | `match_stories` | on | 联赛里你的比赛当天发赛前前瞻、打完发赛后复盘（2.14.0，收件箱新闻） |
+| | `coach` | off | 教练托管时你自己的队伍完全照面板的建议禁和选（2.15.3 起默认关；即使 `ban_pick=off`，别的 Mod 接管时也以它为准） |
 | `[model]` | `patches` | 12 | 模型回看的版本数（含当前，1～12） |
 | | `drift` / `change` | 0.08 / 0.3 | 英雄强度每个版本的变化幅度：未改动 / 被补丁改动（对数几率） |
 | | `patch_shift` | 0.02 | 补丁加强/削弱时起点预移的胜率 |
@@ -348,6 +397,7 @@
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
 | | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条） |
+| | `live_win_chance` | on | 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；关掉时也不再记录比赛 |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
 | | `balance` | off | 由本 Mod 出版本平衡补丁（每版把胜率离 48%–52% 最远的英雄调强/调弱，所有比赛生效；写进游戏自己的补丁公告和补丁历史，BP/百科的属性显示改动后的数值；开着时游戏自带的英雄补丁关掉） |
@@ -369,7 +419,6 @@
 | | `objective_step` / `objective_max` | 15 / 100 | 每个版本最多调多少、累计最多加多少（百分比；最低 -50%） |
 | | `balance_theme_every` | 3 | 每隔几个游戏版本出一次主题版本（2.14.0；热修复不算；要先开 `balance`）：挑一类英雄一起加强；0 = 不出 |
 | | `balance_theme_step` | 8 | 主题版本那一类英雄加强多少（强度百分比，1～30） |
-| | `patch_preview` | on | 补丁日前两天发「补丁预告」新闻，写平衡补丁计划改什么（2.14.0；要先开 `balance`） |
 | `[report]` | `report` | on | 写 `meta_report.html` |
 | `[debug]` | `explore` | off | 把每个新界面的 UI 结构写进 `ui_dump_*.txt`（按 Insert 随时写一份；F9 在主界面是游戏的「设施」键） |
 | | `verbose` | off | 在 `diag.log` 里写更多细节 |
@@ -401,6 +450,18 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.3: coach delegation is off by default (`coach=off` in `Config::default` and in a new settings.ini; `coach=on` turns it on). `ai_bp` and `ban_pick` were off by default already. A settings.ini written by an earlier version says `coach=on` and keeps it.
+
+2.15.2: the inbox's long news of this mod really scroll now. The news open on the right (`main.top.right.news.contents.simple_container`) has title, author and body nodes with no readable text (only `top.time` reads), so 2.14.4, which looked for its author, never found one. The open news is now the list row the player clicked (`...background.list.contents.<news index>`, clicks followed as on the swap table), else - with no click yet - the only news of this mod at the time shown that is also the list's top row; its body comes from this mod's own plain news the client reads with the team's news (`shared::our_news`, `content_bind` filled in).
+
+2.15.1: 2.15.0 recorded no match: a destroyed nexus is taken off the field, and 2.15.0 only knew a nexus that stays there dead, so no match had a winner. A known nexus that is gone now counts as down; a match that ends with no winner seen is logged.
+
+2.15.0 (the user picked "a live win-chance curve" from the shortlist of bigger features): in a match, a panel under the clock (`ui::live`) shows both sides' win chance (blue left, red right), a blue/red bar and the curve so far (above the midline: blue ahead); a swing of ten points within ten seconds puts its reason in the title for a while ("蓝方拿下大龙 +18%"). The model (`winprob`) is a logistic regression on the draft's win chance (this mod's model, log-odds) and the situation, blue minus red: gold (thousands), kills, towers standing, average level, drakes, Baron buff, champions alive - each with coefficients that move with the match time (knots at 0, 5, 10, 15, 20 and 30 minutes, linear in between). The server's run of every ten-player match records a row every 30 s and the winner (whose nexus stands) as a line of `winprob.jsonl` (the newest 4000 matches); under 40 matches the starting values are used, and the model is refitted in the background every fifty or so more (Newton, pulled toward the starting values), checked on the newest fifth (`[winprob] fitted on N matches ...`). Who took a drake or Baron is not told to mods: the team with more of the three champions nearest it when it died; the Baron buff counts for 150 s. The server runs read sparingly (the known objectives every 30 ticks, a full pass every 10 s, players and towers only when a row, a live point or a monster's death needs them). `live_win_chance` (on) switches the panel and the recording.
+
+2.14.5 (the user, with a swap-phase screenshot where Yasuo in the top player's slot read "中单 胜率 62%": "after I move a champion to a position it should show that position's win rate"): the game keeps each pick slot for one player (top to support) and moves the champions between slots - an AI team's when it is seated after its picks, the player's own in the swap phase - while 2.14.3's tags paired slot i with pick i. The coach hook now takes the `Position` phase (`draft::seat_decide`): with Smart Position Lock seating AI teams it stays out and reads the lock's `seated.json` (lock 1.3.78+); an AI team no position lock seats is seated by this mod when `ai_bp` is on (`plan::best_seating`, the user's choice); otherwise the game seats it, noted as unknown. The player's own swaps are followed from the swap table's clicks (`follow_swaps`) and checked against the game's selection box; a mismatch or "delegate to the head coach" turns that side's tags off rather than show another champion's numbers. Once a side is seated, each tag names its slot's lane and its champion's win rate there. The match stories and patch previews of 2.14.0 are gone (the user: "not much use"); theme patches and team styles stay.
+
+2.14.4 (the user: "the item balance news has a bug - it does not scroll"): the game's simple news text is a fixed 728 px label with no scroll view (`news_component/simple_content_d`), so 2.14.2's laid-out item news (five or six lines an item) was cut after about 20 lines. `ui::news_scroll`: when the inbox shows a news item of this mod (its `top.author`) whose text needs more room, the game's label is hidden and a scroll view (the patch content page's) with the same text, size and line height takes its place inside the same `contents`; it goes away for another news item. The block is found under `main.top.right.<page>.data.right_panel`, else by a bounded search for the author line (logged once).
 
 2.14.3 (the user sent another screen's pick cards with "Top 67%" under each champion: "our esports brain has no such win-rate display - can it be added?"): every picked card on both sides (`pick_slot_N.done`) gets a bordered tag under the champion art (`pma_rate`): the lane icon and "上单 胜率 52%" - the lane as the mod reads the team (`advisor::lanes`), a "?" when the enemy's lane is under 50% likely, the model's win rate of the champion in that lane this patch (`Champion::role_rate`), green from 52%, red to 48%. It replaces the enemy's lane bar; `lane_tags` turns it off.
 

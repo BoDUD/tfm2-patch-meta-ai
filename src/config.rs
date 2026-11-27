@@ -51,6 +51,7 @@ pub struct Config {
     pub ban_pick: Switch,
     /// The player's own team's draft when the game's coach drafts for it (coach delegation)
     /// follows the model, even with `ban_pick` off.
+    /// 2.15.3 起默认关（用户打发布包时：「教练和BP的默认都是off」），要用写 `coach=on`
     pub coach: bool,
     /// Every AI team bans and picks outright the way the advice would have it (a hard opponent;
     /// over other draft mods' decisions).
@@ -98,12 +99,9 @@ pub struct Config {
     pub objective_baron: (f32, f32),
     pub objective_step: i32,
     pub objective_max: i32,
-    /// 主题版本（2.14.0，`crate::theme`）：每几个游戏版本出一次（0 = 不出），那一类加强多少（百分比）；补丁日前发预告
+    /// 主题版本（2.14.0，`crate::theme`）：每几个游戏版本出一次（0 = 不出），那一类加强多少（百分比）
     pub balance_theme_every: u32,
     pub balance_theme_step: i32,
-    pub patch_preview: bool,
-    /// 你的比赛前后的前瞻和复盘新闻（2.14.0，`crate::stories`）
-    pub match_stories: bool,
     /// AI 战队的风格（2.14.0，`crate::styles`）：照风格选人每一手最多让出多少胜率点（0 = 不用风格）
     pub ai_style: f32,
     pub tier_list: Switch,
@@ -167,6 +165,8 @@ pub struct Config {
     pub grid_values: bool,
     /// ... the likely lane of each enemy pick.
     pub lane_tags: bool,
+    /// 比赛画面上的实时胜率（2.15.0，`crate::winprob`）：比赛时间下面的胜率条和曲线；关掉也不记录比赛
+    pub live_win_chance: bool,
     /// ... how opaque its panels' background is (percent); a third of it once the pick under a
     /// panel (each pick column's fifth) is in, so it shows through.
     pub panel_opacity: f32,
@@ -185,7 +185,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ban_pick: Switch::Off,
-            coach: true,
+            coach: false,
             ai_bp: false,
             ai_variety: 1.0,
             ai_tactics: false,
@@ -211,8 +211,6 @@ impl Default for Config {
             objective_max: crate::objectives::DEFAULT_TARGETS.max,
             balance_theme_every: 3,
             balance_theme_step: 8,
-            patch_preview: true,
-            match_stories: true,
             ai_style: 1.0,
             tier_list: Switch::Auto,
             patches: 12.0,
@@ -246,6 +244,7 @@ impl Default for Config {
             draft_overlay: true,
             grid_values: true,
             lane_tags: true,
+            live_win_chance: true,
             panel_opacity: 60.0,
             meta_page: true,
             report: true,
@@ -382,11 +381,9 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "objective_baron" => cfg.objective_baron = range(value, 5.0, 900.0)?,
         "objective_step" => cfg.objective_step = number(value)?.round().clamp(1.0, 50.0) as i32,
         "objective_max" => cfg.objective_max = number(value)?.round().clamp(0.0, 300.0) as i32,
-        // 2.14.0：主题版本、补丁预告、比赛新闻、AI 风格
+        // 2.14.0：主题版本、AI 风格（补丁预告、比赛新闻 2.14.5 删了）
         "balance_theme_every" => cfg.balance_theme_every = number(value)?.round().clamp(0.0, 20.0) as u32,
         "balance_theme_step" => cfg.balance_theme_step = number(value)?.round().clamp(1.0, 30.0) as i32,
-        "patch_preview" => cfg.patch_preview = flag(value)?,
-        "match_stories" => cfg.match_stories = flag(value)?,
         "ai_style" => cfg.ai_style = number(value)?.clamp(0.0, 5.0),
         "item_balance_skip" => cfg.item_balance_skip = crate::edits::list(value),
         "recency" if value.trim().eq_ignore_ascii_case("auto") => cfg.recency_auto = true,
@@ -404,6 +401,7 @@ fn apply(cfg: &mut Config, key: &str, value: &str) -> Result<(), String> {
         "draft_overlay" => cfg.draft_overlay = flag(value)?,
         "grid_values" => cfg.grid_values = flag(value)?,
         "lane_tags" => cfg.lane_tags = flag(value)?,
+        "live_win_chance" => cfg.live_win_chance = flag(value)?,
         "panel_opacity" => cfg.panel_opacity = number(value)?,
         "meta_page" => cfg.meta_page = flag(value)?,
         "explore" => cfg.explore = flag(value)?,
@@ -634,11 +632,11 @@ pub fn summary(c: &Config) -> String {
     format!(
         "ban_pick={} coach={} ai_bp={} ai_variety={} ai_tactics={} ai_tactics_margin={} tier_list={} patches={} drift={} change={} patch_shift={} solo_weight={} \
          lol_prior={} stats={} skills={} recency={} reworked=[{}] roles={} players={} mastery={} pairs={} pick_strength={} \
-         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} panel_opacity={} meta_page={} explore={} \
+         ban_strength={} edge_scale={} player_mastery={} min_games={} s={}% a={}% b={}% c={}% unranked={} report={} draft_overlay={} grid_values={} lane_tags={} live_win_chance={} panel_opacity={} meta_page={} explore={} \
          balance={} balance_count={} balance_max={} balance_per_point={} balance_unpicked={} item_balance={} item_balance_count={} item_balance_max={} \
          item_balance_users={} item_balance_band={} item_balance_per_point={} balance_skip=[{}] item_balance_skip=[{}] \
          objective_balance={} objective_length={}-{} objective_drake={}-{} objective_baron={}-{} objective_step={} objective_max={} \
-         balance_theme_every={} balance_theme_step={} patch_preview={} match_stories={} ai_style={}",
+         balance_theme_every={} balance_theme_step={} ai_style={}",
         c.ban_pick.as_str(),
         if c.coach { "on" } else { "off" },
         if c.ai_bp { "on" } else { "off" },
@@ -686,6 +684,7 @@ pub fn summary(c: &Config) -> String {
         if c.draft_overlay { "on" } else { "off" },
         if c.grid_values { "on" } else { "off" },
         if c.lane_tags { "on" } else { "off" },
+        if c.live_win_chance { "on" } else { "off" },
         c.panel_opacity,
         if c.meta_page { "on" } else { "off" },
         if c.explore { "on" } else { "off" },
@@ -713,8 +712,6 @@ pub fn summary(c: &Config) -> String {
         c.objective_max,
         c.balance_theme_every,
         c.balance_theme_step,
-        if c.patch_preview { "on" } else { "off" },
-        if c.match_stories { "on" } else { "off" },
         c.ai_style
     )
 }
@@ -739,10 +736,10 @@ pub const TEMPLATE: &str = r#"; ================================================
 ban_pick=off
 ; coach : when you let the game's coach draft for you (coach delegation), your team bans and
 ;         picks exactly what the panel advises - it decides last, over other draft mods - even
-;         with ban_pick=off. Other teams are not touched by this switch.
+;         with ban_pick=off. Other teams are not touched by this switch. Off by default.
 ; coach : 选人时交给游戏的教练托管时，你自己的队伍完全照面板的建议禁用和选人（最后决定，别的 BP Mod
-;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。
-coach=on
+;         接管时也以它为准），即使 ban_pick=off 也生效；不影响其他队伍。默认关（2.15.3 起）。
+coach=off
 ; ai_bp : every AI team bans and picks the way this mod would advise it - the same ranking,
 ;            3+2 lookahead and players' mastery you see on the panel - decided outright, over
 ;            other draft mods (Hell Draft AI). A hard opponent; also the AI-vs-AI matches.
@@ -896,22 +893,12 @@ objective_max=100
 ;                调整，版本风向隔一段时间变一次。0 = 不出主题。要先开 balance。
 balance_theme_every=3
 balance_theme_step=8
-; patch_preview : a news item a couple of game days before each game patch with what the balance
-;                patch plans to change (the matches until then may still change it).
-; patch_preview : 补丁日前两天左右发一条「补丁预告」新闻，写平衡补丁计划改什么（之后的比赛还可能让它变）。
-patch_preview=on
-; match_stories : a preview news item on the day of each of your matches (form, head to head, the
-;                opponent's style and likely bans) and a review after it (score, each game's kills, gold,
-;                drakes and Baron, the MVP).
-; match_stories : 你的每场比赛当天发一条赛前前瞻（近况、交手记录、对方风格、可能针对你的禁用），打完发一条赛后复盘
-;                （比分、每局的击杀经济和小龙大龙、MVP）。
-match_stories=on
 ; ai_style : with ai_bp, every AI team keeps a style of its own from its matches (dive, poke,
 ;                late game, its favourite classes ...) and picks toward it, giving up at most this many
-;                win-rate points a pick for it. 0 = no styles, up to 5. Its style shows in the previews
-;                and on the ban/pick screen.
+;                win-rate points a pick for it. 0 = no styles, up to 5. Its style shows on the ban/pick
+;                screen.
 ; ai_style : 开着 ai_bp 时，每支 AI 队按自己过去的比赛形成固定的风格（开团、消耗、后期、偏爱哪类英雄……），选人往
-;                风格上靠，每一手最多为此让出这么多胜率点。0 = 不用风格，最大 5。对方风格写在赛前前瞻和 BP 界面上。
+;                风格上靠，每一手最多为此让出这么多胜率点。0 = 不用风格，最大 5。对方风格写在 BP 界面上。
 ai_style=1
 tier_list=auto
 
@@ -1028,6 +1015,8 @@ unranked=keep
 ; grid_values   : on every champion card, what picking it is worth to you now (win-rate points)
 ;                 每个英雄卡片左上角显示此刻选它的价值（胜率百分点）
 ; lane_tags     : under each pick (both teams), its lane and its win rate there / 双方每个已选英雄下面的位置和它在这一路的胜率
+; live_win_chance : in a match, a win-chance bar and curve under the clock (off: matches are not recorded for it either)
+;                 比赛画面上比赛时间下面的实时胜率条和曲线；关掉时也不再记录比赛
 ; panel_opacity : how opaque the two panels' background is, 0-100 (percent); once both teams
 ;                 the panel sits on a pick column's fifth pick: once that pick is in (left panel:
 ;                 blue's, right panel: red's) it drops to a third, so the pick shows through
@@ -1039,6 +1028,7 @@ unranked=keep
 draft_overlay=on
 grid_values=on
 lane_tags=on
+live_win_chance=on
 panel_opacity=60
 meta_page=on
 

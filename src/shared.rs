@@ -145,3 +145,65 @@ pub fn set_player_draft(draft: Option<PlayerDraft>) {
 pub fn player_draft() -> Option<Arc<PlayerDraft>> {
     PLAYER_DRAFT.read().unwrap_or_else(PoisonError::into_inner).clone()
 }
+
+/// 屏幕上这一局每支队选完以后的分路（2.14.5，[`crate::draft::seat_decide`] 记）：按选人顺序的英雄，和每个位置
+/// （`Role::index`）坐的是第几手；`None` 是不知道（游戏或别的 Mod 排的）。选人界面照着把标签对上格子里的英雄。
+pub type Seated = (Vec<String>, Option<[usize; 5]>);
+static SEATED: RwLock<Vec<Seated>> = RwLock::new(Vec::new());
+/// 一场两支队，留点余量
+const SEATED_KEPT: usize = 8;
+
+/// 记下一支队的分路（同样的选人只留最新的）
+pub fn set_seated(picks: Vec<String>, by_lane: Option<[usize; 5]>) {
+    let mut list = SEATED.write().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|(p, _)| *p != picks);
+    list.push((picks, by_lane));
+    let extra = list.len().saturating_sub(SEATED_KEPT);
+    list.drain(..extra);
+}
+
+/// 这些选人（按选人顺序）的分路：`None` 是还没排；`Some(None)` 是排了，但不知道怎么排的
+pub fn seated(picks: &[&str]) -> Option<Option<[usize; 5]>> {
+    let list = SEATED.read().unwrap_or_else(PoisonError::into_inner);
+    list.iter().rev().find(|(p, _)| p.iter().map(String::as_str).eq(picks.iter().copied())).map(|(_, s)| *s)
+}
+
+/// 选人界面打开：上一场的不要了
+pub fn clear_seated() {
+    SEATED.write().unwrap_or_else(PoisonError::into_inner).clear();
+}
+
+/// 电竞大脑自己写的一条普通新闻（2.15.2）：收件箱里打开的新闻读不出正文，长新闻滚动按序号从这里取
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OurNews {
+    /// 在队伍新闻列表里的序号（收件箱列表那一行的名字）
+    pub index: usize,
+    pub title: String,
+    /// `2027-09-20T13:00:00`
+    pub date: String,
+    pub content: String,
+}
+
+static OUR_NEWS: RwLock<Vec<OurNews>> = RwLock::new(Vec::new());
+/// 只留最近这么多条
+const OUR_NEWS_KEPT: usize = 60;
+
+/// 整个新闻列表读过一遍：换掉
+pub fn set_our_news(mut list: Vec<OurNews>) {
+    let extra = list.len().saturating_sub(OUR_NEWS_KEPT);
+    list.drain(..extra);
+    *OUR_NEWS.write().unwrap_or_else(PoisonError::into_inner) = list;
+}
+
+/// 新来了一条（同一个序号的换掉）
+pub fn add_our_news(news: OurNews) {
+    let mut list = OUR_NEWS.write().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|n| n.index != news.index);
+    list.push(news);
+    let extra = list.len().saturating_sub(OUR_NEWS_KEPT);
+    list.drain(..extra);
+}
+
+pub fn our_news() -> Vec<OurNews> {
+    OUR_NEWS.read().unwrap_or_else(PoisonError::into_inner).clone()
+}

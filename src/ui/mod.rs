@@ -7,12 +7,14 @@
 //! its own, so every node this mod adds is checked for every few frames and put back when it
 //! is gone, and nothing assumes a node exists without asking.
 
+pub mod live;
 pub mod balance_view;
 pub mod draft_screen;
 pub mod lineup_screen;
 pub mod explore;
 pub mod item_spec;
 pub mod item_view;
+pub mod news_scroll;
 pub mod patch_items;
 pub mod names;
 pub mod page;
@@ -224,6 +226,9 @@ struct State {
     balance: balance_view::BalanceView,
     items: item_view::ItemView,
     patch_items: patch_items::PatchItems,
+    news: news_scroll::NewsScroll,
+    /// 比赛画面上的实时胜率（2.15.0）
+    live: live::LiveView,
     context: Context,
 }
 
@@ -276,6 +281,8 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     let keys = ui.keys_pressed();
     let snapshot = crate::shared::get();
     time(Part::Explore, || st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"), &keys));
+    // 这一帧的点击：选人界面的换位也要看（2.14.5），所以先取
+    let clicks = take_clicks();
     if cfg.draft_overlay {
         let view = draft_screen::View {
             team_name: &st.context.team_name,
@@ -286,13 +293,16 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             lane_tags: cfg.lane_tags,
             panel_opacity: cfg.panel_opacity,
         };
-        time(Part::Draft, || st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view));
+        time(Part::Draft, || {
+            // 换位阶段跟着玩家的点击记谁坐哪（2.14.5）
+            st.draft.follow_swaps(ui, &clicks);
+            st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view)
+        });
     } else {
         crate::draft::set_live(ui.exists(draft_screen::GRID));
     }
     let opponent = st.draft.enemy_team.clone().or_else(|| st.context.last_opponent.clone());
     let screen = format!("{scene:?}/{}", ui.main_tab().unwrap_or_default());
-    let clicks = take_clicks();
     let f = Frame {
         frame,
         snapshot: snapshot.as_deref(),
@@ -323,6 +333,10 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
         // and the item changes in the patch history (2.12.2)
         time(Part::Page, || st.patch_items.tick(ui, catalog.as_deref(), &st.names, &crate::balance::round_of_patch));
     }
+    // 收件箱里电竞大脑的长新闻能往下滚（2.14.4）
+    time(Part::Page, || st.news.tick(ui, &clicks));
+    // 比赛画面上的实时胜率（2.15.0）
+    time(Part::Page, || st.live.tick(ui, frame, cfg.live_win_chance));
 }
 
 /// A team name as a key: lower case, without the league rank the ban/pick screen appends
