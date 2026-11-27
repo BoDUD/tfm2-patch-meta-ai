@@ -925,58 +925,130 @@ pub fn rows(stats: &Stats, before: i32, after: i32) -> Vec<Row> {
     out
 }
 
-/// A change's reason as the game's notes give one: codes of `patch.reason.*` texts, comma-separated - the model's
-/// win rate (`pma_wr_<n>`, rounded away from the band), the power this round and in all, and whether the round's or
-/// the overall limit held it (`pma_cap`, `pma_total_<CAP>`).
-pub fn reason(c: &Change, rules: Rules) -> String {
-    // power taken off (2.11.0): why, and how much
-    if let Some(why) = c.reset {
-        let mut codes = vec![match why {
-            Reset::Edit => "pma_custom".to_string(),
-            Reset::Skip => "pma_skip".to_string(),
-        }];
-        if c.step != 0 {
-            codes.push(format!("pma_power_{}", signed_code(c.step)));
+/// 挑官方口吻理由用的英雄定位（2.14.2）
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    /// 打输出的（大多数英雄）
+    #[default]
+    Damage,
+    /// 前排、坦克
+    Tank,
+    /// 奶妈、保护型辅助
+    Healer,
+    /// 后期大核
+    Late,
+}
+
+/// 一个英雄的定位：有英雄联盟的阵容画像就先看画像（前排、保护、后期），再看游戏的职业（坦克；没有画像的辅助算奶妈）
+pub fn kind_of(profile: Option<&crate::knowledge::Profile>, category: Option<u8>) -> Kind {
+    if let Some(p) = profile {
+        if p.front >= 1.5 && p.carry < 1.0 {
+            return Kind::Tank;
         }
-        return codes.join(",");
+        if p.peel >= 1.5 && p.front < 1.5 && p.carry < 1.0 {
+            return Kind::Healer;
+        }
+        if p.carry >= 1.5 {
+            return Kind::Late;
+        }
     }
-    // 主题版本（2.14.0）：这一类一起加强，不是因为胜率
+    match category {
+        Some(5) => Kind::Tank,
+        Some(3) if profile.is_none() => Kind::Healer,
+        _ => Kind::Damage,
+    }
+}
+
+/// 官方口吻的理由要看的（2.14.2）：定位；上一次调它是不是就在前两轮、方向也一样（连着调）；上一次是不是也是冷门加强；
+/// 挑第几种说法的种子
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flavor {
+    pub kind: Kind,
+    pub streak: bool,
+    pub unpicked_before: bool,
+    pub seed: u64,
+}
+
+/// 这一轮（`round_id`）里一个改动的 [`Flavor`]：看 `rounds` 里在它之前的轮次
+pub fn flavor_of(c: &Change, round_id: u32, rounds: &[Round], kind: Kind) -> Flavor {
+    let before = rounds
+        .iter()
+        .filter(|r| r.id < round_id && !r.reset)
+        .rev()
+        .find_map(|r| r.changes.iter().find(|x| x.champion == c.champion && x.reset.is_none()).map(|x| (r.id, x)));
+    let (streak, unpicked_before) = match before {
+        Some((id, x)) if round_id.saturating_sub(id) <= 2 => (x.step != 0 && x.step.signum() == c.step.signum(), x.unpicked && c.unpicked),
+        _ => (false, false),
+    };
+    Flavor { kind, streak, unpicked_before, seed: seed(&c.champion, &round_id.to_string()) }
+}
+
+/// 挑说法用的数（FNV-1a）：同一个东西在同一轮总是同一句，换一轮换一句
+pub fn seed(name: &str, round: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes().chain([b'|']).chain(round.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// 游戏自己的补丁理由（`patch.reason.<code>`，游戏里 17 种语言都有）：按方向、定位、是不是连着调，挑一句。只挑和电竞大脑
+/// 知道的事对得上的：连着削的不用「长期占据ban/pick榜首」（nerf_meta_2，禁选率没统计），连着加强的不用「无人问津」（buff_meta_1）
+pub fn official_reason(c: &Change, f: &Flavor) -> String {
+    let v = 1 + f.seed % 3;
+    let base = if c.step > 0 {
+        if c.unpicked {
+            if f.unpicked_before {
+                return "unpicked_long".to_string();
+            }
+            "unpicked"
+        } else if f.streak {
+            return format!("buff_meta_{}", [2, 3][(f.seed % 2) as usize]);
+        } else {
+            match f.kind {
+                Kind::Tank => "too_fragile",
+                Kind::Healer => "low_healing",
+                Kind::Late => "weak_late_game",
+                Kind::Damage => "low_damage",
+            }
+        }
+    } else if f.streak {
+        return format!("nerf_meta_{}", [1, 3][(f.seed % 2) as usize]);
+    } else {
+        match f.kind {
+            Kind::Tank => "too_tanky",
+            Kind::Healer => "too_much_healing",
+            Kind::Late => "late_game_scaling",
+            Kind::Damage => "too_much_damage",
+        }
+    };
+    format!("{base}_{v}")
+}
+
+/// A change's reason as the game's notes give one: codes of `patch.reason.*` texts, comma-separated, a line each on the
+/// page. 2.14.2（用户：「现在英雄平衡补丁的文字说明太僵硬 没有之前官方的那种文字的味道」）：先是游戏自己的一句
+/// （[`official_reason`]），再是一行短的胜率（`pma_wr_<n>`，往目标区间外取整）或场次（冷门加强 `pma_unpicked`）；整体强度
+/// 改成和属性一样的一行（[`power_row`]），所以强度和上限的代码（`pma_power_*`、`pma_sum_*`、`pma_cap`、`pma_total_*`）只留给
+/// 以前写下的补丁。撤回调整（2.11.0）写为什么（`pma_custom`、`pma_skip`），主题版本（2.14.0）写这一类。每条都带一个 `pma_`
+/// 代码：`patchnotes` 靠它认出电竞大脑写的英雄。
+pub fn reason(c: &Change, flavor: &Flavor) -> String {
+    if let Some(why) = c.reset {
+        return match why {
+            Reset::Edit => "pma_custom",
+            Reset::Skip => "pma_skip",
+        }
+        .to_string();
+    }
     if let Some(category) = c.theme {
-        let mut codes = vec![format!("pma_theme_{category}")];
-        if c.step != 0 {
-            codes.push(format!("pma_power_{}", signed_code(c.step)));
-        }
-        if c.total != 0 && c.total != c.step {
-            codes.push(format!("pma_sum_{}", signed_code(c.total)));
-        }
-        if c.total.abs() >= CAP {
-            codes.push(format!("pma_total_{CAP}"));
-        }
-        return codes.join(",");
+        return format!("pma_theme_{category}");
+    }
+    let official = official_reason(c, flavor);
+    if c.unpicked {
+        return format!("{official},pma_unpicked");
     }
     let n = if c.step < 0 { c.win.ceil() } else { c.win.floor() }.clamp(0.0, 100.0) as u32;
-    // an unpicked buff (2.10.0) says why instead of a win rate too few games stand behind, and no limit held it
-    let mut codes = vec![if c.unpicked { "pma_unpicked".to_string() } else { format!("pma_wr_{n}") }];
-    // the power this round and in all (2.9.0; the user: 「一起加上」 - a player read -11% of power as the -5% / -6% of
-    // the lines and thought it barely cut)
-    if c.step != 0 {
-        codes.push(format!("pma_power_{}", signed_code(c.step)));
-    }
-    if c.total != 0 && c.total != c.step {
-        codes.push(format!("pma_sum_{}", signed_code(c.total)));
-    }
-    if c.unpicked {
-        return codes.join(",");
-    }
-    if c.step.abs() >= rules.max_step {
-        codes.push("pma_cap".to_string());
-    }
-    // the limit in all: a code of its own since 2.10.0 (`pma_total_80`), so that the notes 2.9.0 wrote at its limit
-    // keep saying 50% (`pma_total`)
-    if c.total.abs() >= CAP {
-        codes.push(format!("pma_total_{CAP}"));
-    }
-    codes.join(",")
+    format!("{official},pma_wr_{n}")
 }
 
 /// A signed percent in a text code: `m11` for -11, `p9` for +9 (`pma_power_*`, `pma_sum_*`).
@@ -984,13 +1056,85 @@ pub fn signed_code(v: i32) -> String {
     format!("{}{}", if v < 0 { "m" } else { "p" }, v.unsigned_abs())
 }
 
-/// The round's item changes as news of their own (2.9.0; None: it changed no item): a title and a line an item - its
-/// builders' win rate, its step and power, and its numbers before and after (`lines`, [`crate::items::lines`]).
-/// `icon`: an item's icon as text ([`crate::items::icon_text`]; empty: none), in front of its name.
+/// 整体强度那一行的名字（`patch.pma_power_stat`，2.14.2）
+pub const POWER_KEY: &str = "#asset/base/text/news?patch.pma_power_stat";
+
+/// 一个改动的整体强度，和属性一样写成补丁里的一行（2.14.2）：这一版之前和之后的累计强度。以前写在理由里（`pma_power_*`）
+pub fn power_row(c: &Change) -> Option<Row> {
+    (c.step != 0).then(|| Row {
+        key: POWER_KEY.to_string(),
+        target_action: None,
+        pre_value: percent(c.total - c.step),
+        after_value: percent(c.total),
+        is_buff: c.step > 0,
+    })
+}
+
+/// 带正负号的百分数（0 不带）
+pub fn percent(v: i32) -> String {
+    if v == 0 {
+        "0%".to_string()
+    } else {
+        format!("{v:+}%")
+    }
+}
+
+/// 装备改动的理由（2.14.2，照官方英雄补丁的口吻）：按方向挑一句，带上出它的英雄的胜率；`seed` 挑第几句（[`seed`]）
+pub fn item_reason(c: &ItemChange, seed: u64, chinese: bool) -> String {
+    if c.reset.is_some() {
+        return if chinese {
+            "按你的设置（item_balance_skip）撤回电竞大脑之前的调整，恢复它原本的数值。".to_string()
+        } else {
+            "item_balance_skip lists it: this mod's earlier changes are taken off and its own numbers return.".to_string()
+        };
+    }
+    let k = (seed % 3) as usize;
+    let text = match (c.step < 0, chinese) {
+        (true, true) => [
+            "出这件装备的英雄近期胜率约 {w}%，收益明显高出一截，我们决定略微削减它的数值。",
+            "出它的英雄胜率约 {w}%，这件装备带来的优势太大了，这个版本给它降降温。",
+            "出它的英雄胜率约 {w}%，它在对局里的作用过于突出，需要收一收。",
+        ][k],
+        (false, true) => [
+            "这件装备的表现低于预期，出它的英雄近期胜率只有约 {w}%，因此适当提升它的数值。",
+            "出它的英雄胜率约 {w}%，这件装备没能发挥应有的作用，给它一点实在的加强。",
+            "最近很少能靠它打出效果，出它的英雄胜率约 {w}%，这次帮它一把。",
+        ][k],
+        (true, false) => [
+            "Its builders win about {w}% of their games - a clear edge over the other choices, so its numbers come down a little.",
+            "It gives its builders too big an edge (they win about {w}%); time to cool it down.",
+            "Its builders win about {w}%: it does too much in a game and gets trimmed.",
+        ][k],
+        (false, false) => [
+            "It falls short of expectations - its builders win only about {w}% - so its numbers go up.",
+            "It does not pull its weight (its builders win about {w}%); a solid buff this patch.",
+            "It rarely makes a difference lately (its builders win about {w}%); a helping hand this patch.",
+        ][k],
+    };
+    text.replace("{w}", &format!("{:.0}", c.win))
+}
+
+/// 新闻和百科里的版式（2.14.2，照官方英雄补丁）：粗体、补丁里的箭头（符号字体）
+pub const BOLD: &str = "<f#asset/base/font/set/bold>";
+pub const FONT_END: &str = "<f>";
+pub const ARROW: &str = "<f#asset/base/font/set/symbol>→<f>";
+/// 收件箱的新闻是浅色底：加强、削弱的数字和理由的颜色（游戏浅色主题的正负色，理由用官方理由行的灰）
+const NEWS_UP: &str = "#0b7f58ff";
+const NEWS_DOWN: &str = "#b8540bff";
+const NEWS_REASON: &str = "#667085ff";
+
+/// 一件装备的一行数值：图标（4+6 的属性图标，可以没有）、名字、改前、改后
+pub type ItemLine = (String, String, String, String);
+
+/// The round's item changes as news of their own (2.9.0; None: it changed no item). 2.14.2（用户：「装备的平衡补丁现在
+/// 文字显示排版很差 而且数值在局内能改了 你还写上去 排版参考官方英雄补丁那种排版」）：照官方英雄补丁排版——先「增强」
+/// 再「削弱」，每件装备一段：图标和名字（粗体）、一句理由（灰）、一行一个数值「攻击力: 75 → 69」（改后的数字带颜色）、
+/// 整体强度那一行。不再说「装备说明里显示的仍是原来的数值」（2.12.1 起百科和战术界面的装备说明就是改后的数值）。
+/// `lines`：一件装备改前改后的数值（[`crate::items::lines`]，带属性图标），`icon`：它的图标文字（[`crate::items::icon_text`]）。
 pub fn item_news(
     round: &Round,
     chinese: bool,
-    lines: &dyn Fn(&ItemChange) -> Vec<crate::items::Line>,
+    lines: &dyn Fn(&ItemChange) -> Vec<ItemLine>,
     icon: &dyn Fn(&ItemChange) -> String,
 ) -> Option<(String, String)> {
     if round.items.is_empty() {
@@ -999,66 +1143,37 @@ pub fn item_news(
     let name = if round.label.is_empty() { round.version.as_str() } else { round.label.as_str() };
     let title = if chinese { format!("电竞大脑装备平衡 {name}") } else { format!("Patch Meta AI item balance {name}") };
     let mut out = vec![if chinese {
-        "4+6 装备的改动：只改装备给的数值（特效不变，穿透、韧性这类只能加不能减），对所有比赛生效；装备说明里显示的仍是原来的数值。"
-            .to_string()
+        "本次装备平衡应用了以下变动（只调整装备的属性数值，装备特效不变）。".to_string()
     } else {
-        "4+6 item changes: only the numbers an item gives (its effects stay; penetration, tenacity and the like can go up,          never down), in every match; the item tooltips still show the numbers from before."
-            .to_string()
+        "This item balance patch makes the following changes (only the numbers items give; their effects stay).".to_string()
     }];
-    let mut items: Vec<&ItemChange> = round.items.iter().collect();
-    items.sort_by_key(|c| (c.step > 0, c.step));
-    for c in items {
-        let numbers: Vec<String> = lines(c).into_iter().map(|(label, from, to)| format!("{label} {from} → {to}")).collect();
-        // power taken off (2.11.0): why, not its builders
-        if c.reset.is_some() {
-            out.push(if chinese {
-                format!(
-                    "【恢复】{}{}：设置里列为不调整（item_balance_skip），取消电竞大脑之前的 {:+}%{}{}",
-                    icon(c),
-                    c.name,
-                    -c.step,
-                    if numbers.is_empty() { "" } else { "：" },
-                    numbers.join("，")
-                )
-            } else {
-                format!(
-                    "[Reset] {}{}: item_balance_skip lists it; this mod's earlier {:+}% taken off{}{}",
-                    icon(c),
-                    c.name,
-                    -c.step,
-                    if numbers.is_empty() { "" } else { ": " },
-                    numbers.join(", ")
-                )
-            });
+    let power_name = if chinese { "整体强度" } else { "Overall power" };
+    for buffs in [true, false] {
+        let mut items: Vec<&ItemChange> = round.items.iter().filter(|c| (c.step > 0) == buffs).collect();
+        if items.is_empty() {
             continue;
         }
-        out.push(if chinese {
-            format!(
-                "【{}】{}{}：出它的 {} 个英雄平均胜率约 {:.1}% → 装备数值 {:+}%（累计 {:+}%）{}{}",
-                if c.step < 0 { "削弱" } else { "加强" },
-                icon(c),
-                c.name,
-                c.users,
-                c.win,
-                c.step,
-                c.total,
-                if numbers.is_empty() { "" } else { "：" },
-                numbers.join("，")
-            )
-        } else {
-            format!(
-                "[{}] {}{}: its {} builders win about {:.1}% -> item numbers {:+}% ({:+}% in all){}{}",
-                if c.step < 0 { "Nerf" } else { "Buff" },
-                icon(c),
-                c.name,
-                c.users,
-                c.win,
-                c.step,
-                c.total,
-                if numbers.is_empty() { "" } else { ": " },
-                numbers.join(", ")
-            )
-        });
+        items.sort_by_key(|c| -c.step.abs());
+        out.push(String::new());
+        out.push(format!(
+            "{BOLD}{}{FONT_END}",
+            match (buffs, chinese) {
+                (true, true) => "增强",
+                (false, true) => "削弱",
+                (true, false) => "Buffs",
+                (false, false) => "Nerfs",
+            }
+        ));
+        let colour = if buffs { NEWS_UP } else { NEWS_DOWN };
+        for c in items {
+            out.push(String::new());
+            out.push(format!("{}{BOLD}{}{FONT_END}", icon(c), c.name));
+            out.push(format!("<{NEWS_REASON}>{}<>", item_reason(c, seed(&c.item, name), chinese)));
+            for (stat_icon, label, from, to) in lines(c) {
+                out.push(format!("{stat_icon}{label}: {from} {ARROW} <{colour}>{to}<>"));
+            }
+            out.push(format!("{power_name}: {} {ARROW} <{colour}>{}<>", percent(c.total - c.step), percent(c.total)));
+        }
     }
     Some((title, out.join("\n")))
 }
@@ -2070,6 +2185,46 @@ pub fn reset_for_tests() {
 mod tests {
     use super::*;
 
+    /// 用真实账本预览新写法（2.14.2）：最近一轮有英雄和装备改动的，每个英雄的理由代码和整体强度、装备新闻。
+    /// PMA_BOOK=<账本> PMA_ITEMS=<4+6 的 item-catalog.json> PMA_PREVIEW_OUT=<输出> cargo test preview_notes -- --ignored
+    #[test]
+    #[ignore]
+    fn preview_notes_on_a_book() {
+        let book = std::env::var("PMA_BOOK").expect("PMA_BOOK");
+        let out = std::env::var("PMA_PREVIEW_OUT").expect("PMA_PREVIEW_OUT");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&book).unwrap()).unwrap();
+        let rounds: Vec<Round> = serde_json::from_value(v["rounds"].clone()).unwrap();
+        let round = rounds.iter().rev().find(|r| !r.changes.is_empty() && !r.items.is_empty()).unwrap();
+        let catalog = std::env::var("PMA_ITEMS").ok().and_then(|p| crate::items::Catalog::parse(&std::fs::read_to_string(p).ok()?));
+        let mut lines = Vec::new();
+        for c in &round.changes {
+            let kind = kind_of(crate::knowledge::get().profiles.get(&c.champion), None);
+            let f = flavor_of(c, round.id, &rounds, kind);
+            let power = power_row(c).map(|r| format!("{} -> {}", r.pre_value, r.after_value)).unwrap_or_default();
+            lines.push(
+                serde_json::json!({"champion": c.champion, "step": c.step, "codes": reason(c, &f), "power": power, "kind": format!("{kind:?}"), "streak": f.streak})
+                    .to_string(),
+            );
+        }
+        let item_lines = |c: &ItemChange| -> Vec<ItemLine> {
+            catalog
+                .as_ref()
+                .and_then(|cat| cat.item(&c.item))
+                .map(|(_, item)| {
+                    crate::items::field_lines(item, c.total - c.step, c.total, true)
+                        .into_iter()
+                        .map(|(f, l, a, b)| (crate::items::stat_icon_text(f), l, a, b))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let icon = |c: &ItemChange| catalog.as_ref().and_then(|cat| cat.item(&c.item)).map(|(_, i)| crate::items::icon_text(&i.icon)).unwrap_or_default();
+        let (title, body) = item_news(round, true, &item_lines, &icon).unwrap();
+        lines.push(serde_json::json!({"title": title, "body": body, "round": round.label}).to_string());
+        std::fs::write(out, lines.join("
+")).unwrap();
+    }
+
     /// The champions' power a run plays (the items' left out), as the tests before 2.9.0 read it.
     fn champs(key: String, first_run: bool, on: bool) -> Option<Arc<BTreeMap<String, i32>>> {
         round_for(key, first_run, on, true, true).map(|p| p.champions)
@@ -2276,18 +2431,83 @@ mod tests {
     }
 
     #[test]
-    fn the_reason_is_the_win_rate_and_the_limits() {
+    fn the_reason_is_the_games_own_words_then_the_win_rate() {
         let c = |win: f32, step: i32, total: i32| Change { champion: "x".into(), win, evidence: 50.0, step, total, unpicked: false, reset: None, theme: None };
-        assert_eq!(reason(&c(73.3, -10, -10), RULES), "pma_wr_74,pma_power_m10,pma_cap");
-        assert_eq!(reason(&c(52.3, -1, -1), RULES), "pma_wr_53,pma_power_m1", "rounded away from the band");
-        assert_eq!(reason(&c(44.6, 5, 5), RULES), "pma_wr_44,pma_power_p5");
-        // the power in all when other rounds moved it before (2.9.0), the limit in all at CAP (80 since 2.10.0, a code
-        // of its own: 2.9.0's notes at its 50% keep theirs)
-        assert_eq!(reason(&c(70.0, -5, -30), RULES), "pma_wr_70,pma_power_m5,pma_sum_m30");
-        assert_eq!(reason(&c(70.0, -5, -50), RULES), "pma_wr_70,pma_power_m5,pma_sum_m50", "50% is no limit any more");
-        assert_eq!(reason(&c(70.0, -5, -CAP), RULES), "pma_wr_70,pma_power_m5,pma_sum_m80,pma_total_80");
-        assert_eq!(reason(&c(40.0, 8, 0), RULES), "pma_wr_40,pma_power_p8", "back to its own numbers: no sum");
+        let f = |kind: Kind, seed: u64| Flavor { kind, seed, ..Flavor::default() };
+        // 削弱：输出、坦度、回复、后期；加强反过来；种子挑第几句
+        assert_eq!(reason(&c(73.3, -10, -10), &f(Kind::Damage, 0)), "too_much_damage_1,pma_wr_74");
+        assert_eq!(reason(&c(52.3, -1, -1), &f(Kind::Tank, 1)), "too_tanky_2,pma_wr_53", "rounded away from the band");
+        assert_eq!(reason(&c(60.0, -5, -5), &f(Kind::Healer, 2)), "too_much_healing_3,pma_wr_60");
+        assert_eq!(reason(&c(60.0, -5, -5), &f(Kind::Late, 3)), "late_game_scaling_1,pma_wr_60");
+        assert_eq!(reason(&c(44.6, 5, 5), &f(Kind::Damage, 0)), "low_damage_1,pma_wr_44");
+        assert_eq!(reason(&c(44.6, 5, 5), &f(Kind::Tank, 0)), "too_fragile_1,pma_wr_44");
+        assert_eq!(reason(&c(44.6, 5, 5), &f(Kind::Healer, 0)), "low_healing_1,pma_wr_44");
+        assert_eq!(reason(&c(44.6, 5, 5), &f(Kind::Late, 0)), "weak_late_game_1,pma_wr_44");
+        // 连着调：版本强势 / 一直萎靡
+        let streak = Flavor { streak: true, ..f(Kind::Tank, 4) };
+        assert_eq!(reason(&c(70.0, -5, -30), &streak), "nerf_meta_1,pma_wr_70");
+        assert_eq!(reason(&c(40.0, 8, 16), &streak), "buff_meta_2,pma_wr_40");
+        // 禁选率、选用率没统计：「长期占据ban/pick榜首」「无人问津」这两句不用
+        let streak = Flavor { streak: true, ..f(Kind::Tank, 5) };
+        assert_eq!(reason(&c(70.0, -5, -30), &streak), "nerf_meta_3,pma_wr_70");
+        assert_eq!(reason(&c(40.0, 8, 16), &streak), "buff_meta_3,pma_wr_40");
+        // 冷门加强：官方的冷门理由和场次那一行；连着两轮冷门是「阔别太久」
+        let rare = Change { unpicked: true, ..c(50.0, 10, 10) };
+        assert_eq!(reason(&rare, &f(Kind::Damage, 1)), "unpicked_2,pma_unpicked");
+        assert_eq!(reason(&rare, &Flavor { unpicked_before: true, ..f(Kind::Damage, 1) }), "unpicked_long,pma_unpicked");
+        // 撤回、主题：电竞大脑自己的话；每条都有 pma_ 代码（patchnotes 靠它认出来）
+        assert_eq!(reason(&Change { reset: Some(Reset::Skip), ..c(50.0, 10, 0) }, &f(Kind::Damage, 0)), "pma_skip");
+        assert_eq!(reason(&Change { theme: Some(1), ..c(50.0, 8, 8) }, &f(Kind::Damage, 0)), "pma_theme_1");
         assert_eq!((signed_code(-11), signed_code(9)), ("m11".to_string(), "p9".to_string()));
+        // 整体强度是一行：这一版之前和之后
+        let row = power_row(&c(70.0, -5, -30)).unwrap();
+        assert_eq!((row.key.as_str(), row.pre_value.as_str(), row.after_value.as_str(), row.is_buff), (POWER_KEY, "-25%", "-30%", false));
+        let row = power_row(&c(40.0, 8, 8)).unwrap();
+        assert_eq!((row.pre_value.as_str(), row.after_value.as_str(), row.is_buff), ("0%", "+8%", true));
+        assert!(power_row(&c(40.0, 0, 8)).is_none());
+    }
+
+    #[test]
+    fn the_flavor_comes_from_the_role_and_the_last_rounds() {
+        let profile = |front: f32, peel: f32, carry: f32| crate::knowledge::Profile {
+            dmg: crate::knowledge::Dmg::Ad,
+            front,
+            engage: 0.0,
+            peel,
+            poke: 0.0,
+            dive: 0.0,
+            carry,
+            cc: 0.0,
+            tier: 0,
+        };
+        assert_eq!(kind_of(Some(&profile(2.0, 0.0, 0.0)), Some(0)), Kind::Tank);
+        assert_eq!(kind_of(Some(&profile(0.0, 2.0, 0.0)), Some(3)), Kind::Healer);
+        assert_eq!(kind_of(Some(&profile(0.0, 0.0, 2.0)), Some(1)), Kind::Late);
+        assert_eq!(kind_of(Some(&profile(0.5, 0.5, 0.5)), Some(2)), Kind::Damage);
+        assert_eq!(kind_of(None, Some(5)), Kind::Tank);
+        assert_eq!(kind_of(None, Some(3)), Kind::Healer);
+        assert_eq!(kind_of(None, None), Kind::Damage);
+        let change = |name: &str, step: i32, unpicked: bool| Change {
+            champion: name.into(),
+            win: 50.0,
+            evidence: 50.0,
+            step,
+            total: step,
+            unpicked,
+            reset: None,
+            theme: None,
+        };
+        let round = |id: u32, changes: Vec<Change>| Round { id, changes, ..Round::default() };
+        let rounds = vec![round(3, vec![change("a", -5, false), change("b", 5, true)]), round(4, vec![change("c", 5, false)])];
+        // 上一轮（或上上轮）也往同一个方向调：连着调
+        assert!(flavor_of(&change("a", -5, false), 5, &rounds, Kind::Damage).streak);
+        assert!(!flavor_of(&change("a", 5, false), 5, &rounds, Kind::Damage).streak, "the other way");
+        assert!(!flavor_of(&change("a", -5, false), 6, &rounds, Kind::Damage).streak, "three rounds ago");
+        let rare = flavor_of(&change("b", 5, true), 5, &rounds, Kind::Damage);
+        assert!(rare.streak && rare.unpicked_before);
+        // 同一个英雄同一轮总是同一句
+        assert_eq!(seed("a", "5"), flavor_of(&change("a", -5, false), 5, &rounds, Kind::Damage).seed);
+        assert_ne!(seed("a", "5"), seed("a", "6"));
     }
 
     #[test]
@@ -2308,7 +2528,7 @@ mod tests {
         let row = Row { key: "#asset/base/text/champion?stat.attack".into(), target_action: None, pre_value: "94".into(), after_value: "89.3".into(), is_buff: false };
         let mut lines = BTreeMap::new();
         for c in &round.changes {
-            lines.insert(c.champion.clone(), (vec![Row { is_buff: c.step > 0, ..row.clone() }], reason(c, RULES)));
+            lines.insert(c.champion.clone(), (vec![Row { is_buff: c.step > 0, ..row.clone() }], reason(c, &Flavor::default())));
         }
         let signatures = vec![
             Signature { athlete: 2240, name: "OneJey".into(), champion: "league_warwick".into() },
@@ -2327,7 +2547,7 @@ mod tests {
         assert_eq!(keys, ["Champion", "PatchChanges", "PatchReason", "Team"]);
         assert_eq!(pc02.title_bind[0].1, "tft_maddie");
         assert!(pc02.title_bind[1].1.starts_with(r##"[{"key":"#asset/base/text/champion?stat.attack""##), "{}", pc02.title_bind[1].1);
-        assert_eq!(pc02.title_bind[2].1, "pma_wr_74,pma_power_m10,pma_cap");
+        assert_eq!(pc02.title_bind[2].1, "too_much_damage_1,pma_wr_74");
         let tail: Vec<(&str, &str)> = pc02.content_bind[4..].iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(
             tail,
@@ -2678,17 +2898,17 @@ mod tests {
     }
 
     #[test]
-    fn the_item_news_names_each_item_its_builders_and_numbers() {
+    fn the_item_news_is_laid_out_like_the_games_patch_notes() {
         let mut round = Round { id: 4, version: "2027.5.0".into(), label: "2027.5.0".into(), ..Round::default() };
         let no_icon = |_: &ItemChange| String::new();
         assert_eq!(item_news(&round, true, &|_| Vec::new(), &no_icon), None, "no item changed: no news");
         round.items = vec![
             ItemChange { item: "staff".into(), name: "大天使之杖".into(), users: 6, win: 43.5, step: 6, total: 6, reset: None },
-            ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.5, step: -10, total: -20, reset: None },
+            ItemChange { item: "rfc".into(), name: "疾射火炮".into(), users: 4, win: 64.6, step: -10, total: -20, reset: None },
         ];
         let lines = |c: &ItemChange| {
             if c.item == "rfc" {
-                vec![("攻击速度".to_string(), "31".to_string(), "28".to_string())]
+                vec![("<i#asset/base/ui/banpick/champion_stat_icon:attack_speed_0>".to_string(), "攻击速度".to_string(), "31".to_string(), "28".to_string())]
             } else {
                 Vec::new()
             }
@@ -2696,26 +2916,28 @@ mod tests {
         let (title, content) = item_news(&round, true, &lines, &no_icon).unwrap();
         assert_eq!(title, "电竞大脑装备平衡 2027.5.0");
         let rows: Vec<&str> = content.lines().collect();
-        assert_eq!(rows.len(), 3);
-        assert!(rows[0].contains("特效不变"), "{}", rows[0]);
-        assert_eq!(rows[1], "【削弱】疾射火炮：出它的 4 个英雄平均胜率约 64.5% → 装备数值 -10%（累计 -20%）：攻击速度 31 → 28");
-        assert!(rows[2].starts_with("【加强】大天使之杖") && !rows[2].ends_with("："), "{}", rows[2]);
+        assert!(rows[0].starts_with("本次装备平衡应用了以下变动") && !content.contains("仍是原来的数值"), "{content}");
+        // 先增强后削弱，每件一段：粗体名字、一句理由、一行一个数值、整体强度
+        assert_eq!(rows[2], format!("{BOLD}增强{FONT_END}"));
+        assert_eq!(rows[4], format!("{BOLD}大天使之杖{FONT_END}"));
+        assert!(rows[5].starts_with(&format!("<{NEWS_REASON}>")) && rows[5].contains("44%"), "{}", rows[5]);
+        assert_eq!(rows[6], format!("整体强度: 0% {ARROW} <{NEWS_UP}>+6%<>"));
+        assert_eq!(rows[8], format!("{BOLD}削弱{FONT_END}"));
+        assert_eq!(rows[10], format!("{BOLD}疾射火炮{FONT_END}"));
+        assert!(rows[11].contains("65%"), "{}", rows[11]);
+        assert_eq!(rows[12], format!("<i#asset/base/ui/banpick/champion_stat_icon:attack_speed_0>攻击速度: 31 {ARROW} <{NEWS_DOWN}>28<>"));
+        assert_eq!(rows[13], format!("整体强度: -10% {ARROW} <{NEWS_DOWN}>-20%<>"));
+        assert_eq!(rows.len(), 14);
         let (title, content) = item_news(&round, false, &lines, &no_icon).unwrap();
         assert_eq!(title, "Patch Meta AI item balance 2027.5.0");
-        assert!(
-            content.contains("[Nerf] 疾射火炮: its 4 builders win about 64.5% -> item numbers -10% (-20% in all): 攻击速度 31 → 28"),
-            "{content}"
-        );
-        // each item's icon in front of its name (2.11.0)
+        assert!(content.contains(&format!("{BOLD}Nerfs{FONT_END}")) && content.contains("Overall power: -10%"), "{content}");
+        // 装备图标在名字前面（2.11.0）
         let icon = |c: &ItemChange| crate::items::icon_text(if c.item == "rfc" { "i_t5_rfc" } else { "" });
         let (_, content) = item_news(&round, true, &lines, &icon).unwrap();
-        let rows: Vec<&str> = content.lines().collect();
-        assert!(
-            rows[1].starts_with("【削弱】<i#asset/base/aseprite_resources/ingame/item_icons_18x18:i_t5_rfc>疾射火炮："),
-            "{}",
-            rows[1]
-        );
-        assert!(rows[2].starts_with("【加强】大天使之杖"), "an item without an icon: just its name: {}", rows[2]);
+        assert!(content.contains(&format!("<i#asset/base/aseprite_resources/ingame/item_icons_18x18:i_t5_rfc>{BOLD}疾射火炮")), "{content}");
+        // 同一件装备同一轮总是同一句理由
+        let staff = &round.items[0];
+        assert_eq!(item_reason(staff, seed("staff", "2027.5.0"), true), item_reason(staff, seed("staff", "2027.5.0"), true));
     }
 
     #[test]
@@ -2881,11 +3103,9 @@ mod tests {
         // the model reads their steps like any other's
         let steps = &model_rounds_of(std::slice::from_ref(&round))[0].steps;
         assert!(steps.contains(&("new".to_string(), 10)) && steps.contains(&("maddie".to_string(), -10)), "{steps:?}");
-        // the notes say why, not a win rate; no limit codes
-        let reason_of = |name: &str| reason(round.changes.iter().find(|c| c.champion == name).unwrap(), rules);
-        assert_eq!(reason_of("new"), "pma_unpicked,pma_power_p10");
-        let again = Change { step: 10, total: 20, ..round.changes[1].clone() };
-        assert_eq!(reason(&again, rules), "pma_unpicked,pma_power_p10,pma_sum_p20");
+        // the notes say why, not a win rate (2.14.2: the game's own words for it, then the games line)
+        let reason_of = |name: &str| reason(round.changes.iter().find(|c| c.champion == name).unwrap(), &Flavor::default());
+        assert_eq!(reason_of("new"), "unpicked_1,pma_unpicked");
         // and so does the plain news
         let (_, body) = news(&round, &|n: &str| if n == "new" { "新英雄".to_string() } else { "某英雄".to_string() });
         assert!(body.contains("新英雄：近几个版本很少有人选（近期 0 场）→ 强度 +10%（攻击/法强 +5%，生命 +5%），累计 +10%"), "{body}");
@@ -2980,10 +3200,10 @@ mod tests {
         let got: Vec<(&str, i32, i32, Option<Reset>)> = reset.changes.iter().map(|c| (c.champion.as_str(), c.step, c.total, c.reset)).collect();
         assert_eq!(got, [("jinx", 20, 0, Some(Reset::Edit)), ("ezreal", 0, 0, Some(Reset::Edit)), ("zeri", -10, 0, Some(Reset::Skip))]);
         assert_eq!((reset.items[0].step, reset.items[0].total, reset.items[0].reset), (10, 0, Some(Reset::Skip)));
-        // the notes' reasons: why and how much, no win rate
-        assert_eq!(reason(&reset.changes[0], RULES), "pma_custom,pma_power_p20");
-        assert_eq!(reason(&reset.changes[1], RULES), "pma_custom");
-        assert_eq!(reason(&reset.changes[2], RULES), "pma_skip,pma_power_m10");
+        // the notes' reasons: why, no win rate; how much is the power line (2.14.2)
+        assert_eq!(reason(&reset.changes[0], &Flavor::default()), "pma_custom");
+        assert_eq!(reason(&reset.changes[2], &Flavor::default()), "pma_skip");
+        assert_eq!(power_row(&reset.changes[0]).map(|r| (r.pre_value, r.after_value)), Some(("-20%".to_string(), "0%".to_string())));
         // the notes' lines: the numbers with this mod's power, then the save's own (the player's)
         let stats = Stats { category: None, base: [70.0, 0.0, 720.0, 16.0, 12.0, 810.0], growth: [20.0, 0.0, 90.0, 0.0, 0.0, 0.0] };
         let lines = rows(&stats, reset.changes[0].total - reset.changes[0].step, reset.changes[0].total);
@@ -2992,7 +3212,7 @@ mod tests {
         // no news cards; the item news says why
         assert!(articles(&reset, &BTreeMap::new(), "T1", &[], &|n: &str| n.to_string()).is_empty());
         let (_, body) = item_news(&reset, true, &|_| Vec::new(), &|_| String::new()).unwrap();
-        assert!(body.contains("【恢复】无尽之刃：设置里列为不调整（item_balance_skip），取消电竞大脑之前的 -10%"), "{body}");
+        assert!(body.contains("无尽之刃") && body.contains("item_balance_skip") && body.contains("整体强度: -10%"), "{body}");
         // nothing to take off or say: no round; no round yet: no power at all
         assert!(make_reset(&rounds, &[("nopower".into(), Reset::Skip)], &[], &[], today).is_none());
         assert!(make_reset(&[], &[("jinx".into(), Reset::Edit)], &[], &[], today).is_none());
@@ -3177,7 +3397,7 @@ mod tests {
         assert!(steps.iter().all(|(_, step, theme)| *step == 8 && *theme == Some(4)), "{steps:?}");
         assert_eq!(round.power.get("maddie"), Some(&8));
         let maddie = round.changes.iter().find(|c| c.champion == "maddie").unwrap();
-        assert!(reason(maddie, rules).starts_with("pma_theme_4,pma_power_p8"), "{}", reason(maddie, rules));
+        assert_eq!(reason(maddie, &Flavor::default()), "pma_theme_4");
         let (_, body) = news(&round, &|c: &str| if c == "maddie" { "麦迪".to_string() } else { c.to_string() });
         assert!(body.starts_with("本版本是主题版本「刺客版本」"), "{body}");
         assert!(body.contains("麦迪：主题版本（刺客）"), "{body}");

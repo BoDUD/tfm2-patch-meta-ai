@@ -59,7 +59,8 @@ use crate::shared::Snapshot;
 pub const GRID: &str = "main.champions.contents";
 const OVERLAY: &str = "main.pma";
 const TAG: &str = "pma_tag";
-const LANE_TAG: &str = "pma_lane";
+/// 已选英雄下面的位置和胜率标签（2.14.3）
+const RATE_TAG: &str = "pma_rate";
 const BLUE_NAME: &str = "main.bottom.blue_side.name";
 const RED_NAME: &str = "main.bottom.red_side.name";
 const PICK_COLUMNS: [&str; 2] = ["main.blue_picks", "main.red_picks"];
@@ -245,6 +246,8 @@ pub struct DraftScreen {
     /// The draft and model the overlay was last drawn for.
     drawn: Option<u64>,
     tagged: HashMap<String, bool>,
+    /// 已选英雄标签上次写的字（2.14.3），没变就不再写
+    rated: HashMap<String, String>,
     reported: bool,
     /// The values of the last drawing, for the breakdown line and the review.
     last: Option<Drawn>,
@@ -511,26 +514,51 @@ fn chip_source() -> String {
 /// The card's name moves to the left of its row to make room for the value.
 const NAME_LEFT: &str = "align_x: Left; x: 8px; width: 74px;";
 
-/// Steps of the lane read's confidence bar.
-const LANE_STEPS: usize = 5;
+/// 标签的宽：英雄图（宽 137）下面居中
+const RATE_W: i32 = 128;
+/// 读位置没把握（这一路的可能不到这么多）就在位置后面打个问号
+const RATE_SURE: f32 = 0.5;
 
-/// The lane read on an enemy pick: the lane icon and a five-step confidence bar.
-fn lane_source() -> String {
-    let mut steps = String::new();
-    for k in 0..LANE_STEPS {
-        steps.push_str(&format!(
-            "#s{k}:color {{ x: {}px; y: 9px; width: 7px; height: 5px; color: #4a4c56ff; ignore_event: true; \
-             rounding: Uniform {{ rounding: 2; }} }} ",
-            30 + k * 9
-        ));
-    }
+/// 已选英雄下面的标签（2.14.3）：带边框的小条，位置图标和「上单 胜率 52%」。放在游戏已选卡片（`done`）里英雄图的
+/// 脚下：蓝方英雄图在卡片右边（x 160），红方在左边（x 6），都是宽 137。边框和字的颜色跟胜率走（[`rate_colour`]）。
+fn rate_source(side: usize) -> String {
+    let x = if side == 0 { 160 } else { 6 } + (137 - RATE_W) / 2;
     format!(
-        "{LANE_TAG}:color {{ anchor_x: 1; pivot_x: 1; x: -6px; y: 6px; width: {}px; height: 24px; color: #07080be0; \
+        "{RATE_TAG}:color {{ x: {x}px; y: 146px; width: {RATE_W}px; height: 24px; back_color: #161721e8; color: #4a4c56ff; stroke: 1; \
          ignore_event: true; rounding: Uniform {{ rounding: 6; }} \
-         #icon:image {{ x: 5px; y: 3px; width: 18px; height: 18px; color: #e8e8e8ff; ignore_event: true; \
-         source: \"asset/base/ui/icons/top\"; }} {steps}}}",
-        30 + LANE_STEPS * 9 + 2
+         #icon:image {{ x: 6px; y: 4px; width: 16px; height: 16px; color: #e8e8e8ff; ignore_event: true; \
+         source: \"asset/base/ui/icons/top\"; }} \
+         #text:label {{ @\"asset/base/style/main#bold_label\"; x: 26px; y: 0px; width: {}px; height: 24px; size: 13; \
+         align_y: Center; color: #e8e8e8ff; text: \"\"; ignore_event: true; }} }}",
+        RATE_W - 30
     )
+}
+
+/// 位置的中文名（游戏里的叫法）
+fn lane_text(r: Role) -> &'static str {
+    match r {
+        Role::Top => "上单",
+        Role::Jungle => "打野",
+        Role::Mid => "中单",
+        Role::Bottom => "下路",
+        Role::Support => "辅助",
+    }
+}
+
+/// 标签上的字：位置（读得没把握加问号）和胜率
+fn rate_text(lane: Role, rate: f32, unsure: bool) -> String {
+    format!("{}{} 胜率 {:.0}%", lane_text(lane), if unsure { "?" } else { "" }, rate * 100.0)
+}
+
+/// 胜率的颜色：52% 以上绿，48% 以下红，中间是普通的字色（边框用灰）
+fn rate_colour(rate: f32) -> Option<u32> {
+    if rate >= 0.52 {
+        Some(GOOD)
+    } else if rate <= 0.48 {
+        Some(BAD)
+    } else {
+        None
+    }
 }
 
 fn lane_icon(r: Role) -> &'static str {
@@ -1259,33 +1287,41 @@ impl DraftScreen {
             }
         }
 
-        // enemy lanes, on the enemy's pick slots in pick order
+        // 每个已选英雄脚下：位置和它在这一路的胜率（2.14.3；用户发来别的界面卡片下写「Top 67%」的截图：「我们的电竞大脑
+        // 没有这种胜率显示 能加上去吗」）。两边都画，按选人顺序对上卡片；位置是电竞大脑读的这一队分路（`advisor::lanes`，
+        // 胜率也按这个算），对方的读得没把握（这一路的可能不到一半）位置后面打个问号；胜率是模型估的这个版本它在这一路的
+        // 胜率（`Champion::role_rate`）。以前对方卡片右上角的位置条（图标加五格把握）由它代替。
         if view.lane_tags {
-            let column = PICK_COLUMNS[1 - side];
-            let slots = ui.children(column);
-            let probs = advisor::lane_probabilities(meta, &enemy);
-            for (i, slot) in slots.iter().enumerate() {
-                let path = format!("{column}.{slot}");
-                let tag = format!("{path}.{LANE_TAG}");
-                let read = probs.get(i).map(|row| {
-                    row.iter()
-                        .enumerate()
-                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-                        .map(|(r, p)| (Role::ALL[r], *p))
-                        .unwrap_or((Role::Top, 0.0))
-                });
-                if !ui.exists(&tag) && (read.is_none() || !ui.spawn(&path, &lane_source())) {
-                    continue;
-                }
-                ui.set_visible(&tag, read.is_some());
-                if let Some((lane, p)) = read {
-                    ui.set_properties(&format!("{tag}.icon"), &format!("source: \"{}\";", lane_icon(lane)));
-                    // 20% is a blind guess among five lanes: the bar starts there
-                    let lit = (((p - 0.2) / 0.8).clamp(0.0, 1.0) * LANE_STEPS as f32).ceil() as usize;
-                    for k in 0..LANE_STEPS {
-                        let c = if k < lit { if lit >= 4 { GOOD } else { 0xf2c14eff } } else { 0x4a4c56ff };
-                        ui.set_properties(&format!("{tag}.s{k}"), &format!("color: {};", color(c)));
+            // 这里的 blue 已经是「我们是不是蓝方」，按边换回双方的选人
+            let (blue_picks, red_picks) = if side == 0 { (&ally, &enemy) } else { (&enemy, &ally) };
+            for (s, picks) in [(0usize, blue_picks), (1usize, red_picks)] {
+                let column = PICK_COLUMNS[s];
+                let lanes = advisor::lanes(meta, picks);
+                let probs = advisor::lane_probabilities(meta, picks);
+                for (i, slot) in ui.children(column).iter().enumerate() {
+                    let done = format!("{column}.{slot}.done");
+                    let tag = format!("{done}.{RATE_TAG}");
+                    let read = picks.get(i).zip(lanes.roles.get(i)).and_then(|(c, r)| {
+                        let champ = meta.by_id(*c)?;
+                        let sure = probs.get(i).map_or(1.0, |row| row[r.index()]);
+                        Some((*r, champ.role_rate(*r), s != side && sure < RATE_SURE))
+                    });
+                    if !ui.exists(&tag) && (read.is_none() || !ui.exists(&done) || !ui.spawn(&done, &rate_source(s))) {
+                        continue;
                     }
+                    let text = read.map(|(lane, rate, unsure)| rate_text(lane, rate, unsure)).unwrap_or_default();
+                    if self.rated.get(&tag) == Some(&text) {
+                        continue;
+                    }
+                    ui.set_visible(&tag, read.is_some());
+                    if let Some((lane, rate, _)) = read {
+                        ui.set_properties(&format!("{tag}.icon"), &format!("source: \"{}\";", lane_icon(lane)));
+                        ui.set_text(&format!("{tag}.text"), &text);
+                        let tone = rate_colour(rate);
+                        ui.set_properties(&format!("{tag}.text"), &format!("color: {};", color(tone.unwrap_or(0xe8e8_e8ff))));
+                        ui.set_properties(&tag, &format!("color: {};", color(tone.unwrap_or(0x4a4c_56ff))));
+                    }
+                    self.rated.insert(tag, text);
                 }
             }
         }
@@ -1308,6 +1344,7 @@ mod tests {
         for col in PICK_COLUMNS {
             for i in 0..5 {
                 ui.add(&format!("{col}.pick_slot_{i}"), "color_icon_button");
+                ui.add(&format!("{col}.pick_slot_{i}.done"), "empty");
             }
         }
         ui.add(GRID, "empty");
@@ -1507,11 +1544,14 @@ mod tests {
         assert!(advised.contains(&name_ref("c")), "the strong champion is advised: {advised:?}");
         assert!(text(&format!("{GRID}.c.{TAG}.text")).starts_with('▲'), "c is worth picking");
         assert!(ui.nodes[&format!("{GRID}.c.{TAG}.stripe")].props.iter().any(|p| p.contains(&color(GOOD))));
-        // a lane read on the enemy's first pick slot: an icon and a confidence bar
-        let lane = format!("main.red_picks.pick_slot_0.{LANE_TAG}");
-        assert!(ui.nodes[&format!("{lane}.icon")].props.iter().any(|p| p.contains("asset/base/ui/icons/")));
-        assert!(ui.exists(&format!("{lane}.s4")));
-        assert!(!ui.exists(&format!("main.red_picks.pick_slot_1.{LANE_TAG}")));
+        // 双方第一个已选英雄脚下：位置图标和「位置 胜率 xx%」；还没选的格子没有
+        for column in PICK_COLUMNS {
+            let tag = format!("{column}.pick_slot_0.done.{RATE_TAG}");
+            assert!(ui.nodes[&format!("{tag}.icon")].props.iter().any(|p| p.contains("asset/base/ui/icons/")), "{tag}");
+            let shown = text(&format!("{tag}.text"));
+            assert!(shown.contains(" 胜率 ") && shown.ends_with('%'), "{shown}");
+            assert!(!ui.exists(&format!("{column}.pick_slot_1.done.{RATE_TAG}")));
+        }
 
         // nothing changed: nothing redrawn; the game rebuilt the screen: drawn again
         let spawned = ui.spawned.len();
@@ -1520,6 +1560,15 @@ mod tests {
         ui.remove("main.pma");
         screen.tick(&mut ui, 3 * READ_EVERY, Some(&snapshot), &book, &view);
         assert!(ui.exists("main.pma.win.value"));
+    }
+
+    #[test]
+    fn the_pick_badge_says_the_lane_and_the_win_rate() {
+        assert_eq!(rate_text(Role::Bottom, 0.524, false), "下路 胜率 52%");
+        assert_eq!(rate_text(Role::Mid, 0.47, true), "中单? 胜率 47%");
+        assert_eq!((rate_colour(0.53), rate_colour(0.47), rate_colour(0.50)), (Some(GOOD), Some(BAD), None));
+        // 蓝方英雄图在右边、红方在左边，标签都在英雄图脚下居中
+        assert!(rate_source(0).contains("x: 164px;") && rate_source(1).contains("x: 10px;"));
     }
 
     #[test]

@@ -16,31 +16,48 @@
 //! the page can be seen.
 //!
 //! 2.13.0 起防御塔、小龙、大龙的改动也写在这个块里（装备后面，没有装备改动就只有它们）。
+//!
+//! 2.14.2（用户：「装备的平衡补丁现在文字显示排版很差…排版参考官方英雄补丁那种排版是不是更美观」）：块里照官方英雄补丁
+//! 排——左边「增强」右边「削弱」两栏，每一项一个图标格子和名字（粗体），下面竖线边上一句理由（官方理由行的灰）、一行一个
+//! 数值「攻击力: 75 → 69」（属性图标，改后的数字带颜色），最后是整体强度。尺寸和颜色抄游戏自己的
+//! `news_component/patch_*` 布局（patch_champion_entry、patch_change_group、patch_change_row、patch_reason_row）。块还是放在
+//! 英雄列表下面、一直看得到，项多了块里自己滚动（游戏的 scroll_view，内容高度写死，不靠自动排版）。
 
 use super::names::NameBook;
 use super::{color, quote, Ui};
-use crate::balance::ItemChange;
-use crate::items::{Catalog, STATS};
+use crate::balance::{percent, ItemChange, ARROW};
+use crate::items::{field_lines, stat_icon, Catalog, ICON_SHEET, STAT_ICONS};
 use crate::objectives::ObjectiveChange;
 
 /// The main screen's right side: the patch history is one of its children (`<child>.data.right_panel`).
 pub const RIGHT: &str = "main.top.right";
 /// Our block's name in the patch content.
 pub const SECTION: &str = "pma_patch_items";
-/// The stat icons of the ban/pick screen (4+6's sheet), as the game's change rows show them.
-const STAT_ICONS: &str = "asset/base/ui/banpick/champion_stat_icon";
 /// The game's patch content: its width, its champions' list's height (`news_component/patch_content`).
 const WIDTH: i32 = 1055;
 const SCROLL_H: i32 = 830;
 /// The list keeps at least this much.
 const SCROLL_MIN: i32 = 360;
 const TITLE_H: i32 = 44;
-const ROW_H: i32 = 28;
+/// 块至少这么高（标题加两行）
+const BLOCK_MIN: i32 = 150;
 const LINE: u32 = 0x4a4c_56ff;
-const GREY: u32 = 0x8b8d_9aff;
 const WHITE: u32 = 0xe8e8_e8ff;
 const UP: u32 = 0x37d5_b3ff;
 const DOWN: u32 = 0xe5_4d4dff;
+/// 官方补丁的尺寸和颜色（`news_component/patch_*`）：两栏的宽、间隔和左边距，栏标题、一项名字那一行的高，改动组的
+/// 左边距和上下边距，一行的高和行距，理由的灰，竖线的颜色
+const COL_W: i32 = 513;
+const COL_GAP: i32 = 12;
+const PAD_X: i32 = 8;
+const HEADER_H: i32 = 44;
+const ENTRY_H: i32 = 44;
+const GROUP_LEFT: i32 = 30;
+const GROUP_PAD: i32 = 8;
+const ROW_H: i32 = 26;
+const ROW_GAP: i32 = 4;
+const REASON: u32 = 0x6670_85ff;
+const RULE: u32 = 0xdce1_e8ff;
 /// The champions shown are read again every this many frames.
 const LOOK_EVERY: u32 = 10;
 /// Frames after the page's content first appears before its tree is written (laid out by then).
@@ -113,25 +130,25 @@ impl PatchItems {
         }
         self.placed = false;
         let found = if shown.is_empty() { None } else { find(&shown) };
-        let mut lines = match (&found, catalog) {
-            (Some((_, items, _)), Some(catalog)) if !items.is_empty() => lines_of(items, catalog, true),
+        let mut entries = match (&found, catalog) {
+            (Some((label, items, _)), Some(catalog)) if !items.is_empty() => item_entries(items, catalog, label, true),
             _ => Vec::new(),
         };
-        let items = lines.len();
+        let items = entries.len();
         if let Some((_, _, objectives)) = &found {
-            lines.extend(objective_lines(objectives, true));
+            entries.extend(objective_entries(objectives, true));
         }
         let scroll = format!("{content}.scroll");
-        if lines.is_empty() {
+        if entries.is_empty() {
             ui.set_properties(&scroll, &format!("height: {SCROLL_H}px;"));
             return;
         }
-        let (source, height) = block(&lines, title(items > 0, lines.len() > items, true));
         // the list ends where the block fits in the panel's sight (the game's list runs 57 px past the panel's bottom)
         let room = match (ui.rect(&panel), ui.rect(&scroll)) {
             (Some((_, py, _, ph)), Some((_, sy, _, _))) if ph > 0.0 && sy > py => (py + ph - sy).round() as i32 - 8,
             _ => SCROLL_H,
         };
+        let (source, height) = block(&entries, title(items > 0, entries.len() > items, true), (room - SCROLL_MIN).max(BLOCK_MIN), true);
         ui.set_properties(&scroll, &format!("height: {}px;", (room - height).max(SCROLL_MIN)));
         if ui.spawn(&content, &source) {
             self.placed = true;
@@ -139,8 +156,8 @@ impl PatchItems {
             crate::diag::log_once(
                 &format!("patch-items-{label}"),
                 &format!(
-                    "[ui] patch history {content}: {shown:?} = round {label}, {items} item lines + {} tower / monster lines under the list ({height} px)",
-                    lines.len() - items
+                    "[ui] patch history {content}: {shown:?} = round {label}, {items} items + {} towers / monsters under the list ({height} px)",
+                    entries.len() - items
                 ),
             );
         }
@@ -176,89 +193,71 @@ pub fn shown_patch(ui: &impl Ui, contents: &str, names: &NameBook) -> Shown {
     Shown::default()
 }
 
-/// The stat icon of an item number field (4+6's sheet), if it has one.
-fn stat_icon(field: &str) -> Option<&'static str> {
-    Some(match field {
-        "attack" => "ad_0",
-        "magic_power" => "ap_0",
-        "defence" => "armor_0",
-        "hp" => "hp_0",
-        "hp_regen" => "hp_regen_0",
-        "attack_speed_mult" => "attack_speed_0",
-        "skill_cooldown_mult" => "cdr_0",
-        "crit_chance" => "crit_chance_0",
-        "move_speed_mult" => "speed_0",
-        "vamp" => "vamp_0",
-        "defence_penetration" => "armor_pen_0",
-        "magic_resistance_penetration" => "magic_pen_0",
-        "toughness" => "tenacity_0",
-        "range" => "range_0",
-        _ => return None,
-    })
+/// 块里的一项（装备，或者塔、龙）：图标格子（图集和帧，没有就不画）、名字、一句理由、几行改动（属性图标的帧和富文本）、
+/// 是不是增强（决定放在哪一栏）
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub icon: Option<(String, String)>,
+    pub name: String,
+    pub reason: String,
+    pub rows: Vec<(Option<&'static str>, String)>,
+    pub buff: bool,
 }
 
-/// A round's item changes, one line each (rich text): the item's icon and name, the step in the patch colour and the
-/// total, its numbers before and after (the notes' rule, [`crate::items::lines`]) with the stat icons, and in grey
-/// its builders' win rate. Buffs first, the biggest steps first.
-pub fn lines_of(changes: &[ItemChange], catalog: &Catalog, chinese: bool) -> Vec<String> {
+/// 一行改动的文字：「名字: 改前 → 改后」，改后的数字带颜色（游戏的 `patch.stat` 一个样子）
+fn change_text(label: &str, from: &str, to: &str, buff: bool) -> String {
+    format!("{label}: {from} {ARROW} <{}>{to}<>", color(if buff { UP } else { DOWN }))
+}
+
+/// 一轮的装备改动，一件一项：图标、名字、理由（[`crate::balance::item_reason`]，和收件箱新闻同一句）、每个变了的数值
+/// （补丁的规则，[`field_lines`]）、整体强度。增强在前，改得多的在前。`label`：这一轮的版本（挑理由用）。
+pub fn item_entries(changes: &[ItemChange], catalog: &Catalog, label: &str, chinese: bool) -> Vec<Entry> {
     let mut changes: Vec<&ItemChange> = changes.iter().collect();
     changes.sort_by_key(|c| (c.step < 0, -c.step.abs()));
+    let power = if chinese { "整体强度" } else { "Overall power" };
     changes
         .into_iter()
         .map(|c| {
             let item = catalog.item(&c.item).map(|(_, item)| item);
-            let icon = item.map_or(String::new(), |i| crate::items::icon_text(&i.icon));
-            let name = if c.name.is_empty() { c.item.as_str() } else { c.name.as_str() };
-            let numbers: Vec<String> = item
+            let buff = c.step > 0;
+            let mut rows: Vec<(Option<&'static str>, String)> = item
                 .map(|item| {
-                    crate::items::lines(item, c.total - c.step, c.total, chinese)
+                    field_lines(item, c.total - c.step, c.total, chinese)
                         .into_iter()
-                        .map(|(label, from, to)| {
-                            let field = STATS.iter().find(|(_, _, zh, en)| *zh == label || *en == label).map_or("", |s| s.0);
-                            let icon = stat_icon(field).map_or(String::new(), |f| format!("<i#{STAT_ICONS}:{f}>"));
-                            format!("{icon}{label} {from} → {to}")
-                        })
+                        .map(|(field, label, from, to)| (stat_icon(field), change_text(&label, &from, &to, buff)))
                         .collect()
                 })
                 .unwrap_or_default();
-            let step = format!("<{}>{:+}%<>", color(if c.step > 0 { UP } else { DOWN }), c.step);
-            let grey = |t: String| format!("<{}>{t}<>", color(GREY));
-            match (c.reset.is_some(), chinese) {
-                (true, true) => format!("{icon}{name}  {step}  {}  {}", numbers.join("，"), grey("设置里列为不调整（item_balance_skip），取消之前的改动".into())),
-                (true, false) => format!("{icon}{name}  {step}  {}  {}", numbers.join(", "), grey("item_balance_skip lists it: earlier changes taken off".into())),
-                (false, true) => format!(
-                    "{icon}{name}  {step}（累计 {:+}%）  {}  {}",
-                    c.total,
-                    numbers.join("，"),
-                    grey(format!("出它的 {} 个英雄近期胜率约 {:.0}%", c.users, c.win))
-                ),
-                (false, false) => format!(
-                    "{icon}{name}  {step} ({:+}% in all)  {}  {}",
-                    c.total,
-                    numbers.join(", "),
-                    grey(format!("its {} builders win about {:.0}%", c.users, c.win))
-                ),
+            rows.push((None, change_text(power, &percent(c.total - c.step), &percent(c.total), buff)));
+            Entry {
+                icon: item.filter(|i| crate::items::icon_fits(&i.icon)).map(|i| (ICON_SHEET.to_string(), i.icon.clone())),
+                name: if c.name.is_empty() { c.item.clone() } else { c.name.clone() },
+                reason: crate::balance::item_reason(c, crate::balance::seed(&c.item, label), chinese),
+                rows,
+                buff,
             }
         })
         .collect()
 }
 
-/// 塔和龙的改动，一样一行：名字、改了多少（颜色）和累计、生命值改前改后、灰字写量到了什么
-pub fn objective_lines(changes: &[ObjectiveChange], chinese: bool) -> Vec<String> {
+/// 塔和龙的改动，一样一项：名字、量到了什么（理由）、生命值改前改后、整体强度
+pub fn objective_entries(changes: &[ObjectiveChange], chinese: bool) -> Vec<Entry> {
     let mut changes: Vec<&ObjectiveChange> = changes.iter().collect();
     changes.sort_by_key(|c| c.objective);
+    let power = if chinese { "整体强度" } else { "Overall power" };
     changes
         .into_iter()
         .map(|c| {
-            let (name, hp, why) = crate::objectives::history_parts(c, chinese);
-            let step = format!("<{}>{:+}%<>", color(if c.step > 0 { UP } else { DOWN }), c.step);
-            let grey = format!("<{}>{why}<>", color(GREY));
-            let total = match (c.reset.is_some(), chinese) {
-                (true, _) => String::new(),
-                (false, true) => format!("（累计 {:+}%）", c.total),
-                (false, false) => format!(" ({:+}% in all)", c.total),
-            };
-            format!("{name}  {step}{total}  {hp}  {grey}")
+            let (name, _, why) = crate::objectives::history_parts(c, chinese);
+            let buff = c.step > 0;
+            let mut rows = Vec::new();
+            if let Some((a, b)) = crate::objectives::numbers(c) {
+                rows.push((stat_icon("hp"), change_text(if chinese { "生命值" } else { "Health" }, &a.to_string(), &b.to_string(), buff)));
+            }
+            if c.reset.is_none() {
+                rows.push((None, change_text(power, &percent(c.total - c.step), &percent(c.total), buff)));
+            }
+            Entry { icon: None, name, reason: why, rows, buff }
         })
         .collect()
 }
@@ -268,33 +267,146 @@ pub fn title(items: bool, objectives: bool, chinese: bool) -> &'static str {
     match (items, objectives, chinese) {
         (true, true, true) => "装备、防御塔和大小龙（电竞大脑）",
         (false, true, true) => "防御塔和大小龙（电竞大脑）",
-        (_, false, true) => "装备（电竞大脑装备平衡）",
+        (_, false, true) => "装备调整（电竞大脑装备平衡）",
         (true, true, false) => "Items, towers and epic monsters (Patch Meta AI)",
         (false, true, false) => "Towers and epic monsters (Patch Meta AI)",
         (_, false, false) => "Items (Patch Meta AI)",
     }
 }
 
-/// The block's `.ui` source and height: a rule, the title, then a line an item.
-pub fn block(lines: &[String], title: &str) -> (String, i32) {
-    let mut body = format!(
-        "#bar:color {{ x: 0px; y: 6px; width: {WIDTH}px; height: 1px; color: {}; ignore_event: true; }} \
-         #title:label {{ @\"asset/base/style/main#bold_label\"; x: 8px; y: 8px; width: 1040px; height: {}px; size: 20; align_y: Center; color: {}; text: {}; }} ",
+/// 一段文字在 `width` 像素宽、`size` 号字里大概占几行：富文本标签不算，汉字一个字宽，别的字一半多，宁多勿少
+pub fn text_lines(text: &str, width: i32, size: i32) -> i32 {
+    let mut plain = String::new();
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => plain.push(c),
+            _ => {}
+        }
+    }
+    let wide = |c: char| c as u32 >= 0x2e80;
+    let px: f32 = plain.chars().map(|c| if wide(c) { size as f32 } else { size as f32 * 0.6 }).sum();
+    ((px * 1.05 / width.max(1) as f32).ceil() as i32).max(1)
+}
+
+/// The block's `.ui` source and height: a rule, the title, then the entries in two columns as the game's patch notes
+/// lay out champions (buffs left, nerfs right), in a scroll view of at most `max_h` (the block's whole height).
+pub fn block(entries: &[Entry], title: &str, max_h: i32, chinese: bool) -> (String, i32) {
+    let mut body = String::new();
+    let mut heights = [0i32; 2];
+    for (side, buff) in [(0usize, true), (1usize, false)] {
+        let list: Vec<&Entry> = entries.iter().filter(|e| e.buff == buff).collect();
+        if list.is_empty() {
+            continue;
+        }
+        let x0 = PAD_X + side as i32 * (COL_W + COL_GAP);
+        let header = match (buff, chinese) {
+            (true, true) => "增强",
+            (false, true) => "削弱",
+            (true, false) => "Buffs",
+            (false, false) => "Nerfs",
+        };
+        body.push_str(&format!(
+            "#h{side}:label {{ x: {}px; y: 0px; width: 200px; height: {HEADER_H}px; align_y: Center; font: \"asset/base/font/set/bold\"; size: 24; color: {}; text: {}; ignore_event: true; }} ",
+            x0 + 8,
+            color(if buff { UP } else { DOWN }),
+            quote(header)
+        ));
+        let mut y = HEADER_H;
+        for (k, e) in list.iter().enumerate() {
+            let id = format!("{side}_{k}");
+            // 名字那一行（patch_champion_entry）：36×36 的格子（四条边、34×34 的图标），名字粗体 18
+            let name_x = match &e.icon {
+                Some((sheet, tag)) => {
+                    let (sx, sy) = (x0 + 12, y + 4);
+                    for (edge, (ex, ey, w, h)) in [("t", (sx, sy, 36, 1)), ("b", (sx, sy + 35, 36, 1)), ("l", (sx, sy, 1, 36)), ("r", (sx + 35, sy, 1, 36))] {
+                        body.push_str(&format!(
+                            "#s{id}{edge}:color {{ x: {ex}px; y: {ey}px; width: {w}px; height: {h}px; color: {}; ignore_event: true; }} ",
+                            color(LINE)
+                        ));
+                    }
+                    body.push_str(&format!(
+                        "#p{id}:image {{ x: {}px; y: {}px; width: 34px; height: 34px; sample_linear: false; source: {}; rect_tag: {}; ignore_event: true; }} ",
+                        sx + 1,
+                        sy + 1,
+                        quote(sheet),
+                        quote(tag)
+                    ));
+                    sx + 36 + 8
+                }
+                None => x0 + 12,
+            };
+            body.push_str(&format!(
+                "#n{id}:label {{ x: {name_x}px; y: {}px; width: {}px; height: 36px; align_y: Center; font: \"asset/base/font/set/bold\"; size: 18; color: {}; text: {}; ignore_event: true; }} ",
+                y + 4,
+                COL_W - (name_x - x0) - 8,
+                color(WHITE),
+                quote(&e.name)
+            ));
+            y += ENTRY_H;
+            // 改动组（patch_change_group）：左边一条竖线，右边理由（patch_reason_row）和一行行改动（patch_change_row）
+            let line_x = x0 + GROUP_LEFT;
+            let text_x = line_x + 1 + 6;
+            let text_w = COL_W - (text_x - x0);
+            let top = y + GROUP_PAD;
+            let mut yy = top;
+            if !e.reason.is_empty() {
+                let h = text_lines(&e.reason, text_w, 18) * ROW_H;
+                body.push_str(&format!(
+                    "#r{id}:label {{ x: {text_x}px; y: {yy}px; width: {text_w}px; height: {h}px; align_y: Center; font: \"asset/base/font/set/regular\"; size: 18; line_height: {ROW_H}; color: {}; text: {}; ignore_event: true; }} ",
+                    color(REASON),
+                    quote(&e.reason)
+                ));
+                yy += h + ROW_GAP;
+            }
+            for (j, (icon, text)) in e.rows.iter().enumerate() {
+                let mut x = text_x;
+                if let Some(frame) = icon {
+                    body.push_str(&format!(
+                        "#c{id}_{j}i:image {{ x: {x}px; y: {}px; width: 16px; height: 16px; sample_linear: false; source: {}; rect_tag: {}; ignore_event: true; }} ",
+                        yy + (ROW_H - 16) / 2,
+                        quote(STAT_ICONS),
+                        quote(frame)
+                    ));
+                    x += 20;
+                }
+                body.push_str(&format!(
+                    "#c{id}_{j}:label {{ x: {x}px; y: {yy}px; width: {}px; height: {ROW_H}px; align_y: Center; font: \"asset/base/font/set/regular\"; size: 18; color: {}; text: {}; ignore_event: true; }} ",
+                    text_w - (x - text_x),
+                    color(WHITE),
+                    quote(text)
+                ));
+                yy += ROW_H + ROW_GAP;
+            }
+            let inner = (yy - ROW_GAP - top).max(ROW_H);
+            body.push_str(&format!(
+                "#l{id}:color {{ x: {line_x}px; y: {top}px; width: 1px; height: {inner}px; color: {}; ignore_event: true; }} ",
+                color(RULE)
+            ));
+            y = top + inner + GROUP_PAD;
+        }
+        heights[side] = y;
+    }
+    let content_h = heights[0].max(heights[1]);
+    let view_h = content_h.min((max_h - TITLE_H - 8).max(ROW_H));
+    let height = TITLE_H + view_h + 8;
+    let source = format!(
+        "{SECTION}:empty {{ width: {WIDTH}px; height: {height}px; \
+         #bar:color {{ x: 0px; y: 6px; width: {WIDTH}px; height: 1px; color: {}; ignore_event: true; }} \
+         #title:label {{ @\"asset/base/style/main#bold_label\"; x: 8px; y: 8px; width: 1040px; height: {}px; size: 20; align_y: Center; color: {}; text: {}; ignore_event: true; }} \
+         #view:scroll_view {{ focusable: true; x: 0px; y: {TITLE_H}px; width: {WIDTH}px; height: {view_h}px; speed: 100; bar_width: 4; \
+         bar: {{ source: \"asset/base/sprite/white\"; color: #37d5b3ff; hover: {{ color: #ecfbf8ff; }} }} \
+         back: {{ source: \"asset/base/sprite/white\"; color: #4a4c56ff; }} \
+         #contents:empty {{ width: {}px; height: {content_h}px; {body}}} }} }}",
         color(LINE),
         TITLE_H - 8,
         color(WHITE),
-        quote(title)
+        quote(title),
+        PAD_X + 2 * COL_W + COL_GAP
     );
-    for (k, line) in lines.iter().enumerate() {
-        body.push_str(&format!(
-            "#i{k}:label {{ @\"asset/base/style/main#label\"; x: 16px; y: {}px; width: 1030px; height: {ROW_H}px; size: 16; align_y: Center; color: {}; text: {}; }} ",
-            TITLE_H + k as i32 * ROW_H,
-            color(WHITE),
-            quote(line)
-        ));
-    }
-    let height = TITLE_H + lines.len() as i32 * ROW_H + 8;
-    (format!("{SECTION}:empty {{ width: {WIDTH}px; height: {height}px; ignore_event: true; {body}}}"), height)
+    (source, height)
 }
 
 #[cfg(test)]
@@ -384,7 +496,11 @@ mod tests {
         let mut view = PatchItems::default();
         view.tick(&mut ui, Some(&cat), &n, &find);
         let ours = format!("{content}.{SECTION}");
-        assert!(ui.exists(&ours) && ui.exists(&format!("{ours}.i3")), "three item lines and the towers'");
+        // 两个增强（风暴狂涌、心之钢）和塔在左栏，虚空之杖在右栏
+        let contents = format!("{ours}.view.contents");
+        for node in ["h0", "n0_0", "n0_1", "n0_2", "h1", "n1_0", "p0_0", "r1_0", "c1_0_0", "c1_0_0i"] {
+            assert!(ui.exists(&format!("{contents}.{node}")), "{node}");
+        }
         let props = &ui.nodes[&format!("{content}.scroll")].props;
         assert!(props.last().is_some_and(|p| p.starts_with("height: ") && p != "height: 830px;"), "the list gives up the room: {props:?}");
         // the next frames: nothing again
@@ -404,31 +520,48 @@ mod tests {
     }
 
     #[test]
-    fn a_line_an_item() {
+    fn an_item_is_laid_out_like_a_champion_in_the_patch_notes() {
         let cat = Catalog::parse(CATALOG).unwrap();
-        let (_, items, _) = find(&shown_221()).unwrap();
-        let lines = lines_of(&items, &cat, true);
-        assert_eq!(lines.len(), 3);
-        let green = color(UP);
-        let grey = color(GREY);
-        assert_eq!(
-            lines[0],
-            format!("<i#asset/base/aseprite_resources/ingame/item_icons_18x18:i_storm>风暴狂涌  <{green}>+2%<>（累计 +2%）  <i#{STAT_ICONS}:ap_0>法术强度 90 → 92  <{grey}>出它的 4 个英雄近期胜率约 44%<>")
-        );
-        assert!(lines[1].contains("心之钢") && lines[1].contains("生命值 900 → 909"), "{}", lines[1]);
-        assert!(lines[2].contains("虚空之杖") && lines[2].contains(&format!("<{}>-6%<>", color(DOWN))) && lines[2].contains("法术强度 70 → 66"), "{}", lines[2]);
-        let (source, height) = block(&lines, title(true, false, true));
-        assert!(source.starts_with("pma_patch_items:empty") && source.contains("#i2:label"), "{source}");
-        assert_eq!(height, TITLE_H + 3 * ROW_H + 8);
+        let (label, items, _) = find(&shown_221()).unwrap();
+        let entries = item_entries(&items, &cat, &label, true);
+        assert_eq!(entries.len(), 3);
+        let storm = &entries[0];
+        assert_eq!((storm.name.as_str(), storm.buff), ("风暴狂涌", true));
+        assert_eq!(storm.icon, Some((ICON_SHEET.to_string(), "i_storm".to_string())));
+        assert!(storm.reason.contains("44%"), "{}", storm.reason);
+        assert_eq!(storm.rows[0], (Some("ap_0"), format!("法术强度: 90 {ARROW} <{}>92<>", color(UP))));
+        assert_eq!(storm.rows.last().unwrap().1, format!("整体强度: 0% {ARROW} <{}>+2%<>", color(UP)));
+        // 没有图标的装备不画格子；削弱用削弱的颜色
+        let rod = &entries[2];
+        assert!(rod.icon.is_none() && !rod.buff);
+        assert_eq!(rod.rows[0].1, format!("法术强度: 70 {ARROW} <{}>66<>", color(DOWN)));
+        let (source, height) = block(&entries, title(true, false, true), 400, true);
+        assert!(source.starts_with("pma_patch_items:empty") && source.contains("#view:scroll_view"), "{source}");
+        assert!(source.contains("rect_tag: \"i_storm\"") && source.contains("rect_tag: \"ap_0\""), "{source}");
+        assert!(source.contains("text: \"增强\"") && source.contains("text: \"削弱\""), "{source}");
+        assert!(height <= 400, "{height}");
+        // 放不下就在块里滚动：内容比看得见的高
+        let (small, small_h) = block(&entries, title(true, false, true), BLOCK_MIN, true);
+        assert_eq!(small_h, BLOCK_MIN);
+        assert!(small.contains(&format!("height: {}px; speed: 100", BLOCK_MIN - TITLE_H - 8)), "{small}");
     }
 
     #[test]
-    fn a_line_for_the_towers_and_monsters() {
-        let lines = objective_lines(&tower(), true);
-        assert_eq!(
-            lines,
-            [format!("防御塔  <{}>+15%<>（累计 +15%）  生命值 3713 → 4270  <{}>最近 412 场平均 12.6 分钟，目标 19–24 分钟<>", color(UP), color(GREY))]
-        );
+    fn the_towers_and_monsters_too() {
+        let entries = objective_entries(&tower(), true);
+        assert_eq!(entries.len(), 1);
+        let t = &entries[0];
+        assert_eq!((t.name.as_str(), t.buff, t.icon.is_none()), ("防御塔", true, true));
+        assert_eq!(t.reason, "最近 412 场平均 12.6 分钟，目标 19–24 分钟");
+        assert_eq!(t.rows[0], (Some("hp_0"), format!("生命值: 3713 {ARROW} <{}>4270<>", color(UP))));
+        assert_eq!(t.rows[1].1, format!("整体强度: 0% {ARROW} <{}>+15%<>", color(UP)));
         assert_eq!(title(false, true, true), "防御塔和大小龙（电竞大脑）");
+    }
+
+    #[test]
+    fn a_reason_takes_as_many_lines_as_it_needs() {
+        assert_eq!(text_lines("短短一句。", 476, 18), 1);
+        assert_eq!(text_lines(&"字".repeat(40), 476, 18), 2);
+        assert_eq!(text_lines(&format!("<#667085ff>{}<>", "字".repeat(20)), 476, 18), 1, "tags take no room");
     }
 }

@@ -2286,7 +2286,7 @@ fn prepare_next(
         after = p.to_string();
     }
     let Some(book) = crate::balance::book() else { return };
-    let request = balance_request(st, team, &round, rules);
+    let request = balance_request(st, team, &round);
     let payload = crate::server::Prepared { book, after, round, request }.encode();
     if st.balance.prepared.as_deref() != Some(payload.as_str()) && game.send_command(crate::server::PREPARE_BALANCE, payload.as_bytes()) {
         st.balance.prepared = Some(payload);
@@ -2521,7 +2521,7 @@ fn sync_balance(st: &mut State, game: &mut impl Game, cfg: &Config, team: usize,
         return;
     }
     let req = match (&newest, want.0) {
-        (Some(round), true) => balance_request(st, team, round, rules),
+        (Some(round), true) => balance_request(st, team, round),
         _ => BalanceRequest { team, off: want.0, round: want.1, ..BalanceRequest::default() },
     };
     if game.send_command(crate::server::APPLY_BALANCE, req.encode().as_bytes()) {
@@ -2705,12 +2705,14 @@ fn log_held(round: &crate::balance::Round) {
 
 /// The server's request for a round: its notes (each champion's lines - its numbers as it plays with them, from
 /// the game's stats - and reason) and the patch's news cards.
-fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules: crate::balance::Rules) -> BalanceRequest {
+fn balance_request(st: &State, team: usize, round: &crate::balance::Round) -> BalanceRequest {
     let label = |n: &str| st.labels.champion(n);
     let mut lines = BTreeMap::new();
     let mut champions = Vec::new();
+    // 官方口吻的理由（2.14.2）：定位看英雄联盟的阵容画像和游戏的职业，连着调看以前的轮次
+    let rounds = crate::balance::rounds();
     for c in &round.changes {
-        let rows = match st.stats.get(&c.champion) {
+        let mut rows = match st.stats.get(&c.champion) {
             Some(stats) => crate::balance::rows(stats, c.total - c.step, c.total),
             // power taken off (2.11.0): its reason is what the notes are for, lines or not
             None if c.reset.is_some() => Vec::new(),
@@ -2719,7 +2721,13 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
                 continue;
             }
         };
-        let why = crate::balance::reason(c, rules);
+        let kind = crate::balance::kind_of(crate::knowledge::get().profiles.get(&c.champion), st.stats.get(&c.champion).and_then(|s| s.category));
+        let flavor = crate::balance::flavor_of(c, round.id, &rounds, kind);
+        let why = crate::balance::reason(c, &flavor);
+        // 整体强度是补丁里的第一行（2.14.2）
+        if let Some(power) = crate::balance::power_row(c) {
+            rows.insert(0, power);
+        }
         champions.push((c.champion.clone(), rows.clone(), why.clone()));
         lines.insert(c.champion.clone(), (rows, why));
     }
@@ -2729,11 +2737,16 @@ fn balance_request(st: &State, team: usize, round: &crate::balance::Round, rules
     // the items' changes (2.9.0): news of their own, in Chinese when the items' names are
     let catalog = crate::items::catalog();
     let chinese = round.items.iter().any(|c| c.name.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)));
-    let item_lines = |c: &crate::balance::ItemChange| -> Vec<crate::items::Line> {
+    let item_lines = |c: &crate::balance::ItemChange| -> Vec<crate::balance::ItemLine> {
         catalog
             .as_ref()
             .and_then(|cat| cat.item(&c.item))
-            .map(|(_, item)| crate::items::lines(item, c.total - c.step, c.total, chinese))
+            .map(|(_, item)| {
+                crate::items::field_lines(item, c.total - c.step, c.total, chinese)
+                    .into_iter()
+                    .map(|(field, label, from, to)| (crate::items::stat_icon_text(field), label, from, to))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     let item_icon = |c: &crate::balance::ItemChange| -> String {
