@@ -51,8 +51,9 @@ const AUTHOR_DONE: &str = "pma_balance_author";
 const BOOK_ID: &str = "pma_balance_book";
 const SAVE_ID: &str = "pma_save";
 const FIXUPS_DONE: &str = "pma_balance_fixups";
-/// The news fix-ups this version knows (2: the mod's own patch notes without a champion say so).
-const FIXUPS: &str = "2";
+/// The news fix-ups this version knows (2: the mod's own patch notes without a champion say so; 3, 2.15.4: its long
+/// news moved to a minute of their own, [`spread_long_news`]).
+const FIXUPS: &str = "3";
 /// The text of patch notes without a champion change (`text/news.i18n`).
 pub const UNCHANGED_TEXT: &str = "#asset/base/text/news?patch.pma_none";
 
@@ -648,6 +649,10 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
                         "the game refused the tower / monster news".to_string()
                     });
                 }
+                // 长新闻错开到一个没有别的新闻的分钟，收件箱认得出打开的是它（2.15.4）
+                if let Some(moved) = spread_long_news(host, req.team).filter(|n| *n > 0) {
+                    said.push(format!("{moved} long news of this mod moved to a minute of its own"));
+                }
                 host.set_saved(NEWS_DONE, Some(&req.round.to_string()));
             }
         }
@@ -659,6 +664,10 @@ pub fn balance(host: &mut impl BalanceHost, req: &BalanceRequest) -> (bool, Stri
                 }
                 if said_so > 0 {
                     said.push(format!("{said_so} of the mod's patch notes without a champion now say so"));
+                }
+                // 以前写下的长新闻也错开分钟（2.15.4）
+                if let Some(moved) = spread_long_news(host, req.team).filter(|n| *n > 0) {
+                    said.push(format!("{moved} earlier long news of this mod moved to a minute of its own"));
                 }
                 host.set_saved(AUTHOR_DONE, Some(crate::balance::AUTHOR));
                 host.set_saved(FIXUPS_DONE, Some(FIXUPS));
@@ -705,6 +714,60 @@ fn fix_news(host: &mut impl BalanceHost, team: usize) -> Option<(usize, usize)> 
         }
     }
     Some((renamed, said_so))
+}
+
+/// 电竞大脑的长新闻（字多到要滚动，[`crate::ui::news_scroll`]）挪到同一小时里一个没有别的新闻的分钟（2.15.4）。收件箱右边
+/// 打开的新闻只有时间读得到，补丁日那天装备平衡、英雄新闻卡、游戏的补丁公告都在 00:00，认不出打开的是哪一条（用户：
+/// 「装备的滚轮还是没修好啊」）。往后挪一分钟、两分钟……，挪过的也记进 [`crate::shared::our_news`]（收件箱马上认得出）。
+/// 挪了几条（None：新闻读不出）。
+fn spread_long_news(host: &mut impl BalanceHost, team: usize) -> Option<usize> {
+    let items = news_items(host, team).ok()?;
+    let minute = |item: &Value| item.get("date").and_then(Value::as_str).filter(|d| minute_of(d).is_some()).map(|d| d[..16].to_string());
+    let mut taken: BTreeMap<String, usize> = BTreeMap::new();
+    for item in &items {
+        if let Some(m) = minute(item) {
+            *taken.entry(m).or_default() += 1;
+        }
+    }
+    let mut moved = 0;
+    for (i, item) in items.iter().enumerate() {
+        let Some(ours) = crate::client::our_news_item(i, item) else { continue };
+        if crate::ui::news_scroll::height_of(&ours.content) <= crate::ui::news_scroll::VIEW_H {
+            continue;
+        }
+        let Some(at) = minute(item) else { continue };
+        if taken.get(&at).copied().unwrap_or(0) <= 1 {
+            continue;
+        }
+        let Some(free) = later_minutes(&at).find(|m| !taken.contains_key(m)) else { continue };
+        let date = item.get("date").and_then(Value::as_str).unwrap_or_default();
+        let mut fixed = item.clone();
+        fixed["date"] = json!(format!("{free}{}", &date[16..]));
+        if !host.set_news_item(team, i, &fixed.to_string()) {
+            continue;
+        }
+        if let Some(count) = taken.get_mut(&at) {
+            *count -= 1;
+        }
+        taken.insert(free, 1);
+        if let Some(news) = crate::client::our_news_item(i, &fixed) {
+            crate::shared::add_our_news(news);
+        }
+        moved += 1;
+    }
+    Some(moved)
+}
+
+/// 新闻日期（`2026-02-25T00:00:00`）的分钟，`2026-02-25T00:00` 这样能比的样子
+fn minute_of(date: &str) -> Option<&str> {
+    let b = date.as_bytes();
+    (b.len() >= 16 && b[10] == b'T' && b[13] == b':' && date.is_char_boundary(16)).then(|| &date[..16])
+}
+
+/// 同一小时里往后的每一分钟（`2026-02-25T00:00` -> `...T00:01`、`...T00:02` ……`...T00:59`）
+fn later_minutes(at: &str) -> impl Iterator<Item = String> + '_ {
+    let start = at.get(14..16).and_then(|m| m.parse::<u32>().ok()).unwrap_or(59);
+    (start + 1..60).map(move |m| format!("{}{m:02}", &at[..14]))
 }
 
 /// Whether a news item is patch notes that list nothing: no champion, no new champion, no rule.
@@ -1178,6 +1241,41 @@ mod tests {
                 None => false,
             }
         }
+    }
+
+    #[test]
+    fn long_news_of_this_mod_get_a_minute_of_their_own() {
+        let _serial = crate::tests::serial();
+        crate::shared::set_our_news(Vec::new());
+        let long = (0..60).map(|k| format!("第 {k} 行")).collect::<Vec<_>>().join("\n");
+        let news = |author: &str, date: &str, title: &str, content: &str| {
+            json!({"author": author, "date": date, "is_favorite": false, "is_read": false, "is_sent": true,
+                   "title": title, "title_bind": [], "ty": {"Simple": {"content": content, "content_bind": []}}})
+        };
+        let ours = crate::balance::AUTHOR;
+        let mut host = Host {
+            news: vec![
+                news("T1", "2026-02-25T00:00:00", "补丁公告", "短"),
+                news(ours, "2026-02-25T00:00:00", "得到加强的卡莎", "短短一条。"),
+                news(ours, "2026-02-25T00:00:00", "电竞大脑装备平衡 2026.1.1", &long),
+                news(ours, "2026-02-25T00:00:00", "电竞大脑装备平衡 2026.1.1b", &long),
+                news(ours, "2026-02-24T13:00:00", "电竞大脑装备平衡 2026.1.0", &long),
+                news("T1", "2026-02-25T00:01:00", "别人的", "短"),
+            ],
+            ..Host::default()
+        };
+        assert_eq!(spread_long_news(&mut host, 0), Some(2));
+        let date = |i: usize| host.news[i]["date"].as_str().unwrap().to_string();
+        assert_eq!(date(2), "2026-02-25T00:02:00", "00:01 is someone else's");
+        assert_eq!(date(3), "2026-02-25T00:03:00");
+        assert_eq!(date(1), "2026-02-25T00:00:00", "short ones stay");
+        assert_eq!(date(4), "2026-02-24T13:00:00", "alone in its minute: stays");
+        let known: Vec<(usize, String)> = crate::shared::our_news().into_iter().map(|n| (n.index, n.date)).collect();
+        assert_eq!(known, vec![(2, "2026-02-25T00:02:00".to_string()), (3, "2026-02-25T00:03:00".to_string())]);
+        assert_eq!(spread_long_news(&mut host, 0), Some(0), "once is enough");
+        assert_eq!(later_minutes("2026-02-25T00:58").collect::<Vec<_>>(), vec!["2026-02-25T00:59".to_string()]);
+        assert_eq!(minute_of("2026-02-25"), None);
+        crate::shared::set_our_news(Vec::new());
     }
 
     /// The news item layout of 0.7 saves: `[key, value]` binds, a `PatchNote` with exactly its six fields as lists.

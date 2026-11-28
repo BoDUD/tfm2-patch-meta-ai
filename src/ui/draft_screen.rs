@@ -29,6 +29,8 @@
 //! - **Fearless**: how many champions the series has locked, next to the win chance;
 //! - **position locks** are another mod's job (Smart Position Lock): a card it covered with its
 //!   lock layer (`spl_lock`) is not advised as a pick and gets no value.
+//! - **嚎哭深渊**（2.15.6）：生涯是海克斯大乱斗的嚎哭深渊时，传进来的是不分路的那份模型（`Meta::no_lanes`）：建议和卡片上的
+//!   价值不看还空着哪一路、理由里不写路，换位阶段不给最佳换位，选人格下面的位置标签不画（`View::lane_tags` 关着）。
 //!
 //! What the game shows (seen in its UI tree): the grid `main.champions.contents` holds one
 //! `banpick_champion_slot` per champion, **named by the champion id**; a card's `blue` / `red`
@@ -1392,14 +1394,14 @@ impl DraftScreen {
             crate::shared::set_coach_plan(Some(crate::shared::CoachPlan { ally: a, enemy: e, bans: banned, ban: turn.banning, ranked, held }));
         }
 
-        // the swap phase: the best seating instead of picks and bans
-        let seating = if turn.swapping { self.seating(ui, snapshot, &ally, side, players) } else { None };
+        // the swap phase: the best seating instead of picks and bans. 嚎哭深渊（2.15.6）没有分路：换位阶段什么都不建议
+        let seating = if turn.swapping && !meta.no_lanes { self.seating(ui, snapshot, &ally, side, players) } else { None };
         ui.set_visible(&format!("{OVERLAY}.advice.seating"), seating.is_some());
         enum Row<'a> {
             Pick(&'a PickValue),
             Ban(&'a advisor::BanValue),
         }
-        let rows: Vec<(&str, Option<Row>)> = if seating.is_some() {
+        let rows: Vec<(&str, Option<Row>)> = if seating.is_some() || (turn.swapping && meta.no_lanes) {
             vec![("", None), ("", None), ("", None)]
         } else if turn.banning && their_turn {
             vec![("敌禁?", their_bans.first().map(Row::Ban)), ("敌禁?", their_bans.get(1).map(Row::Ban)), ("敌禁?", their_bans.get(2).map(Row::Ban))]
@@ -1840,6 +1842,46 @@ mod tests {
         ui.nodes.get_mut(SWAP).unwrap().visible = false;
         screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
         assert_eq!(ui.visible("main.pma.advice.seating"), Some(false));
+    }
+
+    /// 2.15.6：嚎哭深渊（不分路的那份模型，`ui::tick` 把位置标签关掉）：理由里不写路，选人格下面不画标签，换位阶段不给最佳换位
+    #[test]
+    fn the_howling_abyss_shows_no_lanes() {
+        let _serial = crate::tests::serial();
+        crate::shared::clear_seated();
+        let snapshot = crate::shared::one_lane(&snapshot(1500));
+        let book = NameBook::default();
+        let rosters = HashMap::new();
+        let (no_picks, no_matches) = (HashMap::new(), HashMap::new());
+        let view = View { team_name: "Mods FC", rosters: &rosters, team_picks: &no_picks, team_matches: &no_matches, grid_values: true, lane_tags: false, panel_opacity: 60.0 };
+        let mut ui = screen();
+        ui.add(STEP, "label").text = Some("#asset/base/text/ui?banpick.pick_phase".into());
+        pick(&mut ui, "a", "blue", 1);
+        pick(&mut ui, "f", "red", 1);
+        let mut screen = DraftScreen::default();
+        screen.tick(&mut ui, 0, Some(&snapshot), &book, &view);
+        let text = |ui: &FakeUi, p: &str| ui.text(p).unwrap_or_default();
+        assert_eq!(text(&ui, "main.pma.advice.k0"), "Pick 选");
+        for row in 0..3 {
+            let why = text(&ui, &format!("main.pma.advice.w{row}"));
+            assert!(!Role::ALL.iter().any(|r| why.contains(r.name())), "no lane in the reason: {why}");
+        }
+        assert!(!ui.exists(&format!("{}.pick_slot_0.done.{RATE_TAG}", PICK_COLUMNS[0])), "no lane tag");
+        // the swap phase: no best seating, no advice
+        for (i, n) in ["b", "c", "d", "e"].iter().enumerate() {
+            pick(&mut ui, n, "blue", i as u32 + 2);
+        }
+        for (i, n) in ["g", "h", "i", "j"].iter().enumerate() {
+            pick(&mut ui, n, "red", i as u32 + 2);
+        }
+        ui.add(SWAP, "empty");
+        for (i, r) in Role::ALL.iter().enumerate() {
+            ui.add(&format!("{}.swap_slot_{i}.data.position_name", SWAP_TABLES[0]), "label").text =
+                Some(format!("#asset/base/text/ui?position.{}", r.name().to_lowercase()));
+        }
+        screen.tick(&mut ui, READ_EVERY, Some(&snapshot), &book, &view);
+        assert_eq!(ui.visible("main.pma.advice.seating"), Some(false));
+        assert_eq!(text(&ui, "main.pma.advice.c0"), "", "no pick advice in the swap phase");
     }
 
     /// 2.14.5：换位阶段英雄在格子之间挪。玩家这边从选人顺序算起，跟着换位表里的两下点击对调，标签写这一格的位置和

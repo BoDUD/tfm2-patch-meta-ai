@@ -1079,7 +1079,11 @@ pub fn percent(v: i32) -> String {
     }
 }
 
-/// 装备改动的理由（2.14.2，照官方英雄补丁的口吻）：按方向挑一句，带上出它的英雄的胜率；`seed` 挑第几句（[`seed`]）
+/// 装备改动的理由（2.14.2，照官方英雄补丁的口吻）：按方向挑一句，带上出它的英雄的胜率；`seed` 挑第几句（[`seed`]）。
+/// 2.15.4（用户：「文案太过于僵硬」）：以前三句轮着用，每句都拿「出它的英雄胜率约 X%」开头，同一条新闻里好几件装备说
+/// 一模一样的话。现在按装备的定位（[`ItemRole`]，看它给的属性）说它该干什么、这次怎么调，幅度看这一刀多大（小幅 / 适当 /
+/// 大幅）；之前削多了又加回来、加多了又削回去的，直说是回调；胜率放到句尾的括号里。只说电竞大脑知道的事：胜率、调了多少、
+/// 之前调过什么、装备给什么属性。
 pub fn item_reason(c: &ItemChange, seed: u64, chinese: bool) -> String {
     if c.reset.is_some() {
         return if chinese {
@@ -1088,31 +1092,174 @@ pub fn item_reason(c: &ItemChange, seed: u64, chinese: bool) -> String {
             "item_balance_skip lists it: this mod's earlier changes are taken off and its own numbers return.".to_string()
         };
     }
-    let k = (seed % 3) as usize;
-    let text = match (c.step < 0, chinese) {
-        (true, true) => [
-            "出这件装备的英雄近期胜率约 {w}%，收益明显高出一截，我们决定略微削减它的数值。",
-            "出它的英雄胜率约 {w}%，这件装备带来的优势太大了，这个版本给它降降温。",
-            "出它的英雄胜率约 {w}%，它在对局里的作用过于突出，需要收一收。",
-        ][k],
-        (false, true) => [
-            "这件装备的表现低于预期，出它的英雄近期胜率只有约 {w}%，因此适当提升它的数值。",
-            "出它的英雄胜率约 {w}%，这件装备没能发挥应有的作用，给它一点实在的加强。",
-            "最近很少能靠它打出效果，出它的英雄胜率约 {w}%，这次帮它一把。",
-        ][k],
-        (true, false) => [
-            "Its builders win about {w}% of their games - a clear edge over the other choices, so its numbers come down a little.",
-            "It gives its builders too big an edge (they win about {w}%); time to cool it down.",
-            "Its builders win about {w}%: it does too much in a game and gets trimmed.",
-        ][k],
-        (false, false) => [
-            "It falls short of expectations - its builders win only about {w}% - so its numbers go up.",
-            "It does not pull its weight (its builders win about {w}%); a solid buff this patch.",
-            "It rarely makes a difference lately (its builders win about {w}%); a helping hand this patch.",
-        ][k],
+    let buff = c.step > 0;
+    let before = c.total - c.step;
+    let size = c.step.unsigned_abs();
+    let k = (seed % 2) as usize;
+    let (line, adv) = if chinese {
+        let adv = match (buff, size) {
+            (true, 0..=5) => "小幅",
+            (false, 0..=5) => "略微",
+            (_, 6..=12) => "适当",
+            _ => "大幅",
+        };
+        let line = if buff && before < 0 {
+            ["之前对它的削弱下手重了，这次把一部分数值还给它。", "上次削弱之后它一直没缓过来，这次{adv}回调一部分数值。"][k]
+        } else if !buff && before > 0 {
+            ["之前给它的加强有些过头，这次收回一部分。", "加强之后它变得过于强势，这次{adv}回调一部分数值。"][k]
+        } else {
+            ITEM_REASONS_ZH[role_of(&c.item) as usize][usize::from(!buff)][k]
+        };
+        (line, adv)
+    } else {
+        let adv = match size {
+            0..=5 => "a little",
+            6..=12 => "moderately",
+            _ => "substantially",
+        };
+        let line = if buff && before < 0 {
+            ["The earlier nerf went too far; part of it is given back.", "It never recovered from the last nerf; some of its numbers come back {adv}."][k]
+        } else if !buff && before > 0 {
+            ["The earlier buff went too far; part of it is taken back.", "It got too strong after its buff; some of it is taken back {adv}."][k]
+        } else {
+            ITEM_REASONS_EN[role_of(&c.item) as usize][usize::from(!buff)][k]
+        };
+        (line, adv)
     };
-    text.replace("{w}", &format!("{:.0}", c.win))
+    let line = line.replace("{adv}", adv);
+    if chinese {
+        format!("{line}（出装胜率 {:.0}%）", c.win)
+    } else {
+        format!("{line} (builders win {:.0}%)", c.win)
+    }
 }
+
+/// 装备的定位（2.15.4，理由按定位挑说法）：看 4+6 装备表里它给的属性
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemRole {
+    /// 法强、法穿
+    Mage = 0,
+    /// 法强加上生命或者双抗（中娅沙漏这种）
+    MageGuard = 1,
+    /// 攻击加上攻速、暴击、射程或者普攻按生命打的伤害
+    Marksman = 2,
+    /// 攻击加上穿甲、吸血之类，没有防御也没有攻速暴击
+    Assassin = 3,
+    /// 攻击加上生命或者双抗
+    Fighter = 4,
+    /// 只有生命、双抗、减伤
+    Tank = 5,
+    /// 别的（急速、移速、法强和攻击都给的……）
+    Other = 6,
+}
+
+/// 按装备给的属性（[`crate::items::STATS`] 的字段名）定位
+pub fn item_role(fields: &[&str]) -> ItemRole {
+    let any = |names: &[&str]| fields.iter().any(|f| names.contains(f));
+    let ap = any(&["magic_power", "magic_power_mult", "magic_resistance_penetration"]);
+    let ad = any(&["attack", "attack_mult", "attack_speed_mult", "crit_chance", "defence_penetration", "vamp", "base_attack_enemy_max_hp_damage"]);
+    let guard = any(&[
+        "hp",
+        "hp_mult",
+        "defence",
+        "defence_mult",
+        "magic_resistance",
+        "magic_resistance_mult",
+        "damaged_reduce",
+        "base_attack_damaged_reduce",
+        "skill_damaged_reduce",
+        "toughness",
+        "damage_reflect",
+    ]);
+    let shooter = any(&["attack_speed_mult", "crit_chance", "range", "base_attack_enemy_max_hp_damage"]);
+    match (ap, ad, guard) {
+        (true, false, true) => ItemRole::MageGuard,
+        (true, false, false) => ItemRole::Mage,
+        (false, true, true) => ItemRole::Fighter,
+        (false, true, false) if shooter => ItemRole::Marksman,
+        (false, true, false) => ItemRole::Assassin,
+        (false, false, true) => ItemRole::Tank,
+        _ => ItemRole::Other,
+    }
+}
+
+/// 装备表里这件装备的定位（没有装备表、表里没有它：[`ItemRole::Other`]）
+fn role_of(item: &str) -> ItemRole {
+    crate::items::catalog()
+        .and_then(|cat| cat.item(item).map(|(_, it)| it.stats.iter().map(|(i, _)| crate::items::STATS[*i].0).collect::<Vec<_>>()))
+        .map_or(ItemRole::Other, |fields| item_role(&fields))
+}
+
+/// 每种定位 [加强, 削弱] 各两句（`{adv}`：小幅 / 略微 / 适当 / 大幅）
+const ITEM_REASONS_ZH: [[[&str; 2]; 2]; 7] = [
+    // 法师
+    [
+        ["作为法师装，它眼下的收益撑不起这个定位。我们{adv}提高了它的数值，让法师出它时更有底气。", "法师们带着它很难打出应有的效果，这次{adv}补强它的数值。"],
+        ["它给法师的收益有些超出预期，我们{adv}下调了它的数值，给其他法师装留出空间。", "带着它的法师赢得太多了，这次{adv}削减它的数值。"],
+    ],
+    // 法师的防御装
+    [
+        ["它本该在团战里护住法师，但现在的数值不太够用，这次{adv}提高它的属性。", "这件攻守兼备的法师装最近表现平平，我们{adv}补强了它，让它在攻守之间更有价值。"],
+        ["它在攻守两端给法师的收益都偏高，这次{adv}下调它的数值。", "这件法师装让持有者在团战中占了太多便宜，我们{adv}降低了它的数值。"],
+    ],
+    // 射手
+    [
+        ["它给射手带来的输出提升不够明显，我们{adv}提高了它的数值，让它在后期团战里更有分量。", "射手们出了它之后的表现不尽如人意，这次{adv}补强它的数值。"],
+        ["它让射手的输出提升过于明显，我们{adv}下调了它的数值。", "射手们出了它之后赢得太轻松了，这次{adv}收一收它的数值。"],
+    ],
+    // 刺客 / 物理爆发
+    [
+        ["它眼下的爆发收益偏低，我们{adv}提高了它的数值，让出它的物理输出更有威胁。", "刺客们带着它很难打出足够的伤害，这次{adv}补强它的数值。"],
+        ["它带来的爆发有些过头，我们{adv}下调了它的数值。", "带着它的物理输出赢得太多了，这次{adv}削减它的数值。"],
+    ],
+    // 战士
+    [
+        ["它本该让战士既能打又能扛，但现在两头都差一点，这次{adv}补强。", "带着它的战士在正面交战中有些乏力，我们{adv}提高了它的数值。"],
+        ["它让战士在正面交战中占了太多便宜，这次{adv}削弱它的数值。", "带着它的战士又能打又能扛，有些过头了，我们{adv}下调了它的数值。"],
+    ],
+    // 坦克
+    [
+        ["它给前排的承伤能力不够用，我们{adv}提高了它的数值，让坦克能在团战里站得更久。", "出它的前排最近很难顶住压力，这次{adv}加强它的防御属性。"],
+        ["它让前排太过耐打，这次{adv}降低它的防御属性。", "它给前排的收益偏高，我们{adv}削减了它的数值，让输出位也有机会打穿前排。"],
+    ],
+    // 别的
+    [
+        ["它最近的表现低于预期，我们{adv}提高了它的数值，希望它能在对局中发挥更大的作用。", "和同类装备相比，它眼下的收益偏低，这次{adv}提高它的数值。"],
+        ["它目前的收益超出了预期，我们{adv}削减了它的数值，让其他装备也有出场的机会。", "带着它的对局赢得太多了，这次给它降降温。"],
+    ],
+];
+
+/// [`ITEM_REASONS_ZH`] in English (`{adv}`: a little / moderately / substantially)
+const ITEM_REASONS_EN: [[[&str; 2]; 2]; 7] = [
+    [
+        ["As a mage item it isn't pulling its weight; its numbers go up {adv} so mages can build it with confidence.", "Mages struggle to get much out of it lately; its numbers go up {adv}."],
+        ["It gives mages more than intended; its numbers come down {adv} to leave room for other mage items.", "Mages who build it win too often; its numbers come down {adv}."],
+    ],
+    [
+        ["It should keep mages alive in fights, but its numbers fall short; they go up {adv}.", "This mage item with defense has been underwhelming; its numbers go up {adv}."],
+        ["It gives mages too much on both offense and defense; its numbers come down {adv}.", "It lets its holder get away with too much in fights; its numbers come down {adv}."],
+    ],
+    [
+        ["It adds too little to a marksman's damage; its numbers go up {adv} so it matters more in late fights.", "Marksmen who build it have underperformed; its numbers go up {adv}."],
+        ["It boosts a marksman's damage too much; its numbers come down {adv}.", "Marksmen win too easily with it; its numbers come down {adv}."],
+    ],
+    [
+        ["Its burst is a little lacking; its numbers go up {adv} to make its builders more threatening.", "Assassins struggle to make it work; its numbers go up {adv}."],
+        ["Its burst is a bit too much; its numbers come down {adv}.", "Assassins who build it win too often; its numbers come down {adv}."],
+    ],
+    [
+        ["It should let fighters both deal and take damage, but falls short at both; its numbers go up {adv}.", "Fighters who build it run out of steam in head-on fights; its numbers go up {adv}."],
+        ["It lets fighters get too much out of head-on fights; its numbers come down {adv}.", "Fighters who build it both deal and take too much; its numbers come down {adv}."],
+    ],
+    [
+        ["It doesn't give front-liners enough to hold the line; its numbers go up {adv}.", "Tanks who build it struggle to absorb pressure; its defensive numbers go up {adv}."],
+        ["It makes front-liners too hard to take down; its defensive numbers come down {adv}.", "It gives tanks more than intended; its numbers come down {adv} so damage dealers can break through."],
+    ],
+    [
+        ["It has been underperforming; its numbers go up {adv} so it can do more in a game.", "Compared with similar items it gives too little right now; its numbers go up {adv}."],
+        ["It gives more than intended; its numbers come down {adv} so other items get a look.", "Games with it go too well; it gets cooled down a bit."],
+    ],
+];
 
 /// 新闻和百科里的版式（2.14.2，照官方英雄补丁）：粗体、补丁里的箭头（符号字体）
 pub const BOLD: &str = "<f#asset/base/font/set/bold>";
@@ -1143,9 +1290,9 @@ pub fn item_news(
     let name = if round.label.is_empty() { round.version.as_str() } else { round.label.as_str() };
     let title = if chinese { format!("电竞大脑装备平衡 {name}") } else { format!("Patch Meta AI item balance {name}") };
     let mut out = vec![if chinese {
-        "本次装备平衡应用了以下变动（只调整装备的属性数值，装备特效不变）。".to_string()
+        "这一版调整了以下装备的数值，装备特效保持不变。".to_string()
     } else {
-        "This item balance patch makes the following changes (only the numbers items give; their effects stay).".to_string()
+        "This patch changes the numbers of the items below; their effects stay the same.".to_string()
     }];
     let power_name = if chinese { "整体强度" } else { "Overall power" };
     for buffs in [true, false] {
@@ -1490,6 +1637,8 @@ fn open_book_file(file: PathBuf, legacy: PathBuf, done: u32) {
 }
 
 fn open_file(file: PathBuf) {
+    // 这本账本要是还有一份没写完，先写完再读
+    crate::writer::flush();
     let book = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Book>(&t).ok()).unwrap_or_default();
     let mut st = store();
     *st = Store { file: Some(file), ..Store::default() };
@@ -1523,6 +1672,8 @@ pub fn close() {
     if st.unwritten {
         write(&mut st);
     }
+    // 后台还没写完的先写完，存档关掉时账本是全的
+    crate::writer::flush();
     *st = Store::default();
 }
 
@@ -1542,7 +1693,8 @@ fn write(st: &mut Store) {
         seen_objectives: st.seen_objectives.clone(),
     };
     if let Ok(text) = serde_json::to_string(&book) {
-        let _ = std::fs::write(file, text);
+        // 2.15.7：交给后台写。以前在比赛线程里拿着账本和比赛表的锁直接写，机械硬盘上一次卡了将近 10 秒，整个游戏跟着停
+        crate::writer::replace(file.clone(), text);
     }
     st.unwritten = false;
     st.written_at = Some(std::time::Instant::now());
@@ -2851,7 +3003,7 @@ mod tests {
         let (title, content) = item_news(&round, true, &lines, &no_icon).unwrap();
         assert_eq!(title, "电竞大脑装备平衡 2027.5.0");
         let rows: Vec<&str> = content.lines().collect();
-        assert!(rows[0].starts_with("本次装备平衡应用了以下变动") && !content.contains("仍是原来的数值"), "{content}");
+        assert!(rows[0].starts_with("这一版调整了以下装备的数值") && !content.contains("仍是原来的数值"), "{content}");
         // 先增强后削弱，每件一段：粗体名字、一句理由、一行一个数值、整体强度
         assert_eq!(rows[2], format!("{BOLD}增强{FONT_END}"));
         assert_eq!(rows[4], format!("{BOLD}大天使之杖{FONT_END}"));
@@ -2873,6 +3025,39 @@ mod tests {
         // 同一件装备同一轮总是同一句理由
         let staff = &round.items[0];
         assert_eq!(item_reason(staff, seed("staff", "2027.5.0"), true), item_reason(staff, seed("staff", "2027.5.0"), true));
+    }
+
+    #[test]
+    fn item_reasons_follow_the_items_role_and_history() {
+        use ItemRole::*;
+        assert_eq!(item_role(&["magic_power", "magic_resistance_penetration"]), Mage);
+        assert_eq!(item_role(&["magic_power", "defence"]), MageGuard);
+        assert_eq!(item_role(&["attack", "crit_chance"]), Marksman);
+        assert_eq!(item_role(&["attack", "defence_penetration"]), Assassin);
+        assert_eq!(item_role(&["attack", "hp", "skill_cooldown_mult"]), Fighter);
+        assert_eq!(item_role(&["hp", "magic_resistance"]), Tank);
+        assert_eq!(item_role(&["skill_cooldown_mult", "move_speed_mult"]), Other);
+        assert_eq!(item_role(&["magic_power", "attack_speed_mult"]), Other, "hybrid");
+        let change = |step: i32, total: i32| ItemChange { item: "x".into(), name: "某装备".into(), users: 5, win: 46.6, step, total, reset: None };
+        for k in 0..2u64 {
+            for (step, total) in [(8, 8), (-15, -15), (8, -11), (-6, 4), (3, 3), (-20, -20)] {
+                for chinese in [true, false] {
+                    let r = item_reason(&change(step, total), k, chinese);
+                    assert!(!r.contains("{adv}") && !r.starts_with("出它的英雄"), "{r}");
+                    assert!(r.ends_with(if chinese { "（出装胜率 47%）" } else { "(builders win 47%)" }), "{r}");
+                }
+            }
+            // 之前削多了又加回来、加多了又削回去：直说是回调
+            let back = item_reason(&change(8, -11), k, true);
+            assert!(back.contains("还给它") || back.contains("回调"), "{back}");
+            let back = item_reason(&change(-6, 4), k, true);
+            assert!(back.contains("收回") || back.contains("回调"), "{back}");
+        }
+        // 幅度跟着这一刀走（没有装备表：「别的」那两句）
+        let big = item_reason(&change(20, 20), 0, true);
+        assert!(big.contains("大幅"), "{big}");
+        let small = item_reason(&change(-3, -3), 0, true);
+        assert!(small.contains("略微"), "{small}");
     }
 
     #[test]
@@ -3236,6 +3421,8 @@ mod tests {
 
     #[test]
     fn a_round_judges_the_towers_and_monsters_on_the_matches_watched() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let file = std::env::temp_dir().join(format!("pma_objectives_test_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -3292,6 +3479,8 @@ mod tests {
 
     #[test]
     fn a_health_change_in_the_same_patch_away_from_patch_days_is_the_players() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let file = std::env::temp_dir().join(format!("pma_objectives_seen_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -3319,6 +3508,8 @@ mod tests {
 
     #[test]
     fn a_theme_patch_buffs_one_class_together_and_says_so() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let mut m = meta();
         m.champions.push(champ("other", 50.0, 300.0));

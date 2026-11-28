@@ -54,6 +54,43 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.7：写文件不再卡住比赛和主线程
+
+用户：「为什么过日变这么慢」「电竞大脑是我们的吧？如果这个引发卡顿我们就应该优化」。
+
+- 过日时偶尔整个游戏停 5～12 秒：一场比赛开局时，平衡账本（`balance-<存档>.json`，几百 KB）在比赛线程里、拿着账本和比赛表的锁直接写硬盘；机械硬盘上打开文件那一下卡了将近 10 秒，其余比赛线程和主线程都在等这两把锁。
+- 现在平衡账本、AI 战术记录（`ai_tactics.json`，每场开局写一次整份）、实时胜率的比赛记录（`winprob.jsonl`，每场结束追加一行）和版本分析表、报告都交给一条后台线程写（`writer`）：同一个文件排着好几份时只写最新的一份，先写临时文件再整体换上去；存档关闭、重新打开同一本账本、读胜率记录和退出游戏前都先等它写完，写进去的内容和以前一样。
+
+## 2.15.6：嚎哭深渊（海克斯大乱斗）里英雄不分路
+
+用户：「海斗不应该受到位置锁的限制了 所有英雄 都应该和moba模式区分开来了」。
+
+- 海克斯大乱斗（`league_hextech`）把死斗生涯改成了嚎哭深渊：五对五一条路，没有分路。它的客户端把进程环境变量 `TFM2_HEXTECH_ARAM` 写成 `1`（打开的是嚎哭深渊生涯）或 `0`；电竞大脑用到时现读（`compat::aram`），没有这个变量就一切照旧。
+- **嚎哭深渊生涯里**用复制出来的一份不分路的模型（`shared::get_for_match`，`Meta::no_lanes`）：选人钩子（`ban_pick` 的加分、托管、AI BP）、选人界面、首发推荐、F8 的侦察、比赛里实时胜率用的阵容胜率都按它算。英雄的强度就是它本身的（不加各路的偏移、不扣不打这一路的代价），谁都能选、不看还空着哪一路，选手的熟练度按整队平均，理由里不写路；禁用板只有一份候选（不按路比，也就没有「N路摇摆」）；托管和 AI BP 不照锁位置的规则挑（`draft::lane_fits`）。
+- **不排分路**：`draft::seat_decide` 交给游戏，也不读锁位置的 `seated.json`；选人格下面的位置和胜率标签不画，换位阶段不给最佳换位；推荐首发不看位置评分，星旁边不写位置。
+- 配合、克制、阵容缺口、伤害类型、对方习惯、风格、无畏、推演照旧。各路的胜率、场次这些统计数字（版本分析页、F8 梯队的「最佳位置」、报告）是存档里记的，照旧显示。
+- `diag.log`：变了记一行 `[aram] Howling Abyss career ...` / `[aram] not a Howling Abyss career any more ...`；`[seat] Howling Abyss career (no lanes): every team is seated by the game`。
+- 锁位置 1.3.79 起在嚎哭深渊里也整个不管（不锁选人、不排分路、不写 `seated.json`）。
+
+## 2.15.5：没有位置锁时，你对手的 AI 队由电竞大脑排分路
+
+用户：「BP页面的胜率显示现在不打位置锁的玩家也能正确显示吗」→「直接读选人界面的英雄好了」→（读不出）「要，替 AI 排」。
+
+- **查到的**（2.15.4 在换位阶段把换位表和两边选人格整棵写下来，加一份全界面导出；游戏 0.7.3）：没有一个节点说得出某一格坐的是哪个英雄。选人格 `done.champion.icon` 和换位表 `data.champion.icon` 是图片（没有状态）；选人格的「英雄位置」提示框鼠标停上去才填字；选手提示框里的英雄是他的常用英雄；能读的数字（换位表的场次、击杀、死亡、助攻、KDA、等级、评分，选人格的熟练度加成）这一局十个人全是「0 / - / +0%」，拿来反推也分不出来。
+- **现在**（`draft::seat_decide`）：`ai_bp` 关着时，屏幕上这一局的对手（开着 `lane_tags`）也由电竞大脑排分路（`plan::best_seating`，和开着 `ai_bp` 时一样），标签就一直对得上。后台别的比赛照旧交给游戏；装了位置锁的照旧由它排；你自己点「交给主教练」时游戏不经过任何 Mod，你这边的标签照旧收起来。`diag.log`：`[seat] ... seated by this mod for the lane tags (ai_bp off, no position lock)`。
+- 2.15.4 的换位阶段导出删掉了（每次开游戏写约 450 KB）。
+
+## 2.15.4：收件箱的长新闻按列表的日期和时间认，不用点；装备平衡的文案
+
+用户（截图：电竞大脑装备平衡 2026.1.1，第三件装备以后被截掉）：「装备的滚轮还是没修好啊」「还有文案太过于僵硬」。
+
+- **滚动的原因**：2.15.2 认右边打开的是哪一条，靠你在列表里点的那一行；没点过时要求右边的时间只对得上电竞大脑的一条、而且它在列表最上面。补丁日那天电竞大脑同一时刻发好几条（装备平衡和两张英雄新闻卡；界面导出：2/25 00:00 列表里五条，三条是电竞大脑的），一进收件箱默认打开最上面那条、不用点，所以一直没接手（`diag.log` 里一行都没有）。
+- **现在**（`ui::news_scroll`）：左边列表每一行的日期（它上面最近的日期标题 `h_20260225`，按位置找，不靠孩子的先后）和时间（`00:02`）去对右边的时间，只有一行对得上就是它；几行同一时刻时才看你点的是哪一行。服务端把电竞大脑的长新闻（字多到要滚动的）挪到同一小时里一个没有别的新闻的分钟（`server::spread_long_news`：新写的一轮马上挪；以前写下的，新版第一次读档时挪一次，`FIXUPS` 3），所以装备平衡总能认出来，挪过的马上记进 `shared::our_news`。正文照旧从电竞大脑自己的新闻里按序号取，它的时间和列表那一行的标题（太长时游戏截成「...」）也要对得上。`diag.log`：`[ui] the inbox list read: N news rows, M with a day and a time`、`[ui] a long news of this mod scrolls (... px in 728): news 79 「...」 at 2/25 00:02`；同一时刻几条认不出时 `[ui] N news in the inbox list at ...`；服务端 `[balance] ... long news of this mod moved to a minute of its own`。
+- **文案**（`balance::item_reason`）：以前三句轮着用，每句都拿「出它的英雄胜率约 X%」开头，同一条新闻里好几件装备说一模一样的话。现在按装备的定位（`ItemRole`：法师、法师防御、射手、刺客、战士、坦克、其他，看 4+6 装备表里它给的属性）各两句，说它该干什么、这次怎么调，幅度看这一刀多大（小幅 / 略微 / 适当 / 大幅）；之前削多了又加回来、加多了又削回去的，直说是回调（「之前对它的削弱下手重了，这次把一部分数值还给它。」）；出装胜率放到句尾括号里。只说电竞大脑知道的事：胜率、调了多少、之前调过什么、装备给什么属性。开头一句改成「这一版调整了以下装备的数值，装备特效保持不变。」百科补丁历史的装备块用同一句理由。
+- **换位阶段导出**（为下一步「直接读选人界面每一格的英雄」做准备，用户：「直接读选人界面的英雄好了」）：每次开游戏后第一次换位阶段过一秒，把换位表和两边的选人格整棵写进 Mod 文件夹（`ui_dump_swap.txt`、`ui_dump_blue_picks.txt`、`ui_dump_red_picks.txt`）。2.14.5 查过：选人格里的英雄头像是图片，读不出是哪个英雄；那次看的是 10 月游戏 0.6 的导出，而且全界面导出到 6000 个节点就停了。
+
+- **AI 多样性的缓存**（`draft::variety`）：每局 AI 对英雄强度的判断（`ai_variety`）算好的那份模型有个缓存，以前按模型和这一抽的内存地址认，旧的一抽释放以后新的一抽可能分到同一个地址，就拿到了上一局的那份（AI 偶尔照搬上一局的判断；测试 `variety_draws_once_per_draft_and_spreads_the_picks` 时好时坏就是这个）。现在缓存拿住这两个对象、按对象比。
+
 ## 2.15.3：教练托管默认关
 
 用户（打发布压缩包时）：「教练和BP的默认都是off」。
@@ -396,7 +433,7 @@
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
-| | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条） |
+| | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条；2.15.6 起嚎哭深渊生涯里不画） |
 | | `live_win_chance` | on | 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；关掉时也不再记录比赛 |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
@@ -450,6 +487,14 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.7 (the user: "why has the day advance become so slow" / "the esports brain is ours - if it stutters we should fix it"): files are written on a background thread (`writer`). A match's first tick wrote the balance book (`balance-<save>.json`, hundreds of KB) on its match thread while holding the book's and the runs' locks; on a hard disk opening the file once took almost 10 s and every other match thread and the main thread waited for those locks, so the whole game stood still. The balance book, `ai_tactics.json` (written at every match's start), `winprob.jsonl` (a line appended after every match) and the meta table and report are now handed to the writer: only the newest text of a file is written, through a temporary file; closing a save, reopening the same book, reading the win-chance rows and quitting the game wait for it first, so what is written is the same as before.
+
+2.15.6 (the user: "Howling Abyss should not be held by the position lock any more - every champion should be told apart from the moba mode"): league_hextech turns the Deathmatch career into a Howling Abyss (ARAM) one - one lane, no positions - and sets the process environment variable `TFM2_HEXTECH_ARAM` to `1` in it (`0` in other careers; absent without league_hextech). In such a career (`compat::aram`, read where it is used) the draft hooks, the ban/pick screen, the line-up screen, the F8 scouting and the live win chance's draft input use a copy of the model with `Meta::no_lanes` (`shared::get_for_match`): a champion's strength is its own (no lane offsets, no off-role cost), any champion fits any open slot, the players' mastery is the line-up's average, the ban board has one pool of options (no flex picks), the coach and AI BP do not apply Smart Position Lock's rule, nobody is seated (`seat_decide` leaves it to the game and reads no `seated.json`), the lane tags and the swap phase's best seating are off, and the suggested starters ignore position ratings. Synergy, matchups, composition, habits, styles, Fearless and the lookahead stay; per-lane statistics are shown as recorded. Smart Position Lock 1.3.79 stands aside there too.
+
+2.15.5: with no position lock seating it, the player's opponent is seated by this mod (`plan::best_seating`) even with `ai_bp` off, as long as `lane_tags` is on - game 0.7.3's ban/pick screen tells no slot's champion (portraits are images, the position tooltip fills on hover, the swap table's numbers and the proficiency badges were all 0 / - / +0%), so a seating the game makes leaves the tags off. Other AI matches stay the game's. The 2.15.4 swap-phase dumps are gone.
+
+2.15.4: the inbox's long news of this mod scroll without a click. The open news is the only list row whose day (the nearest date header above it, `h_20260225`, found by position) and time match the time shown on the right; with several rows at that time, the one clicked. The server moves this mod's long news to a minute of their own within the hour (`server::spread_long_news`: a new round's at once, older ones once on the first load, `FIXUPS` 3), so the item balance news is always told apart from the patch day's other news at 00:00. Item reasons are written by the item's role (`ItemRole` from the 4+6 catalog's stats: mage, mage defense, marksman, assassin, fighter, tank, other), two each way, with the step's size and a plain roll-back line when a buff undoes a nerf or the other way; the builders' win rate goes to the end. The swap phase's table and both pick columns are written to `ui_dump_swap.txt` / `ui_dump_blue_picks.txt` / `ui_dump_red_picks.txt` once a game session, to find a node that tells which champion sits in a slot.
 
 2.15.3: coach delegation is off by default (`coach=off` in `Config::default` and in a new settings.ini; `coach=on` turns it on). `ai_bp` and `ban_pick` were off by default already. A settings.ini written by an earlier version says `coach=on` and keeps it.
 

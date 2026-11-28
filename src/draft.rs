@@ -33,6 +33,9 @@
 //! seats it (Smart Position Lock with its AI switch on keeps doing it), and notes for the ban/pick
 //! screen where each team's champions sit. The score hooks never see that phase.
 //!
+//! 2.15.6：嚎哭深渊生涯（`compat::aram`，海克斯大乱斗的一条路）里用去掉分路的那份模型（`shared::get_for_match`）：
+//! 估值不看还空着哪一路，托管和 AI BP 不照锁位置的规则挑（`lane_fits`），也不排分路（[`seat_decide`]）。
+//!
 //! `diag.log` gets the first decisions of a game session (`[draft]` lines): the line-ups the
 //! game handed over, and for the best candidates their value, the players' part of it and what
 //! was added to the game's score.
@@ -128,7 +131,8 @@ pub fn ai_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if !cfg.ai_bp || acting.is_none() || acting == shared::player_team() {
         return None;
     }
-    let snapshot = shared::get()?;
+    // 嚎哭深渊里是去掉分路的那份（2.15.6）
+    let snapshot = shared::get_for_match()?;
     let model_id = |g: usize| ctx.champion_name(g).and_then(|n| snapshot.meta.names.get(n));
     let ids = |list: &[usize]| -> Vec<u16> { list.iter().filter_map(|g| model_id(*g)).collect() };
     let available: Vec<(usize, u16)> =
@@ -387,11 +391,16 @@ pub mod variety {
     #[derive(Default)]
     struct State {
         draws: HashMap<(Option<usize>, Option<usize>), Draw>,
-        /// (model, draw, weight) -> the believed snapshot.
-        copies: Vec<((usize, usize, u32), Arc<Snapshot>)>,
+        /// (model, draw, weight) -> the believed snapshot. 2.15.4：拿住模型和这一抽本身、按对象比。以前按地址认，旧的一抽
+        /// 释放以后新的一抽可能分到同一个地址，就拿到了上一局的那份（AI 的多样性偶尔照搬上一局；
+        /// `variety_draws_once_per_draft_and_spreads_the_picks` 时好时坏就是这个）
+        copies: Vec<Believed>,
         clock: u64,
         seed: u64,
     }
+
+    /// 一份信念：模型、这一抽、权重（f32 的位），和照着算出来的那份模型
+    type Believed = (Arc<Snapshot>, Arc<HashMap<u16, f32>>, u32, Arc<Snapshot>);
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -435,8 +444,8 @@ pub mod variety {
         draw.progress = progress;
         draw.used = clock;
         let z = draw.z.clone();
-        let key = (Arc::as_ptr(base) as usize, Arc::as_ptr(&z) as usize, weight.to_bits());
-        if let Some((_, s)) = st.copies.iter().find(|(k, _)| *k == key) {
+        let bits = weight.to_bits();
+        if let Some((.., s)) = st.copies.iter().find(|(b, d, w, _)| Arc::ptr_eq(b, base) && Arc::ptr_eq(d, &z) && *w == bits) {
             return s.clone();
         }
         let mut believed = Snapshot::clone(base);
@@ -447,7 +456,7 @@ pub mod variety {
         if st.copies.len() >= COPIES {
             st.copies.remove(0);
         }
-        st.copies.push((key, believed.clone()));
+        st.copies.push((base.clone(), z, bits, believed.clone()));
         believed
     }
 
@@ -474,7 +483,8 @@ pub fn coach_decide(ctx: &StableDraftContext<'_>, ban: bool) -> Option<usize> {
     if !cfg.coach || ctx.ally_team().is_none() || ctx.ally_team() != shared::player_team() {
         return None;
     }
-    let snapshot = shared::get()?;
+    // 嚎哭深渊里是去掉分路的那份（2.15.6）
+    let snapshot = shared::get_for_match()?;
     let model_id = |g: usize| ctx.champion_name(g).and_then(|n| snapshot.meta.names.get(n));
     let ids = |list: &[usize]| -> Vec<u16> { list.iter().filter_map(|g| model_id(*g)).collect() };
     let available: Vec<(usize, u16)> =
@@ -596,6 +606,10 @@ pub fn coach_choice_styled(
 /// and table when it holds this team's picks (`holds`: its AI or player switch) - a deciding hook
 /// goes past its score - else those that fit a lane the model sees still open.
 fn lane_fits(snapshot: &Snapshot, ally: &[u16], offer: &[u16], holds: impl Fn(&crate::lock::Table) -> bool) -> Vec<u16> {
+    // 嚎哭深渊（2.15.6）：没有分路，锁位置也不锁（它 1.3.79 起自己让开），谁都能选
+    if snapshot.meta.no_lanes {
+        return offer.to_vec();
+    }
     let names = &snapshot.meta.names;
     match crate::lock::get().filter(|t| holds(t)) {
         Some(t) => {
@@ -672,7 +686,8 @@ fn score(ctx: &StableDraftContext<'_>, candidate: usize, ban: bool) -> StableDra
     if factor > 1.0 {
         diag::log_once("draft-coach", "[draft] coach delegation: the player's team drafts by the model (coach=on)");
     }
-    let Some(snapshot) = shared::get() else {
+    // 嚎哭深渊里是去掉分路的那份（2.15.6）
+    let Some(snapshot) = shared::get_for_match() else {
         diag::log_once(
             "draft-cold",
             "[draft] the AI drafted with no model ready (no save open, or its matches not read yet): left to the game",
@@ -725,22 +740,26 @@ fn offer_ids(snapshot: &Arc<Snapshot>, available: &[usize], ids: &dyn Fn(&[usize
     })
 }
 
+/// 哪份模型、这一队的选人、它还空着的路（2.15.6 起也按模型认：嚎哭深渊那份不分路）
+type Open = (usize, Vec<u16>, Vec<Role>);
+
 thread_local! {
     /// The open lanes of the last team asked about: the game scores every candidate of one
     /// decision in a row, with the same picks (hooks may run on several threads).
-    static OPEN: RefCell<Option<(Vec<u16>, Vec<Role>)>> = const { RefCell::new(None) };
+    static OPEN: RefCell<Option<Open>> = const { RefCell::new(None) };
 }
 
 fn open_lanes(snapshot: &Snapshot, picks: &[u16]) -> Vec<Role> {
     OPEN.with(|cell| {
         let mut cache = cell.borrow_mut();
-        if let Some((key, open)) = cache.as_ref() {
-            if key == picks {
+        let model = snapshot as *const Snapshot as usize;
+        if let Some((m, key, open)) = cache.as_ref() {
+            if *m == model && key == picks {
                 return open.clone();
             }
         }
         let open = advisor::open_lanes(&snapshot.meta, picks);
-        *cache = Some((picks.to_vec(), open.clone()));
+        *cache = Some((model, picks.to_vec(), open.clone()));
         open
     })
 }
@@ -864,9 +883,17 @@ enum Seater {
 /// - 锁位置排（开着它的 AI 分路）：不插手，读它刚写的 `seated.json`（锁位置 1.3.78 起写）；
 /// - 没有位置锁排、开着 `ai_bp` 的 AI 队：电竞大脑自己排（用户选的「电竞大脑来排」），按模型最好的坐法
 ///   （[`crate::plan::best_seating`]：这一路的强度，加上这名选手对它的熟练度）；
-/// - 其他（玩家自己的队、`ai_bp` 关着、别的位置锁）：留给游戏或那个 Mod，记下「不知道」。
+/// - 2.15.5：`ai_bp` 关着时，屏幕上这一局的对手（开着 `lane_tags`）也由电竞大脑排。游戏 0.7.3 的选人界面读不出哪一格
+///   坐的是哪个英雄（头像是图片，换位表的场次 / KDA 和熟练度加成几乎都是 0），游戏自己排的话标签只能收起来；用户：
+///   「要，替 AI 排」。后台别的比赛照旧交给游戏；
+/// - 其他（玩家自己的队、别的位置锁）：留给游戏或那个 Mod，记下「不知道」。
 pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
     if ctx.is_explore() {
+        return None;
+    }
+    // 2.15.6：嚎哭深渊没有分路，谁坐哪一格都交给游戏，也不读锁位置的 seated.json（选人格下面的标签不画）
+    if crate::compat::aram() {
+        diag::log_once("seat-aram", "[seat] Howling Abyss career (no lanes): every team is seated by the game");
         return None;
     }
     let names: Vec<String> = ctx.ally_picks().iter().map(|g| ctx.champion_name(*g).map(str::to_string)).collect::<Option<_>>()?;
@@ -881,7 +908,7 @@ pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
         Seater::Lock
     } else if let Some(other) = crate::compat::get().position_lock().filter(|m| *m != "Smart Position Lock") {
         Seater::OtherLock(other)
-    } else if !player && cfg.ai_bp {
+    } else if !player && (cfg.ai_bp || (cfg.lane_tags && live)) {
         Seater::This
     } else {
         Seater::Game
@@ -905,7 +932,9 @@ pub fn seat_decide(ctx: &StableDraftContext<'_>) -> Option<Vec<usize>> {
             b.iter().enumerate().map(|(lane, p)| format!("{} {}", Role::ALL[lane].name(), names.get(*p).map_or("?", String::as_str))).collect::<Vec<_>>().join(", ")
         };
         let how = match (seater, by_lane) {
-            (Seater::This, Some(b)) => format!("seated by this mod: {}", seats(&b)),
+            (Seater::This, Some(b)) => {
+                format!("seated by this mod{}: {}", if cfg.ai_bp { "" } else { " for the lane tags (ai_bp off, no position lock)" }, seats(&b))
+            }
             (Seater::This, None) => "left to the game (the model does not know every champion)".to_string(),
             (Seater::Lock, Some(b)) => format!("Smart Position Lock seats it: {}", seats(&b)),
             (Seater::Lock, None) if live => "Smart Position Lock seats it, but its seated.json does not say how (a lock before 1.3.78?): the tags under these picks are off".to_string(),
@@ -1741,7 +1770,13 @@ mod tests {
         shared::set_player_team(Some(19));
         set_live(true);
         let ai = ctx_for(12, 19, &theirs);
-        assert_eq!(seat(&ai), None, "ai_bp off: the game seats them");
+        // ai_bp 关着：你这一场的对手照样由电竞大脑排（2.15.5，标签才对得上）；后台别的比赛交给游戏
+        let order = seat(&ai).expect("the player's opponent: seated for the tags");
+        assert_eq!(shared::seated(&ai_picks), Some(crate::lock::by_lane_of(&[0, 1, 2, 3, 4], &order)), "noted by lane");
+        assert_eq!(seat(&ctx_for(12, 33, &theirs)), None, "off screen with ai_bp off: the game seats them");
+        // 标签也关了：交给游戏
+        config::set_for_tests(config::Config { lane_tags: false, ..config::Config::default() });
+        assert_eq!(seat(&ai), None, "no tags, no ai_bp: the game seats them");
         assert_eq!(shared::seated(&ai_picks), Some(None), "noted: not known how");
         config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
         let order = seat(&ai).expect("seated by the model");
@@ -1823,6 +1858,86 @@ c=Mid
         crate::lock::set(Some(crate::lock::Table { ai: false, ..table }));
         assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0), Some(id("c")));
         crate::lock::set(None);
+    }
+
+    /// 2.15.6：嚎哭深渊（海克斯大乱斗写的环境变量）没有分路：不排分路、不读锁位置的 seated.json、不照锁位置的规则挑，
+    /// 估值不说打哪路；换回普通生涯一切照旧
+    #[test]
+    fn the_howling_abyss_has_no_lanes() {
+        use mod_api_stable::{ChampionBriefV1, DraftCtxV1, DraftPhaseV1, StrV1};
+        let _serial = crate::tests::serial();
+        let root = std::env::temp_dir().join(format!("patch_meta_ai_aram_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(crate::MOD_ID);
+        let lock_dir = root.join(crate::lock::MOD_ID);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&lock_dir);
+        std::env::set_var(crate::paths::DIR_ENV, &dir);
+        crate::reset_for_tests();
+        let names: Vec<String> = NAMES.iter().map(|n| n.to_string()).collect();
+        let briefs: Vec<ChampionBriefV1> =
+            names.iter().map(|n| ChampionBriefV1 { name: StrV1::from_str(n), ..Default::default() }).collect();
+        let picks: Vec<usize> = ["a", "b", "c", "d", "e"].iter().map(|n| names.iter().position(|x| x == n).unwrap()).collect();
+        let lanes: Vec<u32> = vec![0, 1, 2, 3, 4];
+        // SAFETY: a plain C struct; every pointer set below outlives the calls
+        let mut raw: DraftCtxV1 = unsafe { std::mem::zeroed() };
+        raw.size = std::mem::size_of::<DraftCtxV1>();
+        raw.phase = DraftPhaseV1::Position.code();
+        raw.ally_pick_ptr = picks.as_ptr();
+        raw.ally_pick_len = picks.len();
+        raw.slot_lanes_ptr = lanes.as_ptr();
+        raw.slot_lanes_len = lanes.len();
+        raw.champion_briefs_ptr = briefs.as_ptr();
+        raw.champion_briefs_len = briefs.len();
+        raw.ally_team = 12;
+        raw.enemy_team = 19;
+        // SAFETY: `raw` lives for the call
+        let seat = || CoachHook.decide_positions(&unsafe { StableDraftContext::from_raw(&raw) }.unwrap());
+        let ai_picks = ["a", "b", "c", "d", "e"];
+        shared::publish(snapshot());
+        shared::set_player_team(Some(19));
+        set_live(true);
+        config::set_for_tests(config::Config { ai_bp: true, ..config::Config::default() });
+        // 锁位置管着 AI（a、c 都只打中路），也写好了这一队的分路
+        let table = crate::lock::parse("[lock]\nai=on\n[positions]\na=Mid\nc=Mid\n", "", "");
+        crate::lock::set(Some(table));
+        std::fs::write(
+            lock_dir.join(crate::lock::SEATED),
+            r#"{"seated": [{"team": 12, "picks": ["a", "b", "c", "d", "e"], "slots": [0, 1, 2, 3, 4], "order": [4, 3, 2, 1, 0]}]}"#,
+        )
+        .unwrap();
+
+        let abyss = crate::tests::HowlingAbyss::on();
+        assert_eq!(seat(), None, "the game seats them");
+        assert_eq!(shared::seated(&ai_picks), None, "nothing noted, so no tags");
+        let s = shared::get_for_match().unwrap();
+        assert!(s.meta.no_lanes && Arc::ptr_eq(&s, &shared::get_for_match().unwrap()), "one copy per model");
+        assert!(!shared::get().unwrap().meta.no_lanes, "the model itself is untouched");
+        let id = |n: &str| s.meta.names.get(n).unwrap();
+        let available: Vec<(usize, u16)> = (0..12u16).filter(|c| *c != id("a")).map(|c| (c as usize, c)).collect();
+        let offer: Vec<u16> = available.iter().map(|(_, c)| *c).collect();
+        let none = Lineups::default();
+        assert_eq!(lane_fits(&s, &[id("a")], &offer, |t| t.ai), offer, "c is not held next to a");
+        let held = ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0);
+        crate::lock::set(None);
+        assert_eq!(ai_choice(&s, &[id("a")], &[], 6, false, &available, &none, [None, None], 0.0), held, "the lock changes nothing");
+        crate::lock::set(Some(crate::lock::parse("[lock]\nai=on\n[positions]\na=Mid\nc=Mid\n", "", "")));
+        let v = value_with(&s, id("c"), &Draft { ally: &[id("a")], enemy: &[], offer: &[], lineups: &none }, false, 0.5);
+        assert_eq!(v.role, None);
+
+        drop(abyss);
+        assert!(!shared::get_for_match().unwrap().meta.no_lanes, "another career: lanes again");
+        assert_eq!(seat(), None, "the lock's seating stands");
+        assert_eq!(shared::seated(&ai_picks), Some(Some([4, 3, 2, 1, 0])), "read from its seated.json again");
+        set_live(false);
+        let log = std::fs::read_to_string(dir.join(diag::LOG_FILE)).unwrap();
+        assert!(log.contains("[aram] Howling Abyss career") && log.contains("[aram] not a Howling Abyss career any more"), "{log}");
+        assert!(log.contains("[seat] Howling Abyss career (no lanes): every team is seated by the game"), "{log}");
+        crate::lock::set(None);
+        shared::set_player_team(None);
+        shared::clear();
+        crate::reset_for_tests();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// ai_variety: one draw per draft, kept through it; a new draft draws again; a champion the

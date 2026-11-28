@@ -274,6 +274,10 @@ impl StableExtension for ClientExt {
             crate::ui::reset();
         }
     }
+    fn on_end(&self) {
+        // 2.15.7：后台还没写完的文件（平衡账本、战术记录、胜率记录、分析表）写完再退出
+        crate::writer::flush();
+    }
 }
 
 const IDENTITY_EVERY: Duration = Duration::from_secs(2);

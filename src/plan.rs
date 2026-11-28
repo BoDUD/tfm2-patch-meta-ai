@@ -138,10 +138,13 @@ pub fn fielding(meta: &Meta, athlete: u32, info: Option<&AthleteInfo>, role: Rol
     let pool_value = if top.is_empty() { 0.0 } else { top.iter().map(|x| x.1).sum::<f32>() / top.len() as f32 };
     let rating = info.map_or(100, |i| i.positions[role.index()]);
     let fit = if rating < 50 { -1.5 } else { (rating as f32 - 100.0) / 100.0 * 0.3 };
+    // 嚎哭深渊（2.15.6）：没有位置，位置评分不算
+    let fit = if meta.no_lanes { 0.0 } else { fit };
     skill + pool_value + fit
 }
 
 /// The best five players for the five positions (`Role::ALL` order) and what each is worth.
+/// 嚎哭深渊（2.15.6，`Meta::no_lanes`）里没有位置：就是最好的五个人，排的先后不代表位置。
 pub fn best_lineup(meta: &Meta, squad: &[(u32, Option<&AthleteInfo>)]) -> Option<[(u32, f32); 5]> {
     if squad.len() < 5 {
         return None;
@@ -228,7 +231,8 @@ pub fn training_for(meta: &Meta, info: &AthleteInfo, role: Role, n: usize) -> Ve
     let mut list: Vec<(u16, f32, u16, f32)> = meta
         .champions
         .iter()
-        .filter(|c| c.window.games >= 5 && c.role_share()[role.index()] >= 0.15)
+        // 嚎哭深渊（2.15.6）没有位置：不看它打这一路的比例
+        .filter(|c| c.window.games >= 5 && (meta.no_lanes || c.role_share()[role.index()] >= 0.15))
         .filter_map(|c| {
             let prof = info.proficiency.get(&c.name).copied().unwrap_or(0);
             let strength = advisor::strength_in(meta, c.id, role);
@@ -324,6 +328,13 @@ mod tests {
         assert_eq!(sorted, expected, "every champion seated once");
         assert!(gain >= 0.0);
         assert!(best_seating(&meta, &champs[..3], &seats, &HashMap::new()).is_none());
+
+        // 嚎哭深渊（2.15.6）没有位置：上单选手放哪一路都一样，位置评分不算
+        let mut aram = meta.clone();
+        aram.no_lanes = true;
+        let anywhere: Vec<f32> = Role::ALL.iter().map(|r| fielding(&aram, 1, Some(&infos[0]), *r)).collect();
+        assert!(anywhere.iter().all(|v| (v - anywhere[0]).abs() < 1e-6), "{anywhere:?}");
+        assert!(fielding(&meta, 1, Some(&infos[0]), Role::Jungle) < fielding(&meta, 1, Some(&infos[0]), Role::Top), "classic: off position");
 
         // training: strong in the role, low proficiency; mastered champions drop out
         let mut info = AthleteInfo { name: "x".into(), positions: [100, 0, 0, 0, 0], proficiency: HashMap::new() };

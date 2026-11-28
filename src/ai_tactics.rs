@@ -116,7 +116,8 @@ fn save(st: &Store) {
         .filter_map(|k| Some(Entry { key: k.clone(), sides: st.by_key.get(k)?.clone() }))
         .collect();
     if let Ok(text) = serde_json::to_string(&File { v: 1, matches }) {
-        let _ = std::fs::write(paths::mod_dir().join(FILE), text);
+        // 2.15.7：每场开局都写一次整份，交给后台写，比赛线程不等硬盘
+        crate::writer::replace(paths::mod_dir().join(FILE), text);
     }
 }
 

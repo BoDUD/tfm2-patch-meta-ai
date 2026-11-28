@@ -99,11 +99,8 @@ pub fn write_file(name: &str, text: &str) {
         Some(diag) => diag.dir.clone(),
         None => return,
     };
-    let tmp = dir.join(format!("{name}.tmp"));
-    if fs::write(&tmp, text).is_ok() && fs::rename(&tmp, dir.join(name)).is_err() {
-        let _ = fs::write(dir.join(name), text);
-        let _ = fs::remove_file(&tmp);
-    }
+    // 2.15.7：交给后台写（照旧先写临时文件再换上去），主线程不等硬盘
+    crate::writer::replace(dir.join(name), text.to_string());
 }
 
 /// Shortens text for a log line (on a character boundary).

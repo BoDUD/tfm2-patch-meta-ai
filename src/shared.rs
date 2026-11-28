@@ -37,10 +37,39 @@ pub fn publish(snapshot: Snapshot) {
 
 pub fn clear() {
     *SNAPSHOT.write().unwrap_or_else(PoisonError::into_inner) = None;
+    *ONE_LANE.write().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 pub fn get() -> Option<Arc<Snapshot>> {
     SNAPSHOT.read().unwrap_or_else(PoisonError::into_inner).clone()
+}
+
+/// 去掉分路的那份（2.15.6）和它是从哪份模型复制的
+static ONE_LANE: RwLock<Option<(Arc<Snapshot>, Arc<Snapshot>)>> = RwLock::new(None);
+
+/// 比赛和 BP 用的模型（2.15.6）：打开的是嚎哭深渊生涯（[`crate::compat::aram`]）时给去掉分路的那份（`Meta::no_lanes`），
+/// 别的生涯就是 [`get`]。选人钩子、界面上的建议（选人界面、首发推荐、F8 的侦察）、比赛里的实时胜率都从这里拿；
+/// 各路的胜率、场次这些统计数字是存档里记的，照旧显示。
+pub fn get_for_match() -> Option<Arc<Snapshot>> {
+    let base = get()?;
+    Some(if crate::compat::aram() { one_lane(&base) } else { base })
+}
+
+/// `base` 去掉分路的那份：每份模型只复制一次
+pub fn one_lane(base: &Arc<Snapshot>) -> Arc<Snapshot> {
+    if base.meta.no_lanes {
+        return base.clone();
+    }
+    if let Some((from, copy)) = ONE_LANE.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if Arc::ptr_eq(from, base) {
+            return copy.clone();
+        }
+    }
+    let mut copy = Snapshot::clone(base);
+    copy.meta.no_lanes = true;
+    let copy = Arc::new(copy);
+    *ONE_LANE.write().unwrap_or_else(PoisonError::into_inner) = Some((base.clone(), copy.clone()));
+    copy
 }
 
 /// The player's team id in the open save (`usize::MAX`: none), for the coach delegation.

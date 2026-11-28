@@ -319,6 +319,9 @@ pub struct Meta {
     pub keys: Vec<Key>,
     pub beta: Vec<f32>,
     pub sweeps: u32,
+    /// 2.15.6：嚎哭深渊（海克斯大乱斗，一条路没有分路）用的那一份：`advisor` 里英雄不分路——强度就是英雄本身的，不看还空着
+    /// 哪一路，禁用不按路比，选手按整队算。拟合出来的都是 false，只有 [`crate::shared::get_for_match`] 复制的那份是 true
+    pub no_lanes: bool,
 }
 
 impl Meta {

@@ -162,6 +162,8 @@ mod tests {
         for frame in 0..10 {
             ex.tick(&ui, frame, true, "Match", &ui.keys.clone());
         }
+        // 2.15.7 起截取的文件在后台写：先等它写完再看
+        crate::writer::flush();
         let dump = std::fs::read_to_string(dir.join("ui_dump_01.txt")).unwrap();
         assert!(dump.contains("main.champions.contents.0 [banpick_champion_slot]"), "{dump}");
         assert!(dump.contains("state={\"champion\":\"ahri\"}") && dump.contains("text=\"Ahri\""), "{dump}");
@@ -169,11 +171,13 @@ mod tests {
         for frame in 10..100 {
             ex.tick(&ui, frame, true, "Match", &ui.keys.clone());
         }
+        crate::writer::flush();
         assert!(!dir.join("ui_dump_02.txt").exists());
         ui.keys = vec!["F9".into()];
         ex.tick(&ui, 100, true, "Match", &ui.keys.clone());
         ui.keys.clear();
         ex.tick(&ui, 101, true, "Match", &ui.keys.clone());
+        crate::writer::flush();
         assert!(dir.join("ui_dump_02.txt").exists());
     }
 }
