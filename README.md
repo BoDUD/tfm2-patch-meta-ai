@@ -54,6 +54,13 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.7：写文件不再卡住比赛和主线程
+
+用户：「为什么过日变这么慢」「电竞大脑是我们的吧？如果这个引发卡顿我们就应该优化」。
+
+- 过日时偶尔整个游戏停 5～12 秒：一场比赛开局时，平衡账本（`balance-<存档>.json`，几百 KB）在比赛线程里、拿着账本和比赛表的锁直接写硬盘；机械硬盘上打开文件那一下卡了将近 10 秒，其余比赛线程和主线程都在等这两把锁。
+- 现在平衡账本、AI 战术记录（`ai_tactics.json`，每场开局写一次整份）、实时胜率的比赛记录（`winprob.jsonl`，每场结束追加一行）和版本分析表、报告都交给一条后台线程写（`writer`）：同一个文件排着好几份时只写最新的一份，先写临时文件再整体换上去；存档关闭、重新打开同一本账本、读胜率记录和退出游戏前都先等它写完，写进去的内容和以前一样。
+
 ## 2.15.6：嚎哭深渊（海克斯大乱斗）里英雄不分路
 
 用户：「海斗不应该受到位置锁的限制了 所有英雄 都应该和moba模式区分开来了」。
@@ -480,6 +487,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.7 (the user: "why has the day advance become so slow" / "the esports brain is ours - if it stutters we should fix it"): files are written on a background thread (`writer`). A match's first tick wrote the balance book (`balance-<save>.json`, hundreds of KB) on its match thread while holding the book's and the runs' locks; on a hard disk opening the file once took almost 10 s and every other match thread and the main thread waited for those locks, so the whole game stood still. The balance book, `ai_tactics.json` (written at every match's start), `winprob.jsonl` (a line appended after every match) and the meta table and report are now handed to the writer: only the newest text of a file is written, through a temporary file; closing a save, reopening the same book, reading the win-chance rows and quitting the game wait for it first, so what is written is the same as before.
 
 2.15.6 (the user: "Howling Abyss should not be held by the position lock any more - every champion should be told apart from the moba mode"): league_hextech turns the Deathmatch career into a Howling Abyss (ARAM) one - one lane, no positions - and sets the process environment variable `TFM2_HEXTECH_ARAM` to `1` in it (`0` in other careers; absent without league_hextech). In such a career (`compat::aram`, read where it is used) the draft hooks, the ban/pick screen, the line-up screen, the F8 scouting and the live win chance's draft input use a copy of the model with `Meta::no_lanes` (`shared::get_for_match`): a champion's strength is its own (no lane offsets, no off-role cost), any champion fits any open slot, the players' mastery is the line-up's average, the ban board has one pool of options (no flex picks), the coach and AI BP do not apply Smart Position Lock's rule, nobody is seated (`seat_decide` leaves it to the game and reads no `seated.json`), the lane tags and the swap phase's best seating are off, and the suggested starters ignore position ratings. Synergy, matchups, composition, habits, styles, Fearless and the lookahead stay; per-lane statistics are shown as recorded. Smart Position Lock 1.3.79 stands aside there too.
 

@@ -27,6 +27,18 @@ struct World {
     log: Vec<String>,
 }
 
+/// 等后台写的文件出来、内容对上了再读（最多 5 秒；到时候还没有就照读到的返回，让后面的断言报出来）
+fn read_when_written(path: &std::path::Path, ready: impl Fn(&str) -> bool) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if ready(&text) || start.elapsed() > std::time::Duration::from_secs(5) {
+            return text;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 unsafe fn world<'a>(s: *const c_void) -> &'a mut World {
     &mut *(s as *mut World)
 }
@@ -467,7 +479,8 @@ coach=on
         assert_eq!(order, [usize::MAX; 5]);
 
         // the files a player looks at
-        let table = std::fs::read_to_string(dir.join("meta_table.txt")).unwrap();
+        // 2.15.7 起分析表在后台写：等它写出来再看（最多 5 秒）
+        let table = read_when_written(&dir.join("meta_table.txt"), |t| t.contains("alpha") && t.contains("patch 2.4"));
         assert!(table.contains("alpha") && table.contains("patch 2.4"), "{table}");
         let log = std::fs::read_to_string(dir.join("diag.log")).unwrap();
         assert!(log.contains("[probe] competition record #30"), "{log}");

@@ -1637,6 +1637,8 @@ fn open_book_file(file: PathBuf, legacy: PathBuf, done: u32) {
 }
 
 fn open_file(file: PathBuf) {
+    // 这本账本要是还有一份没写完，先写完再读
+    crate::writer::flush();
     let book = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Book>(&t).ok()).unwrap_or_default();
     let mut st = store();
     *st = Store { file: Some(file), ..Store::default() };
@@ -1670,6 +1672,8 @@ pub fn close() {
     if st.unwritten {
         write(&mut st);
     }
+    // 后台还没写完的先写完，存档关掉时账本是全的
+    crate::writer::flush();
     *st = Store::default();
 }
 
@@ -1689,7 +1693,8 @@ fn write(st: &mut Store) {
         seen_objectives: st.seen_objectives.clone(),
     };
     if let Ok(text) = serde_json::to_string(&book) {
-        let _ = std::fs::write(file, text);
+        // 2.15.7：交给后台写。以前在比赛线程里拿着账本和比赛表的锁直接写，机械硬盘上一次卡了将近 10 秒，整个游戏跟着停
+        crate::writer::replace(file.clone(), text);
     }
     st.unwritten = false;
     st.written_at = Some(std::time::Instant::now());
@@ -3416,6 +3421,8 @@ mod tests {
 
     #[test]
     fn a_round_judges_the_towers_and_monsters_on_the_matches_watched() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let file = std::env::temp_dir().join(format!("pma_objectives_test_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -3472,6 +3479,8 @@ mod tests {
 
     #[test]
     fn a_health_change_in_the_same_patch_away_from_patch_days_is_the_players() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let file = std::env::temp_dir().join(format!("pma_objectives_seen_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -3499,6 +3508,8 @@ mod tests {
 
     #[test]
     fn a_theme_patch_buffs_one_class_together_and_says_so() {
+        // 用的是整个进程共用的账本：和别的账本测试排队跑（2.15.7 写文件改到后台以后，并发跑时会互相踩）
+        let _serial = crate::tests::serial();
         reset_for_tests();
         let mut m = meta();
         m.champions.push(champ("other", 50.0, 300.0));

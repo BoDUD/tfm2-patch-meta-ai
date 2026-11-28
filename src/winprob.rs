@@ -12,7 +12,6 @@
 //! [`BARON_SECONDS`] 秒算。只读场上，不改比赛。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Instant;
@@ -541,16 +540,15 @@ fn path() -> std::path::PathBuf {
 /// 一场记完：追加一行
 fn append(m: &Match) {
     let _guard = FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let line = m.encode();
-    let ok = std::fs::OpenOptions::new().create(true).append(true).open(path()).and_then(|mut f| writeln!(f, "{line}")).is_ok();
-    if !ok {
-        diag::log_once("winprob-write", "[winprob] could not write winprob.jsonl");
-    }
+    // 2.15.7：交给后台按顺序追加，比赛线程不等硬盘（写不进去后台会在 diag.log 记一次）
+    crate::writer::append(path(), m.encode());
 }
 
 /// 读记录（最近 [`KEPT`] 场）；文件太长就顺手只留最近的
 pub fn read() -> Vec<Match> {
     let _guard = FILE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    // 后台还没追加完的行先写完再读（拿着 FILE_LOCK，读和修剪的时候不会有新行插进来）
+    crate::writer::flush();
     let Ok(text) = std::fs::read_to_string(path()) else { return Vec::new() };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let from = lines.len().saturating_sub(KEPT);

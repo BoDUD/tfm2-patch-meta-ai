@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.15.6 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.7 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,9 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.7：过日时偶尔整个游戏停 5～12 秒的问题修好了：平衡账本、AI 战术记录、实时胜率记录和版本分析表改在后台写，
+比赛和主界面不再等硬盘。存档关闭和退出游戏前会先写完，内容不会少。
 
 2.15.6：海克斯大乱斗的嚎哭深渊生涯（五对五一条路）里英雄不分路了：选人的推荐和卡片上的数值不看还空着哪一路，
 禁用不按路比，托管和 AI BP 不再照位置锁的规则挑，电竞大脑不排分路，选人格下面的位置标签和换位阶段的最佳换位
@@ -538,6 +541,10 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.7: the day advance no longer stalls for 5-12 s now and then: the balance book, the AI tactics record, the live
+win chance's match rows and the meta table are written on a background thread, so the matches and the main screen
+never wait for the disk. Closing a save and quitting the game wait for it, so nothing is lost.
 
 2.15.6: in a Howling Abyss career (the Hextech pack's ARAM: one lane) champions have no lanes: picks and card
 values ignore the open lanes, bans are not weighed lane by lane, the coach and AI BP no longer follow the

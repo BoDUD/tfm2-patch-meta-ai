@@ -53,6 +53,7 @@ pub mod server;
 mod shared;
 pub mod ui;
 pub mod worker;
+mod writer;
 
 use mod_api_stable::{declare_stable_mod, LogLevel, StableHost, StableMod};
 
