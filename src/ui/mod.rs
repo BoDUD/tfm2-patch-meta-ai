@@ -279,7 +279,9 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
     st.frame += 1;
     let frame = st.frame;
     let keys = ui.keys_pressed();
-    let snapshot = crate::shared::get();
+    // 2.15.6：嚎哭深渊生涯里界面上的建议都按不分路的那份模型算，选人格下面的位置标签不画，换位也不用跟
+    let aram = crate::compat::aram();
+    let snapshot = crate::shared::get_for_match();
     time(Part::Explore, || st.explorer.tick(ui, frame, cfg.explore, &format!("{scene:?}"), &keys));
     // 这一帧的点击：选人界面的换位也要看（2.14.5），所以先取
     let clicks = take_clicks();
@@ -290,12 +292,14 @@ pub fn tick(ui: &mut impl Ui, scene: Option<ClientSceneKindV1>, cfg: &crate::con
             team_picks: &st.context.team_picks,
             team_matches: &st.context.team_matches,
             grid_values: cfg.grid_values,
-            lane_tags: cfg.lane_tags,
+            lane_tags: cfg.lane_tags && !aram,
             panel_opacity: cfg.panel_opacity,
         };
         time(Part::Draft, || {
             // 换位阶段跟着玩家的点击记谁坐哪（2.14.5）
-            st.draft.follow_swaps(ui, &clicks);
+            if !aram {
+                st.draft.follow_swaps(ui, &clicks);
+            }
             st.draft.tick(ui, frame, snapshot.as_ref(), &st.names, &view)
         });
     } else {

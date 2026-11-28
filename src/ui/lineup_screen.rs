@@ -2,6 +2,7 @@
 //! (`plan::best_lineup`: own strength, position rating, champion pool there with mastery and
 //! proficiency). Each of them gets a chip on their roster row - a star and the position - and,
 //! when the roster leaves room below its rows, a panel lists them with their best champions.
+//! 嚎哭深渊（2.15.6，`Meta::no_lanes`）里没有位置：推荐最好的五个人（不看位置评分），星旁边和名单里都不写位置。
 //!
 //! Roster rows are `main.roaster.scroll.contents.athlete_<id>`, so the athletes are known by id;
 //! their records are read by the client a couple per frame. The chip and the panel are placed from
@@ -109,6 +110,7 @@ impl LineupScreen {
         let squad: Vec<(u32, Option<&AthleteInfo>)> = ids.iter().map(|id| (*id, infos.get(id))).collect();
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (&ids, snapshot.meta.matches, snapshot.meta.solo_matches, squad.iter().filter(|s| s.1.is_some()).count()).hash(&mut h);
+        snapshot.meta.no_lanes.hash(&mut h);
         let key = h.finish();
         let first = format!("{ROWS}.{}", rows[0].0);
         let g = geometry(ui, &first);
@@ -129,6 +131,11 @@ impl LineupScreen {
                 continue;
             }
             match role_of.get(id) {
+                // 嚎哭深渊（2.15.6）没有位置：只有星
+                Some(_) if snapshot.meta.no_lanes => {
+                    ui.set_visible(&chip, true);
+                    ui.set_text(&format!("{chip}.lane"), "");
+                }
                 Some(r) => {
                     ui.set_visible(&chip, true);
                     ui.set_text(&format!("{chip}.lane"), &format!("#asset/base/text/ui?position.{}", r.name().to_lowercase()));
@@ -156,14 +163,22 @@ impl LineupScreen {
             let y = 44 + k as i32 * 50;
             let name = infos.get(&a).map_or_else(|| format!("#{a}"), |i| i.name.clone());
             let pts = (sigmoid(value) - 0.5) * 100.0;
+            // 嚎哭深渊（2.15.6）没有位置：不画位置图标
+            let lane = if meta.no_lanes {
+                String::new()
+            } else {
+                format!(
+                    "#lane:image {{ x: 16px; y: 13px; width: 20px; height: 20px; source: \"{}\"; color: #c2c6ceff; ignore_event: true; }} ",
+                    lane_icon(*r)
+                )
+            };
             body.push_str(&format!(
                 "#r{k}:empty {{ x: 0px; y: {y}px; width: 460px; height: 46px; ignore_event: true; \
-                 #lane:image {{ x: 16px; y: 13px; width: 20px; height: 20px; source: \"{}\"; color: #c2c6ceff; ignore_event: true; }} \
+                 {lane}\
                  #name:label {{ @\"asset/base/style/main#bold_label\"; x: 44px; y: 0px; width: 130px; height: 46px; size: 16; \
                  color: #e8e8e8ff; align_y: Center; ignore_event: true; text: {}; }} \
                  #v:label {{ @\"asset/base/style/main#label\"; x: 172px; y: 0px; width: 52px; height: 46px; size: 13; color: {}; \
                  align_x: Right; align_y: Center; ignore_event: true; text: {}; }} ",
-                lane_icon(*r),
                 quote(&name),
                 color(if pts >= 0.0 { 0x4cc38aff } else { 0xef6471ff }),
                 quote(&format!("{}{pts:.1}", if pts >= 0.0 { "+" } else { "" }))

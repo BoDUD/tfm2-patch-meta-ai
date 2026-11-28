@@ -12,13 +12,42 @@
 //!
 //! When the list cannot be read nothing is assumed; the tier writer also notices at run time
 //! when another writer keeps putting its own list back (see `client`).
+//!
+//! 海克斯大乱斗（`league_hextech`）把死斗生涯改成了嚎哭深渊：五对五一条路，没有分路。打开的是这种生涯时 [`aram`] 为真，
+//! 比赛和 BP 里电竞大脑不按分路算（2.15.6，`shared::get_for_match`）。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use serde_json::Value;
 
 use crate::{diag, paths};
+
+/// 海克斯大乱斗的客户端每帧看一眼打开的生涯，把这个进程环境变量写成 `1`（嚎哭深渊）或 `0`（不是）；
+/// 没有这个变量 = 没装它，一切照旧。
+pub const HEXTECH_ARAM_ENV: &str = "TFM2_HEXTECH_ARAM";
+
+/// 现在打开的是不是嚎哭深渊生涯（2.15.6）：是的话英雄不分路——选人估值不看还空着哪一路、禁用不按路比、不排分路、
+/// 不画选人格下面的位置标签。每次用到时现读环境变量（同一个进程里谁写的都读得到，和加载顺序无关），变了在 diag.log 记一行。
+pub fn aram() -> bool {
+    static LAST: AtomicBool = AtomicBool::new(false);
+    let on = is_aram(std::env::var(HEXTECH_ARAM_ENV).ok().as_deref());
+    if LAST.swap(on, Ordering::Relaxed) != on {
+        diag::log(if on {
+            "[aram] Howling Abyss career (league_hextech: one lane, no positions): drafts are valued without lanes, \
+             no seating, no lane tags"
+        } else {
+            "[aram] not a Howling Abyss career any more: lanes count again"
+        });
+    }
+    on
+}
+
+/// 只有 `1` 算嚎哭深渊
+fn is_aram(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
 
 /// Mods that write the player team's tier list.
 const TIER_WRITERS: [(&str, &str); 2] = [
@@ -186,5 +215,18 @@ mod tests {
         assert_eq!(unknown.enabled, None);
         assert_eq!(unknown.tier_writer(), None);
         assert!(!unknown.toolbox());
+    }
+
+    #[test]
+    fn howling_abyss_from_league_hextech() {
+        assert!(!is_aram(None), "没装海克斯大乱斗");
+        assert!(!is_aram(Some("0")) && is_aram(Some("1")) && is_aram(Some(" 1 ")) && !is_aram(Some("")));
+        let _serial = crate::tests::serial();
+        assert!(!aram());
+        {
+            let _abyss = crate::tests::HowlingAbyss::on();
+            assert!(aram());
+        }
+        assert!(!aram(), "变量去掉了");
     }
 }

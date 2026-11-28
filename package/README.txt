@@ -1,5 +1,5 @@
 ﻿======================================================================
- 电竞大脑 Patch Meta AI 2.15.5 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
+ 电竞大脑 Patch Meta AI 2.15.6 —— BP 教练、AI 战队、梯队、版本平衡补丁（英雄 + 4+6 装备 + 塔和龙）
  团战经理 2 / Teamfight Manager 2（游戏 0.6 及以上，Windows）
 ======================================================================
 
@@ -12,6 +12,10 @@
 英雄联盟英雄（league Mod 的英雄）另有内置的英雄联盟经验：官方位置、阵容属性
 （前排/开团/保护/消耗/突进/后期/控制）、职业赛场梯队、知名的配合和克制，
 存档比赛少的时候也能给出靠谱的建议，比赛多了由你存档的数据修正。
+
+2.15.6：海克斯大乱斗的嚎哭深渊生涯（五对五一条路）里英雄不分路了：选人的推荐和卡片上的数值不看还空着哪一路，
+禁用不按路比，托管和 AI BP 不再照位置锁的规则挑，电竞大脑不排分路，选人格下面的位置标签和换位阶段的最佳换位
+都不显示，推荐首发不看位置评分。普通生涯照旧。（要配合锁位置 1.3.79：它在嚎哭深渊里也不锁了。）
 
 2.15.5：没装位置锁也能看到对手每个英雄下面正确的位置和胜率了：你自己的比赛里，对手的 AI 队由电竞大脑来排分路
 （游戏的选人界面读不出哪一格是哪个英雄，游戏自己排的话标签只能收起来）。只管你这一场的对手，别的比赛不动；
@@ -285,7 +289,7 @@ AI 智能BP 都按补全后的阵容禁人。diag.log 里托管每次禁人写�
   grid_values=on     英雄卡片上的数字
   panel_opacity=60   两个面板背景的不透明度（0～100）；面板在屏幕最下面一条的两角，不挡选人位，
                      那一边选满五个后背景再降到三分之一
-  lane_tags=on       双方已选英雄脚下的位置和胜率（没有位置锁时，你这一场对手的分路由电竞大脑来排）
+  lane_tags=on       双方已选英雄脚下的位置和胜率（没有位置锁时，你这一场对手的分路由电竞大脑来排；嚎哭深渊生涯里不画）
   live_win_chance=on 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；off = 不显示，也不再记录比赛
   meta_page=on       "版本分析"页（经典界面左侧菜单 / 新界面标题栏）
 
@@ -534,6 +538,12 @@ breakdown above the info panel. Coach delegation bans and picks exactly what the
 advises (coach=on; off by default since 2.15.3), Hell Draft AI or not; with Hell Draft AI the enemy's likely picks,
 bans and the lookahead follow how it drafts. Champions start from their stats
 (stats=auto) and win chances are calibrated on held-out matches.
+
+2.15.6: in a Howling Abyss career (the Hextech pack's ARAM: one lane) champions have no lanes: picks and card
+values ignore the open lanes, bans are not weighed lane by lane, the coach and AI BP no longer follow the
+position lock's rule, this mod seats nobody, the lane tags and the swap phase's best seating are off and the
+suggested starters ignore position ratings. Other careers are unchanged. (Smart Position Lock 1.3.79 stands
+aside there too.)
 
 2.15.5: without a position lock, your opponent's tags are right too: in your own matches this mod seats the
 opponent's champions (the ban/pick screen does not tell which champion sits in which slot). Other matches

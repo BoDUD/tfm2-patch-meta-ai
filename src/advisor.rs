@@ -31,6 +31,10 @@
 //! **Lookahead** ([`simulate`]): the rest of a standard 3+2 draft played out from an action -
 //! each side taking its best ban and pick in turn from the strongest champions on offer - and
 //! the line-ups it ends in rated, so an action is judged by the draft it leads to.
+//!
+//! **嚎哭深渊**（2.15.6，`Meta::no_lanes`）：一条路，英雄不分路。强度就是英雄本身的（不加各路的偏移、不扣不打这一路的
+//! 代价），谁都能选、不看还空着哪一路，选手的熟练度按整队平均；禁用的候选只有一份（不按路比，也就没有「摇摆位」）。
+//! 配合、克制、阵容缺口、伤害类型、被克、抢、推演照旧。
 
 use std::collections::HashMap;
 
@@ -92,6 +96,10 @@ pub struct Lanes {
 /// League champion) counting as [`ROLE_EVIDENCE`] games. `None`: too few games and no League
 /// lanes - any lane is as likely.
 pub fn lane_shares(meta: &Meta, champ: u16) -> Option<[f32; 5]> {
+    // 嚎哭深渊（2.15.6，`Meta::no_lanes`）没有分路
+    if meta.no_lanes {
+        return None;
+    }
     let c = meta.by_id(champ)?;
     let games: u32 = c.roles.iter().map(|r| r.tally.games).sum();
     let prior = meta.lane_priors.get(champ as usize).copied().flatten();
@@ -120,6 +128,10 @@ fn lane_fit(meta: &Meta, champ: u16, role: Role) -> f32 {
 /// assignment is scored by how often each champion plays its lane.
 pub fn lanes(meta: &Meta, picks: &[u16]) -> Lanes {
     let picks = &picks[..picks.len().min(5)];
+    // 嚎哭深渊（2.15.6）：谁打哪路无所谓，按选人顺序占位就行（强度不看路，还空着几个位置才有用）
+    if meta.no_lanes {
+        return Lanes { roles: Role::ALL[..picks.len()].to_vec(), confidence: 1.0 };
+    }
     let mut best: Option<(f32, Vec<Role>)> = None;
     let mut total = 0.0f32;
     let mut current = Vec::with_capacity(picks.len());
@@ -205,6 +217,10 @@ pub fn fits_lanes(meta: &Meta, champ: u16, open: &[Role]) -> bool {
 /// 以前算对方每一路的候选时所有英雄都放进去、不打这一路的只扣 [`OFF_ROLE_COST`]，又强又常用的射手扣完还能挤进对方中路
 /// 候选的前几名，对方下路有人了还去禁射手。
 pub fn plays(meta: &Meta, champ: u16, role: Role) -> bool {
+    // 嚎哭深渊（2.15.6）：一条路，谁都能上
+    if meta.no_lanes {
+        return true;
+    }
     if let Some(lanes) = crate::knowledge::positions_of(meta.names.name(champ)).filter(|l| !l.is_empty()) {
         return lanes.contains(&role);
     }
@@ -217,6 +233,10 @@ pub fn plays(meta: &Meta, champ: u16, role: Role) -> bool {
 /// A champion's strength in a lane (log-odds), with the off-role cost.
 pub fn strength_in(meta: &Meta, champ: u16, role: Role) -> f32 {
     let Some(c) = meta.by_id(champ) else { return 0.0 };
+    // 嚎哭深渊（2.15.6）：不分路，就是英雄本身的强度
+    if meta.no_lanes {
+        return c.strength;
+    }
     let off = lane_shares(meta, champ).is_some_and(|s| s[role.index()] < OFF_ROLE_SHARE);
     c.strength + c.roles[role.index()].value - if off { OFF_ROLE_COST } else { 0.0 }
 }
@@ -341,6 +361,8 @@ pub fn pick_value_weighted(
         .max_by(|a, b| (a.1, a.2).partial_cmp(&(b.1, b.2)).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(r, _, s)| (r, s))
         .unwrap_or((None, meta.by_id(cand).map_or(0.0, |c| c.strength) - OFF_ROLE_COST));
+    // 嚎哭深渊（2.15.6）：不说打哪路，选手也不按路找，按整队的平均
+    let role = role.filter(|_| !meta.no_lanes);
     let synergy: f32 = ally.iter().map(|a| meta.synergy(cand, *a).value).sum();
     let counter: f32 = enemy.iter().map(|e| meta.counter(cand, *e).value).sum();
     // the composition: the League profiles' gaps when they are known, else the plain damage mix
@@ -614,7 +636,9 @@ fn lane_options(
     if team.picks.len() >= 5 {
         return Vec::new();
     }
-    open_lanes(meta, team.picks)
+    // 嚎哭深渊（2.15.6）：没有分路，候选只有一份（占一个空位就行，`plays` 和估值在这里都不看路）
+    let lanes = if meta.no_lanes { vec![Role::ALL[team.picks.len()]] } else { open_lanes(meta, team.picks) };
+    lanes
         .into_iter()
         .map(|role| {
             // 只有能打这一路的才算这一路的候选（2.13.3，[`plays`]）
@@ -1080,6 +1104,25 @@ mod tests {
             assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-4);
         }
         assert!(lane_probabilities(&m, &[]).is_empty());
+    }
+
+    /// 2.15.6：嚎哭深渊那份模型（`Meta::no_lanes`）不分路：强度就是英雄本身的，谁都能打哪一路，选手按整队算，禁用只有一份候选
+    #[test]
+    fn the_howling_abyss_has_one_lane() {
+        let mut m = meta();
+        m.no_lanes = true;
+        let none = |_: u16| None;
+        let id = |n: &str| m.names.get(n).unwrap();
+        let c = m.by_id(id("c")).unwrap().strength;
+        assert!(Role::ALL.iter().all(|r| strength_in(&m, id("c"), *r) == c && plays(&m, id("c"), *r)));
+        assert_eq!(lane_shares(&m, id("c")), None);
+        let v = pick_value(&m, id("c"), &[id("a")], &[], &[(7, Some(Role::Mid)), (8, Some(Role::Top))], &none);
+        assert_eq!((v.role, v.player, v.strength), (None, None, c), "no lane, the line-up as a whole");
+        assert_eq!(open_lanes(&m, &[id("a"), id("b")]).len(), 3, "three picks still to make");
+        let offer: Vec<u16> = (0..12).collect();
+        let board = ban_board(&m, Team::new(&[], &[]), Team::new(&[id("a")], &[]), Mastery::FULL, &none, &offer, None);
+        assert!(!board.is_empty() && board.iter().all(|b| b.lanes <= 1 && b.threat.role.is_none()), "one pool, no flex picks");
+        assert!(likely_picks(&m, Team::new(&[], &[]), &[], Mastery::FULL, &none, &offer).iter().all(|v| v.role.is_none()));
     }
 
     /// `cargo test --release -- --ignored --nocapture advice_time`: one draft state, 120

@@ -116,4 +116,21 @@ pub(crate) mod tests {
     pub fn serial() -> MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// 装作打开的是嚎哭深渊生涯（海克斯大乱斗写的环境变量）；出了作用域就去掉，`compat::aram` 记的上一次也跟着对齐
+    pub struct HowlingAbyss;
+
+    impl HowlingAbyss {
+        pub fn on() -> Self {
+            std::env::set_var(crate::compat::HEXTECH_ARAM_ENV, "1");
+            Self
+        }
+    }
+
+    impl Drop for HowlingAbyss {
+        fn drop(&mut self) {
+            std::env::remove_var(crate::compat::HEXTECH_ARAM_ENV);
+            crate::compat::aram();
+        }
+    }
 }

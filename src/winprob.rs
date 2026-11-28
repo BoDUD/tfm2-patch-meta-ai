@@ -705,9 +705,10 @@ struct Run {
 
 static RUNS: LazyLock<Mutex<VecDeque<Run>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
 
-/// BP 完的阵容胜率（对数几率）：电竞大脑的模型，蓝方英雄对红方英雄；模型不认识的英雄不算，没有模型就是五五开
+/// BP 完的阵容胜率（对数几率）：电竞大脑的模型，蓝方英雄对红方英雄；模型不认识的英雄不算，没有模型就是五五开。
+/// 嚎哭深渊生涯里按不分路的那份算（2.15.6，和选人界面的胜率一样）
 fn draft_logit(players: &[Player]) -> f32 {
-    let Some(snapshot) = crate::shared::get() else { return 0.0 };
+    let Some(snapshot) = crate::shared::get_for_match() else { return 0.0 };
     let meta = &snapshot.meta;
     let side = |t: usize| -> Vec<u16> { players.iter().filter(|p| p.team == t).filter_map(|p| meta.names.get(&p.champion)).collect() };
     let (blue, red) = (side(0), side(1));

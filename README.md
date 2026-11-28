@@ -54,6 +54,17 @@
 - **地狱人机（Hell Draft AI，`hell_draft_ai`）**：它整手决定 AI 队伍的 BP，几乎没有随机性，主要按存档胜率（它自己的统计）和属性给英雄评级。检测到它启用且接管 AI 队伍时，本 Mod 按它的方式预测对方：每个英雄加上它的偏好（本版本 AI 队伍的选用 + 禁用率，和它 `cache/history.json` 里的胜率，各最多约 ±0.5 对数几率），"敌可能"和推演里对方的选人按这个偏好；对方的禁用（敌禁? 和推演）按"最强位置的强度 + 偏好"排序，而不是按禁掉后我方损失多少。它的 `ally_draft_ai` 开着时 `diag.log` 会提醒：本 Mod 的教练托管排在最后，复盘显示被盖掉时在它的配置器（F7）里关掉"我方 AI"。本 Mod 只读它的文件，不改。另外它算作"接管 AI 选人的 Mod"：`ban_pick=auto` 时让给它。
 - `diag.log` 里的模型检验行（`[model] model check ...`）以前可能因为排队的拟合被跳过而不出现，现在总会写。
 
+## 2.15.6：嚎哭深渊（海克斯大乱斗）里英雄不分路
+
+用户：「海斗不应该受到位置锁的限制了 所有英雄 都应该和moba模式区分开来了」。
+
+- 海克斯大乱斗（`league_hextech`）把死斗生涯改成了嚎哭深渊：五对五一条路，没有分路。它的客户端把进程环境变量 `TFM2_HEXTECH_ARAM` 写成 `1`（打开的是嚎哭深渊生涯）或 `0`；电竞大脑用到时现读（`compat::aram`），没有这个变量就一切照旧。
+- **嚎哭深渊生涯里**用复制出来的一份不分路的模型（`shared::get_for_match`，`Meta::no_lanes`）：选人钩子（`ban_pick` 的加分、托管、AI BP）、选人界面、首发推荐、F8 的侦察、比赛里实时胜率用的阵容胜率都按它算。英雄的强度就是它本身的（不加各路的偏移、不扣不打这一路的代价），谁都能选、不看还空着哪一路，选手的熟练度按整队平均，理由里不写路；禁用板只有一份候选（不按路比，也就没有「N路摇摆」）；托管和 AI BP 不照锁位置的规则挑（`draft::lane_fits`）。
+- **不排分路**：`draft::seat_decide` 交给游戏，也不读锁位置的 `seated.json`；选人格下面的位置和胜率标签不画，换位阶段不给最佳换位；推荐首发不看位置评分，星旁边不写位置。
+- 配合、克制、阵容缺口、伤害类型、对方习惯、风格、无畏、推演照旧。各路的胜率、场次这些统计数字（版本分析页、F8 梯队的「最佳位置」、报告）是存档里记的，照旧显示。
+- `diag.log`：变了记一行 `[aram] Howling Abyss career ...` / `[aram] not a Howling Abyss career any more ...`；`[seat] Howling Abyss career (no lanes): every team is seated by the game`。
+- 锁位置 1.3.79 起在嚎哭深渊里也整个不管（不锁选人、不排分路、不写 `seated.json`）。
+
 ## 2.15.5：没有位置锁时，你对手的 AI 队由电竞大脑排分路
 
 用户：「BP页面的胜率显示现在不打位置锁的玩家也能正确显示吗」→「直接读选人界面的英雄好了」→（读不出）「要，替 AI 排」。
@@ -415,7 +426,7 @@
 | | `unranked` | keep | 证据不足的英雄：`keep` 保持原梯队，`clear` 设为无梯队 |
 | `[screen]` | `draft_overlay` | on | 选人界面的胜率和建议，以及战术界面、首发界面的推荐 |
 | | `grid_values` | on | 英雄卡片上的价值 |
-| | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条） |
+| | `lane_tags` | on | 双方已选英雄脚下的位置和它在这一路的胜率（2.14.3；以前只有敌方的位置条；2.15.6 起嚎哭深渊生涯里不画） |
 | | `live_win_chance` | on | 比赛画面上比赛时间下面的实时胜率条和曲线（2.15.0）；关掉时也不再记录比赛 |
 | | `panel_opacity` | 60 | 两个面板背景的不透明度（0～100）。面板在屏幕底栏的两角（选人位下方、队名左右两侧），原版和 Ban/Pick View Plus（原画 Mod）的布局里都不挡选人位；面板上方那一列选满五个后背景再降到三分之一 |
 | | `meta_page` | on | "版本分析"页（经典界面左侧菜单 / 新界面标题栏） |
@@ -469,6 +480,8 @@
 "按胜率调整 ban/pick + 自动梯队"的思路最早来自 yudra 的创意工坊 Mod「Win-Rate Ban/Pick AI + Champion Tiers」，失效原因见 [docs/background.md](docs/background.md)。选人界面标注、高级统计、对手位置标签等功能方向受 Bowsori 的「Drafter's Toolbox」「Terminator Draft AI」启发；UI 路径和界面重建的经验参考了 shirograhm 的开源 Mod「Riot Games Item Expansion Pack」（MIT）。本 Mod 是独立实现，代码、模型、设置和美术都是自己的。
 
 ## English
+
+2.15.6 (the user: "Howling Abyss should not be held by the position lock any more - every champion should be told apart from the moba mode"): league_hextech turns the Deathmatch career into a Howling Abyss (ARAM) one - one lane, no positions - and sets the process environment variable `TFM2_HEXTECH_ARAM` to `1` in it (`0` in other careers; absent without league_hextech). In such a career (`compat::aram`, read where it is used) the draft hooks, the ban/pick screen, the line-up screen, the F8 scouting and the live win chance's draft input use a copy of the model with `Meta::no_lanes` (`shared::get_for_match`): a champion's strength is its own (no lane offsets, no off-role cost), any champion fits any open slot, the players' mastery is the line-up's average, the ban board has one pool of options (no flex picks), the coach and AI BP do not apply Smart Position Lock's rule, nobody is seated (`seat_decide` leaves it to the game and reads no `seated.json`), the lane tags and the swap phase's best seating are off, and the suggested starters ignore position ratings. Synergy, matchups, composition, habits, styles, Fearless and the lookahead stay; per-lane statistics are shown as recorded. Smart Position Lock 1.3.79 stands aside there too.
 
 2.15.5: with no position lock seating it, the player's opponent is seated by this mod (`plan::best_seating`) even with `ai_bp` off, as long as `lane_tags` is on - game 0.7.3's ban/pick screen tells no slot's champion (portraits are images, the position tooltip fills on hover, the swap table's numbers and the proficiency badges were all 0 / - / +0%), so a seating the game makes leaves the tags off. Other AI matches stay the game's. The 2.15.4 swap-phase dumps are gone.
 
